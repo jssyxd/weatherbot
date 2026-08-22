@@ -21,6 +21,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 AWC_TAF_ENDPOINT = "https://aviationweather.gov/api/data/taf"
+OPEN_METEO_FORECAST_ENDPOINT = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_MODEL = "ecmwf_ifs025"
 WUNDERGROUND_FORECAST_KEY = "calendarDayTemperature"
 TAF_TEMPERATURE_RE = re.compile(r"\b(TX|TN)(M?\d{2})/(\d{4})Z\b")
 WU_DAILY_ENDPOINT_RE = re.compile(
@@ -69,7 +71,10 @@ def load_contract_cities(path: Path) -> dict[str, dict[str, Any]]:
     for city in raw:
         if not isinstance(city, dict):
             raise ValueError("contract_cities 每项必须为对象")
-        required = ("city_id", "name", "icao", "timezone", "market_unit", "wu_forecast_url")
+        required = (
+            "city_id", "name", "icao", "timezone", "market_unit", "wu_forecast_url",
+            "latitude", "longitude", "coordinate_source",
+        )
         missing = [field for field in required if not city.get(field)]
         if missing:
             raise ValueError(f"合同城市配置缺少字段: {', '.join(missing)}")
@@ -78,6 +83,11 @@ def load_contract_cities(path: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(f"合同城市配置的 ICAO 无效: {icao!r}")
         if city["market_unit"] not in {"C", "F"}:
             raise ValueError(f"{icao} 的 market_unit 必须为 C 或 F")
+        latitude, longitude = city["latitude"], city["longitude"]
+        if not isinstance(latitude, (int, float)) or not -90.0 <= float(latitude) <= 90.0:
+            raise ValueError(f"{icao} 的 latitude 必须为 -90 至 90 的数值")
+        if not isinstance(longitude, (int, float)) or not -180.0 <= float(longitude) <= 180.0:
+            raise ValueError(f"{icao} 的 longitude 必须为 -180 至 180 的数值")
         ZoneInfo(str(city["timezone"]))
         if icao in by_icao:
             raise ValueError(f"合同城市配置 ICAO 重复: {icao}")
@@ -201,6 +211,68 @@ def fetch_awc_tafs(stations: list[str]) -> tuple[dict[str, dict[str, Any]], str]
     return {str(item.get("icaoId", "")).upper(): item for item in parsed if item.get("icaoId")}, final_url
 
 
+def fetch_openmeteo_ecmwf_forecast(city: dict[str, Any]) -> dict[str, Any]:
+    """Fetch one city from the explicit ECMWF IFS 0.25° daily forecast endpoint."""
+    query = urllib.parse.urlencode({
+        "latitude": f"{float(city['latitude']):.6f}",
+        "longitude": f"{float(city['longitude']):.6f}",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "timezone": str(city["timezone"]),
+        "temperature_unit": "fahrenheit" if city["market_unit"] == "F" else "celsius",
+        "forecast_days": "2",
+        "models": OPEN_METEO_MODEL,
+    }, safe=",")
+    payload, final_url = _read_url(f"{OPEN_METEO_FORECAST_ENDPOINT}?{query}")
+    parsed = json.loads(payload)
+    daily = parsed.get("daily") if isinstance(parsed, dict) else None
+    if not isinstance(daily, dict):
+        raise RuntimeError("Open-Meteo ECMWF 返回缺少 daily 对象")
+    required = ("time", "temperature_2m_max", "temperature_2m_min")
+    if any(not isinstance(daily.get(field), list) for field in required):
+        raise RuntimeError("Open-Meteo ECMWF 缺少日高、日低或当地日期")
+    if parsed.get("timezone") != city["timezone"]:
+        raise RuntimeError("Open-Meteo ECMWF 返回时区与合同城市时区不一致")
+    return {
+        "endpoint": final_url,
+        "response": parsed,
+        "raw_hash": sha256_text(payload),
+        "retrieved_at_utc": as_utc_string(utc_now()),
+        "requested_model": OPEN_METEO_MODEL,
+        "requested_coordinates": {"latitude": city["latitude"], "longitude": city["longitude"]},
+        "returned_coordinates": {
+            "latitude": parsed.get("latitude"), "longitude": parsed.get("longitude"),
+            "elevation": parsed.get("elevation"),
+        },
+        "returned_timezone": parsed.get("timezone"),
+        "utc_offset_seconds": parsed.get("utc_offset_seconds"),
+    }
+
+
+def openmeteo_ecmwf_edges_for_city_date(snapshot: dict[str, Any], city: dict[str, Any], target_local_date: str) -> dict[str, dict[str, Any]]:
+    daily = snapshot["response"]["daily"]
+    dates = daily["time"]
+    highs = daily["temperature_2m_max"]
+    lows = daily["temperature_2m_min"]
+    for index, local_date in enumerate(dates):
+        if local_date != target_local_date:
+            continue
+        detail = {
+            "endpoint": snapshot["endpoint"], "raw_hash": snapshot["raw_hash"],
+            "retrieved_at_utc": snapshot["retrieved_at_utc"], "requested_model": snapshot["requested_model"],
+            "requested_coordinates": snapshot["requested_coordinates"],
+            "returned_coordinates": snapshot["returned_coordinates"],
+            "returned_timezone": snapshot["returned_timezone"],
+            "utc_offset_seconds": snapshot["utc_offset_seconds"], "daily_time": local_date,
+        }
+        output: dict[str, dict[str, Any]] = {}
+        if index < len(highs) and isinstance(highs[index], (int, float)):
+            output["high"] = build_edge_config(city, target_local_date, "high", float(highs[index]), "openmeteo_ecmwf_ifs025_high", detail)
+        if index < len(lows) and isinstance(lows[index], (int, float)):
+            output["low"] = build_edge_config(city, target_local_date, "low", float(lows[index]), "openmeteo_ecmwf_ifs025_low", detail)
+        return output
+    return {}
+
+
 def _extract_weather_com_daily_url(page_html: str, desired_unit: str) -> str:
     unescaped = html.unescape(page_html).replace("\\/", "/")
     match = WU_DAILY_ENDPOINT_RE.search(unescaped)
@@ -269,14 +341,26 @@ def edge_key(city_id: str, local_date: str, direction: str) -> str:
     return f"{city_id}|{local_date}|{direction}"
 
 
+def _group_missing_by_city(missing: list[tuple[dict[str, Any], str]]) -> dict[str, tuple[dict[str, Any], list[str]]]:
+    grouped: dict[str, tuple[dict[str, Any], list[str]]] = {}
+    for city, direction in missing:
+        stored = grouped.get(city["icao"])
+        if stored is None:
+            grouped[city["icao"]] = (city, [direction])
+        else:
+            stored[1].append(direction)
+    return grouped
+
+
 def refresh_edge_configs(state: dict[str, Any], cities: dict[str, dict[str, Any]], target_dates: dict[str, str], wu_pause_seconds: float = 0.3) -> dict[str, Any]:
-    """Refresh TAF first, then WU only for missing city-direction edges."""
+    """Configure every direction through TAF -> explicit ECMWF -> WU -> fail closed."""
     city_list = list(cities.values())
     tafs, taf_endpoint = fetch_awc_tafs([city["icao"] for city in city_list])
     edges: dict[str, dict[str, Any]] = state.setdefault("edge_configs", {})
     failures: dict[str, str] = state.setdefault("edge_failures", {})
-    missing: list[tuple[dict[str, Any], str]] = []
+    missing_after_taf: list[tuple[dict[str, Any], str]] = []
     taf_count = 0
+    ecmwf_count = 0
     wu_count = 0
 
     for city in city_list:
@@ -284,31 +368,41 @@ def refresh_edge_configs(state: dict[str, Any], cities: dict[str, dict[str, Any]
         taf_edges = taf_edges_for_city_date(tafs.get(city["icao"], {}), city, local_date)
         for direction, config in taf_edges.items():
             config["source_endpoint"] = taf_endpoint
-            edges[edge_key(city["city_id"], local_date, direction)] = config
-            failures.pop(edge_key(city["city_id"], local_date, direction), None)
+            key = edge_key(city["city_id"], local_date, direction)
+            edges[key] = config
+            failures.pop(key, None)
             taf_count += 1
         for direction in ("high", "low"):
-            key = edge_key(city["city_id"], local_date, direction)
             if direction not in taf_edges:
-                missing.append((city, direction))
+                missing_after_taf.append((city, direction))
 
-    pending_by_city: dict[str, tuple[dict[str, Any], list[str]]] = {}
+    missing_after_ecmwf: list[tuple[dict[str, Any], str]] = []
+    for city, directions in _group_missing_by_city(missing_after_taf).values():
+        local_date = target_dates[city["icao"]]
+        try:
+            ecmwf_edges = openmeteo_ecmwf_edges_for_city_date(fetch_openmeteo_ecmwf_forecast(city), city, local_date)
+            for direction in directions:
+                key = edge_key(city["city_id"], local_date, direction)
+                config = ecmwf_edges.get(direction)
+                if config is None:
+                    missing_after_ecmwf.append((city, direction))
+                    continue
+                edges[key] = config
+                failures.pop(key, None)
+                ecmwf_count += 1
+        except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            for direction in directions:
+                failures[edge_key(city["city_id"], local_date, direction)] = f"openmeteo_ecmwf_unavailable:{type(exc).__name__}"
+                missing_after_ecmwf.append((city, direction))
+
     wu_endpoint_cache: dict[str, str] = state.setdefault("wu_endpoint_cache", {})
-    for city, direction in missing:
-        stored = pending_by_city.get(city["icao"])
-        if stored is None:
-            pending_by_city[city["icao"]] = (city, [direction])
-        else:
-            stored[1].append(direction)
-
-    for index, (city, directions) in enumerate(pending_by_city.values()):
+    for index, (city, directions) in enumerate(_group_missing_by_city(missing_after_ecmwf).values()):
         local_date = target_dates[city["icao"]]
         try:
             cached_endpoint = wu_endpoint_cache.get(city["icao"])
             try:
                 snapshot = fetch_wunderground_forecast(city, cached_endpoint)
             except RuntimeError:
-                # Endpoint expiry or a changed provider response: rediscover once from the page.
                 snapshot = fetch_wunderground_forecast(city, None)
             wu_endpoint_cache[city["icao"]] = snapshot["endpoint"]
             wu_edges = wunderground_edges_for_city_date(snapshot, city, local_date)
@@ -316,6 +410,7 @@ def refresh_edge_configs(state: dict[str, Any], cities: dict[str, dict[str, Any]
                 key = edge_key(city["city_id"], local_date, direction)
                 config = wu_edges.get(direction)
                 if config is None:
+                    edges.pop(key, None)
                     failures[key] = "wu_target_local_date_unavailable"
                     continue
                 edges[key] = config
@@ -323,12 +418,21 @@ def refresh_edge_configs(state: dict[str, Any], cities: dict[str, dict[str, Any]
                 wu_count += 1
         except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
             for direction in directions:
-                failures[edge_key(city["city_id"], local_date, direction)] = f"wu_forecast_unavailable:{type(exc).__name__}"
-        if index + 1 < len(pending_by_city):
+                key = edge_key(city["city_id"], local_date, direction)
+                edges.pop(key, None)
+                failures[key] = f"wu_forecast_unavailable:{type(exc).__name__}"
+        if index + 1 < len(_group_missing_by_city(missing_after_ecmwf)):
             time.sleep(max(0.0, wu_pause_seconds))
 
     state["last_edge_refresh_utc"] = as_utc_string(utc_now())
-    return {"taf_edges": taf_count, "wu_edges": wu_count, "missing_edges": len(failures), "taf_endpoint": taf_endpoint}
+    return {
+        "taf_edges": taf_count,
+        "ecmwf_edges": ecmwf_count,
+        "wu_edges": wu_count,
+        "missing_edges": len(failures),
+        "taf_endpoint": taf_endpoint,
+        "openmeteo_model": OPEN_METEO_MODEL,
+    }
 
 
 def observed_temperature_native(event: dict[str, Any], city: dict[str, Any]) -> tuple[float, str] | None:
@@ -386,6 +490,12 @@ def evaluate_observation(state: dict[str, Any], event: dict[str, Any], city: dic
     age = (fetched_at - report_time).total_seconds()
     if age > max_latency_seconds:
         return [{"signal_type": "no_signal", "reason": "report_too_old", "event_id": event.get("event_id"), "age_seconds": round(age, 3)}]
+    if event.get("is_correction") is True:
+        return [{
+            "signal_type": "no_signal", "reason": "correction_requires_full_day_rebuild",
+            "event_id": event.get("event_id"),
+            "disclaimer": "COR is retained for audit but cannot produce a candidate until full corrected-day replay is implemented.",
+        }]
     temperature = observed_temperature_native(event, city)
     if temperature is None:
         return [{"signal_type": "no_signal", "reason": "missing_temperature", "event_id": event.get("event_id")}]
@@ -433,13 +543,25 @@ def evaluate_observation(state: dict[str, Any], event: dict[str, Any], city: dic
             if selected:
                 candidate = dict(selected)
                 candidate["market_rule_id"] = rule.get("market_rule_id")
-                candidate["market_id"] = rule.get("market_id")
-                candidate["no_token_id"] = rule.get("no_token_id")
+                candidate["market_id"] = candidate.get("market_id")
+                candidate["no_token_id"] = candidate.get("no_token_id")
                 bucket_candidates.append(candidate)
         if not bucket_candidates:
             signals.append({"signal_type": "no_signal", "reason": f"no_adjacent_{direction}_bucket_invalidated", "event_id": event.get("event_id"), "local_date": local_date, "value": value})
             continue
-        selected_bucket = bucket_candidates[0]
+        if city["market_unit"] == "F" and precision != "metar_remark_tenths_c":
+            signals.append({
+                "signal_type": "no_signal", "reason": "f_unit_precision_ambiguous",
+                "event_id": event.get("event_id"), "local_date": local_date,
+                "temperature_native": round(value, 4), "temperature_precision": precision,
+                "disclaimer": "An integer-C METAR body temperature cannot safely invalidate a Fahrenheit contract bucket without an RMK T-group.",
+            })
+            continue
+        selected_bucket = (
+            max(bucket_candidates, key=lambda bucket: (float(bucket.get("hi", -float("inf"))), float(bucket.get("lo", -float("inf")))))
+            if direction == "high"
+            else min(bucket_candidates, key=lambda bucket: (float(bucket.get("lo", float("inf"))), float(bucket.get("hi", float("inf")))))
+        )
         handle_key = "|".join((str(selected_bucket.get("market_rule_id")), str(selected_bucket.get("bucket_id"))))
         handled = state.setdefault("handled_candidate_buckets", {})
         if handle_key in handled:

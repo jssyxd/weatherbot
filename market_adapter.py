@@ -1,7 +1,7 @@
 """Public Polymarket Gamma adapter for temperature-market rule discovery.
 
-The adapter reads public event metadata only.  It never authenticates, signs, reads a
-wallet, or sends an order.  Parsed rules are inputs to the local paper signal engine.
+The adapter reads public event metadata only. It never authenticates, signs, reads a
+wallet, or sends an order. Parsed rules are inputs to the local paper signal engine.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def event_slug(market_city_slug: str, local_date: str, direction: str) -> str:
 
 
 def _fetch_json(url: str) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers={"User-Agent": "weatherbot-market-adapter/1.0 (+https://github.com/jssyxd/weatherbot)"})
+    request = urllib.request.Request(url, headers={"User-Agent": "weatherbot-market-adapter/1.1 (+https://github.com/jssyxd/weatherbot)"})
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             payload = response.read().decode("utf-8")
@@ -64,11 +64,19 @@ def parse_bucket(outcome_text: str) -> tuple[float | None, float | None, str] | 
     return None
 
 
+def _bucket_sort_key(bucket: dict[str, Any]) -> tuple[float, float]:
+    return (
+        -float("inf") if bucket.get("lo") is None else float(bucket["lo"]),
+        float("inf") if bucket.get("hi") is None else float(bucket["hi"]),
+    )
+
+
 def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: str, direction: str) -> list[dict[str, Any]]:
+    """Parse one active event into one rule with all its selectable temperature buckets."""
     expected_slug = event_slug(str(city.get("market_city_slug") or city["city_id"]), local_date, direction)
     if event.get("slug") != expected_slug:
         return []
-    rules: list[dict[str, Any]] = []
+    buckets: list[dict[str, Any]] = []
     for market in event.get("markets", []):
         if not isinstance(market, dict):
             continue
@@ -98,28 +106,20 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
         no_token = next((str(token_ids[index]) for index, outcome in enumerate(outcomes) if outcome == "No"), None)
         if not no_token:
             continue
-        market_rule_id = f"{market.get('id')}|{local_date}|{direction}"
-        rules.append({
-            "market_rule_id": market_rule_id,
-            "market_id": str(market.get("id")),
-            "event_id": str(event.get("id")),
-            "event_slug": expected_slug,
-            "city_id": city["city_id"],
-            "icao": city["icao"],
-            "market_local_date": local_date,
-            "direction": direction,
-            "market_unit": unit,
-            "enabled": True,
-            "source": "Polymarket Gamma public event metadata",
-            "buckets": [{
-                "bucket_id": str(market.get("id")),
-                "label": outcome_text,
-                "lo": lo,
-                "hi": hi,
-                "no_token_id": no_token,
-            }],
+        buckets.append({
+            "bucket_id": str(market.get("id")), "label": outcome_text, "lo": lo, "hi": hi,
+            "market_id": str(market.get("id")), "no_token_id": no_token,
         })
-    return rules
+    if not buckets:
+        return []
+    buckets.sort(key=_bucket_sort_key)
+    return [{
+        "market_rule_id": f"{event.get('id')}|{local_date}|{direction}",
+        "event_id": str(event.get("id")), "event_slug": expected_slug,
+        "city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
+        "direction": direction, "market_unit": city["market_unit"], "enabled": True,
+        "source": "Polymarket Gamma public event metadata", "buckets": buckets,
+    }]
 
 
 def refresh_market_rules(cities: dict[str, dict[str, Any]], local_dates: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, str]]:

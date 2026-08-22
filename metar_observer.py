@@ -31,6 +31,7 @@ from edge_engine import (
     refresh_edge_configs,
 )
 from market_adapter import refresh_market_rules
+from paper_execution import simulate_paper_fak
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE_DIR / "config.json"
@@ -223,7 +224,7 @@ def load_state(state_path: Path) -> dict[str, Any]:
         ("seen", {}), ("last_successful_scan_utc", None), ("edge_configs", {}),
         ("edge_failures", {}), ("daily_extrema", {}), ("handled_candidate_buckets", {}),
         ("market_rules", []), ("market_failures", {}), ("consecutive_failure_started_utc", None),
-        ("paper_city_day_notional", {}), ("execution_paused", False),
+        ("paper_city_day_notional", {}), ("paper_city_day_total_debit", {}), ("execution_paused", False),
     ):
         state.setdefault(key, default)
     return state
@@ -265,33 +266,12 @@ def refresh_configuration(state: dict[str, Any], config: dict[str, Any], cities:
 
 
 def enrich_execution(signal: dict[str, Any], mode: str, state: dict[str, Any]) -> dict[str, Any]:
-    """Attach a capped paper intent or a live safety block; never submit an order."""
+    """Attach a read-only paper-fill estimate or a live safety block; never submit an order."""
     if signal.get("signal_type") != "candidate_no_signal":
         return signal
     result = dict(signal)
-    city_day_key = f"{signal['city_id']}|{signal['market_local_date']}"
     if mode == "paper":
-        ledger: dict[str, float] = state.setdefault("paper_city_day_notional", {})
-        spent = float(ledger.get(city_day_key, 0.0))
-        if spent + 1.0 > 2.0:
-            status = "paper_intent_skipped_city_day_cap"
-            notional = 0.0
-        else:
-            ledger[city_day_key] = round(spent + 1.0, 2)
-            status = "paper_order_intent_pending_price_gate"
-            notional = 1.0
-        result["execution"] = {
-            "mode": "paper",
-            "status": status,
-            "notional_usdc": notional,
-            "spent_city_day_usdc": round(spent, 2),
-            "max_city_day_notional_usdc": 2.0,
-            "order_type": "FAK",
-            "side": "BUY_NO",
-            "max_price_exclusive": 0.96,
-            "price_gate": "not_evaluated_no_clob_executor",
-            "message": "模拟意图；不连接 CLOB、不加载凭据、不提交订单。",
-        }
+        result["execution"] = simulate_paper_fak(signal, state)
     else:
         result["execution"] = {
             "mode": "live",

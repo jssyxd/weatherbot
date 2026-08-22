@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import metar_observer as observer  # noqa: E402
@@ -14,20 +15,46 @@ class ExecutionBoundaryTests(unittest.TestCase):
             "signal_type": "candidate_no_signal",
             "city_id": "shanghai",
             "market_local_date": "2026-08-23",
+            "bucket": {"bucket_id": "bucket-31", "no_token_id": "no-token"},
         }
+        self.book = {
+            "timestamp": "123456", "hash": "book-hash", "tick_size": "0.01", "min_order_size": "1",
+            "asks": [{"price": "0.50", "size": "2.00"}, {"price": "0.51", "size": "2.00"}],
+        }
+        self.fee = {"base_fee": 500}
 
-    def test_paper_intents_are_capped_per_city_day(self) -> None:
+    def test_paper_fill_uses_public_depth_and_fee_in_total_debit_cap(self) -> None:
         state: dict = {}
-        one = observer.enrich_execution(self.signal, "paper", state)
-        two = observer.enrich_execution(self.signal, "paper", state)
-        three = observer.enrich_execution(self.signal, "paper", state)
-        self.assertEqual(one["execution"]["status"], "paper_order_intent_pending_price_gate")
-        self.assertEqual(two["execution"]["status"], "paper_order_intent_pending_price_gate")
-        self.assertEqual(three["execution"]["status"], "paper_intent_skipped_city_day_cap")
-        self.assertEqual(state["paper_city_day_notional"]["shanghai|2026-08-23"], 2.0)
+        with patch("paper_execution.fetch_order_book", return_value=(self.book, "https://clob.test/book")), \
+             patch("paper_execution.fetch_fee_rate", return_value=(self.fee, "https://clob.test/fee")):
+            output = observer.enrich_execution(self.signal, "paper", state)
+        execution = output["execution"]
+        self.assertEqual(execution["status"], "paper_fill_estimate")
+        self.assertEqual(execution["order_type"], "FAK")
+        self.assertEqual(execution["side"], "BUY_NO")
+        self.assertEqual(execution["no_token_id"], "no-token")
+        self.assertGreater(execution["estimated_fee_usdc"], 0)
+        self.assertLessEqual(execution["total_debit_usdc"], 1.0)
+        self.assertEqual(execution["base_fee_bps"], 500.0)
+        self.assertIn("shanghai|2026-08-23", state["paper_city_day_total_debit"])
 
-    def test_live_mode_never_submits_an_order(self) -> None:
-        output = observer.enrich_execution(self.signal, "live", {})
+    def test_paper_fill_rejects_ask_outside_strict_price_gate(self) -> None:
+        state: dict = {}
+        invalid_book = dict(self.book, asks=[{"price": "0.10", "size": "20"}])
+        with patch("paper_execution.fetch_order_book", return_value=(invalid_book, "https://clob.test/book")), \
+             patch("paper_execution.fetch_fee_rate", return_value=(self.fee, "https://clob.test/fee")):
+            output = observer.enrich_execution(self.signal, "paper", state)
+        self.assertEqual(output["execution"]["status"], "paper_fill_rejected_best_ask_outside_gate")
+        self.assertEqual(state["paper_city_day_total_debit"], {})
+
+    def test_paper_fill_rejects_when_fixed_one_usdc_no_longer_fits_city_day_total_debit(self) -> None:
+        state: dict = {"paper_city_day_total_debit": {"shanghai|2026-08-23": 1.01}}
+        output = observer.enrich_execution(self.signal, "paper", state)
+        self.assertEqual(output["execution"]["status"], "paper_fill_rejected_city_day_cap")
+
+    def test_live_mode_never_submits_an_order_or_reads_a_book(self) -> None:
+        with patch("metar_observer.simulate_paper_fak", side_effect=AssertionError("must not be called")):
+            output = observer.enrich_execution(self.signal, "live", {})
         self.assertEqual(output["execution"]["status"], "blocked_no_live_executor")
         self.assertNotIn("no_token_id", output["execution"])
 
