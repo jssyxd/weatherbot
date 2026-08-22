@@ -6,9 +6,15 @@
   "edge_refresh_interval_seconds": 900,
   "max_report_age_seconds": 600,
   "failure_pause_after_seconds": 1800,
+  "warmup_history_hours": 30,
+  "warmup_stations_per_request": 10,
+  "warmup_retry_seconds": 60,
+  "edge_config_max_age_seconds": 1800,
+  "market_rules_max_age_seconds": 1800,
   "contract_cities_path": "config/contract_cities.json",
   "market_rules_path": "data/market_rules.json",
   "state_path": "data/state.json",
   "event_dir": "data/observations",
-  "signal_dir": "data/signals"
+  "signal_dir": "data/signals",
+  "health_path": "data/health.json"
 }

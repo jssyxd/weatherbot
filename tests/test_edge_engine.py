@@ -88,10 +88,20 @@ class EdgeEngineTests(unittest.TestCase):
         self.assertNotIn(key, state["edge_configs"])
         self.assertTrue(state["edge_failures"][key].startswith("wu_forecast_unavailable"))
 
+    def test_stale_edge_config_fails_closed_before_bucket_selection(self) -> None:
+        city = self.cities["ZSPD"]
+        event = {"event_id": "stale", "report_time_utc": "2026-08-22T12:30:00Z", "fetched_at_utc": "2026-08-22T12:33:00Z", "temperature_c": 31, "raw_metar": "METAR ZSPD 221230Z 00000KT 9999 31/24 Q1005"}
+        state: dict = {
+            "daily_extrema": {"shanghai|2026-08-22": {"city_id": "shanghai", "icao": "ZSPD", "market_local_date": "2026-08-22", "market_unit": "C", "high": 29, "low": 29}},
+            "edge_configs": {edge.edge_key("shanghai", "2026-08-22", "high"): {"activation_edge_native": 30, "source_type": "taf_tx", "configured_at_utc": "2026-08-22T11:00:00Z"}},
+        }
+        signals = edge.evaluate_observation(state, event, city, [], 600, 1800)
+        self.assertIn("edge_config_stale_high", [item.get("reason") for item in signals])
+
     def test_fahrenheit_bucket_requires_tenths_c_remark_for_candidate_signal(self) -> None:
         city = self.cities["KLGA"]
         state: dict = {
-            "edge_configs": {edge.edge_key("new-york-city", "2026-08-22", "high"): {"activation_edge_native": 80.0, "source_type": "taf_tx"}},
+            "edge_configs": {edge.edge_key("new-york-city", "2026-08-22", "high"): {"activation_edge_native": 80.0, "source_type": "taf_tx", "configured_at_utc": "2026-08-22T16:50:00Z"}},
             "daily_extrema": {"new-york-city|2026-08-22": {"city_id": "new-york-city", "icao": "KLGA", "market_local_date": "2026-08-22", "market_unit": "F", "high": 80.0, "low": 80.0}},
             "handled_candidate_buckets": {},
         }
@@ -130,7 +140,7 @@ class EdgeEngineTests(unittest.TestCase):
         first = edge.evaluate_observation(state, event_base, city, [], 600)
         self.assertEqual(first[0]["reason"], "daily_baseline_initialized")
         local_date = "2026-08-22"
-        state["edge_configs"][edge.edge_key(city["city_id"], local_date, "high")] = {"activation_edge_native": 30.0, "source_type": "taf_tx"}
+        state["edge_configs"][edge.edge_key(city["city_id"], local_date, "high")] = {"activation_edge_native": 30.0, "source_type": "taf_tx", "configured_at_utc": "2026-08-22T12:10:00Z"}
         rules = [{
             "market_rule_id": "market-high", "market_id": "m1", "no_token_id": "no", "city_id": city["city_id"],
             "market_local_date": local_date, "direction": "high", "market_unit": "C", "enabled": True,

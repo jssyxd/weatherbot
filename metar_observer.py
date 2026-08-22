@@ -28,6 +28,7 @@ from edge_engine import (
     load_contract_cities,
     load_market_rules,
     local_market_date,
+    observed_temperature_native,
     refresh_edge_configs,
 )
 from market_adapter import refresh_market_rules
@@ -48,9 +49,11 @@ def iso_now() -> str:
 
 
 def parse_time(value: Any) -> datetime | None:
-    """Accept AWC ISO strings or epoch seconds, returning aware UTC datetime."""
+    """Accept aware datetimes, AWC ISO strings or epoch seconds, returning UTC."""
     if value is None:
         return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(value, tz=timezone.utc)
     if isinstance(value, str):
@@ -124,6 +127,21 @@ def load_config(config_path: Path) -> dict[str, Any]:
     failure_pause = int(config.get("failure_pause_after_seconds", 1800))
     if failure_pause < 60:
         raise ValueError("failure_pause_after_seconds 不得小于 60")
+    warmup_retry = int(config.get("warmup_retry_seconds", 60))
+    if warmup_retry < 60:
+        raise ValueError("warmup_retry_seconds 不得小于 60")
+    warmup_history_hours = int(config.get("warmup_history_hours", 30))
+    if warmup_history_hours < 25 or warmup_history_hours > 96:
+        raise ValueError("warmup_history_hours 必须介于 25 和 96，以覆盖 IANA 夏令时回拨日")
+    warmup_chunk_size = int(config.get("warmup_stations_per_request", 10))
+    if warmup_chunk_size < 1 or warmup_chunk_size > 20:
+        raise ValueError("warmup_stations_per_request 必须介于 1 和 20，以降低历史报文单次响应截断风险")
+    edge_max_age = int(config.get("edge_config_max_age_seconds", 1800))
+    if edge_max_age < edge_interval:
+        raise ValueError("edge_config_max_age_seconds 不得小于 edge_refresh_interval_seconds")
+    market_rules_max_age = int(config.get("market_rules_max_age_seconds", 1800))
+    if market_rules_max_age < edge_interval:
+        raise ValueError("market_rules_max_age_seconds 不得小于 edge_refresh_interval_seconds")
     mode = str(config.get("mode", "paper")).lower().strip()
     if mode not in {"paper", "live"}:
         raise ValueError("mode 只能为 paper 或 live")
@@ -134,10 +152,16 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "edge_refresh_interval_seconds": edge_interval,
         "max_report_age_seconds": max_age,
         "failure_pause_after_seconds": failure_pause,
+        "warmup_retry_seconds": warmup_retry,
+        "warmup_history_hours": warmup_history_hours,
+        "warmup_stations_per_request": warmup_chunk_size,
+        "edge_config_max_age_seconds": edge_max_age,
+        "market_rules_max_age_seconds": market_rules_max_age,
         "mode": mode,
         "state_path": BASE_DIR / str(config.get("state_path", "data/state.json")),
         "event_dir": BASE_DIR / str(config.get("event_dir", "data/observations")),
         "signal_dir": BASE_DIR / str(config.get("signal_dir", "data/signals")),
+        "health_path": BASE_DIR / str(config.get("health_path", "data/health.json")),
         "contract_cities_path": BASE_DIR / str(config.get("contract_cities_path", "config/contract_cities.json")),
         "market_rules_path": BASE_DIR / str(config.get("market_rules_path", "data/market_rules.json")),
         "stations": normalize_stations(config.get("stations")) if config.get("stations") is not None else [],
@@ -222,8 +246,8 @@ def load_state(state_path: Path) -> dict[str, Any]:
         raise RuntimeError("状态文件结构无效；请先备份并删除该文件后重试")
     for key, default in (
         ("seen", {}), ("last_successful_scan_utc", None), ("edge_configs", {}),
-        ("edge_failures", {}), ("daily_extrema", {}), ("handled_candidate_buckets", {}),
-        ("market_rules", []), ("market_failures", {}), ("consecutive_failure_started_utc", None),
+        ("edge_failures", {}), ("daily_extrema", {}), ("daily_warmup", {}), ("handled_candidate_buckets", {}),
+        ("market_rules", []), ("market_rules_refreshed_at_utc", None), ("market_failures", {}), ("consecutive_failure_started_utc", None),
         ("paper_city_day_notional", {}), ("paper_city_day_total_debit", {}), ("execution_paused", False),
     ):
         state.setdefault(key, default)
@@ -237,13 +261,123 @@ def prune_seen(seen: dict[str, str], keep_hours: int = 72) -> dict[str, str]:
 
 def prune_state(state: dict[str, Any], keep_days: int = 3) -> None:
     cutoff = (utc_now() - timedelta(days=keep_days)).date().isoformat()
-    for key in ("daily_extrema",):
+    for key in ("daily_extrema", "daily_warmup"):
         state[key] = {item_key: value for item_key, value in state.get(key, {}).items() if str(value.get("market_local_date", "")) >= cutoff}
+
+
+def _warmup_state_key(city: dict[str, Any], local_date: str) -> str:
+    return f"{city['city_id']}|{local_date}"
+
+
+def _warmup_is_complete(state: dict[str, Any], city: dict[str, Any], local_date: str) -> bool:
+    entry = state.get("daily_warmup", {}).get(_warmup_state_key(city, local_date), {})
+    return entry.get("status") == "complete" and entry.get("market_local_date") == local_date
+
+
+def _warmup_due_cities(state: dict[str, Any], cities: dict[str, dict[str, Any]], target_dates: dict[str, str], retry_seconds: int) -> list[dict[str, Any]]:
+    now = utc_now()
+    due: list[dict[str, Any]] = []
+    for city in cities.values():
+        local_date = target_dates[city["icao"]]
+        if _warmup_is_complete(state, city, local_date):
+            continue
+        entry = state.get("daily_warmup", {}).get(_warmup_state_key(city, local_date), {})
+        attempted = parse_time(entry.get("last_attempt_utc"))
+        if attempted is None or (now - attempted).total_seconds() >= retry_seconds:
+            due.append(city)
+    return due
+
+
+def _rebuild_daily_extrema_from_history(state: dict[str, Any], cities: dict[str, dict[str, Any]], reports: list[dict[str, Any]], fetched_at: str, source_endpoint: str, target_dates: dict[str, str]) -> dict[str, int]:
+    """Rebuild only current market-local days; this path never emits signals or marks events seen."""
+    values: dict[str, list[tuple[float, str]]] = {}
+    for report in reports:
+        report_type = str(report.get("metarType", "")).upper()
+        icao = str(report.get("icaoId", "")).upper()
+        city = cities.get(icao)
+        raw = str(report.get("rawOb", "")).strip()
+        report_time = parse_time(report.get("reportTime") or report.get("obsTime"))
+        if report_type not in SUPPORTED_TYPES or city is None or not raw or report_time is None:
+            continue
+        local_date = local_market_date(report_time, city)
+        if local_date != target_dates[icao]:
+            continue
+        temperature = observed_temperature_native({"raw_metar": raw, "temperature_c": report.get("temp")}, city)
+        if temperature is None:
+            continue
+        value, _precision = temperature
+        values.setdefault(_warmup_state_key(city, local_date), []).append((value, as_utc_string(report_time)))
+
+    extrema: dict[str, Any] = state.setdefault("daily_extrema", {})
+    warmups: dict[str, Any] = state.setdefault("daily_warmup", {})
+    complete_count = 0
+    missing_count = 0
+    for city in cities.values():
+        local_date = target_dates[city["icao"]]
+        key = _warmup_state_key(city, local_date)
+        series = values.get(key, [])
+        if not series:
+            extrema.pop(key, None)
+            warmups[key] = {
+                "status": "failed_no_current_local_day_reports", "city_id": city["city_id"], "icao": city["icao"],
+                "market_local_date": local_date, "last_attempt_utc": fetched_at, "source_endpoint": source_endpoint,
+                "history_replay_emits_signals": False,
+            }
+            missing_count += 1
+            continue
+        extrema[key] = {
+            "city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
+            "market_unit": city["market_unit"], "high": max(item[0] for item in series), "low": min(item[0] for item in series),
+            "initialized_by_event_id": "iana_local_day_warmup", "updated_at_utc": fetched_at,
+            "warmup_report_count": len(series), "warmup_earliest_report_time_utc": min(item[1] for item in series),
+            "warmup_latest_report_time_utc": max(item[1] for item in series),
+        }
+        warmups[key] = {
+            "status": "complete", "city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
+            "last_attempt_utc": fetched_at, "completed_at_utc": fetched_at, "source_endpoint": source_endpoint,
+            "history_report_count": len(series), "history_replay_emits_signals": False,
+        }
+        complete_count += 1
+    return {"complete": complete_count, "missing_current_local_day_reports": missing_count}
+
+
+def warm_up_current_local_days(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Fail closed until a deterministic reportTime-to-IANA replay has completed for every current local day."""
+    target_dates = {icao: local_market_date(utc_now(), city) for icao, city in cities.items()}
+    due = _warmup_due_cities(state, cities, target_dates, config["warmup_retry_seconds"])
+    if not due:
+        return {"status": "already_complete", "city_count": len(cities)}
+    fetched_at = iso_now()
+    station_ids = list(cities)
+    all_reports: list[dict[str, Any]] = []
+    endpoints: list[str] = []
+    try:
+        for station_chunk in chunks(station_ids, config["warmup_stations_per_request"]):
+            reports, endpoint = fetch_awc_reports(station_chunk, config["warmup_history_hours"])
+            all_reports.extend(reports)
+            endpoints.append(endpoint)
+    except Exception as exc:
+        warmups: dict[str, Any] = state.setdefault("daily_warmup", {})
+        for city in due:
+            local_date = target_dates[city["icao"]]
+            warmups[_warmup_state_key(city, local_date)] = {
+                "status": "failed_fetch", "city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
+                "last_attempt_utc": fetched_at, "error": f"{type(exc).__name__}: {exc}", "history_replay_emits_signals": False,
+            }
+        return {"status": "failed_fetch", "due_city_count": len(due), "error": f"{type(exc).__name__}: {exc}"}
+    due_by_icao = {city["icao"]: city for city in due}
+    summary = _rebuild_daily_extrema_from_history(state, due_by_icao, all_reports, fetched_at, ";".join(endpoints), target_dates)
+    return {"status": "completed", "due_city_count": len(due), "reports_seen": len(all_reports), "history_hours": config["warmup_history_hours"], **summary}
 
 
 def edge_refresh_due(state: dict[str, Any], interval_seconds: int) -> bool:
     prior = parse_time(state.get("last_edge_refresh_utc"))
     return prior is None or (utc_now() - prior).total_seconds() >= interval_seconds
+
+
+def cache_is_fresh(timestamp: Any, max_age_seconds: int) -> bool:
+    parsed = parse_time(timestamp)
+    return parsed is not None and 0 <= (utc_now() - parsed).total_seconds() <= max_age_seconds
 
 
 def refresh_configuration(state: dict[str, Any], config: dict[str, Any], cities: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
@@ -260,6 +394,7 @@ def refresh_configuration(state: dict[str, Any], config: dict[str, Any], cities:
         rules, failures = refresh_market_rules(cities, local_dates)
         state["market_rules"] = rules
         state["market_failures"] = failures
+        state["market_rules_refreshed_at_utc"] = iso_now()
     except Exception as exc:
         state["last_market_refresh_error"] = f"{type(exc).__name__}: {exc}"
     return edge_summary
@@ -293,6 +428,7 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     fetched_at = iso_now()
     state = load_state(config["state_path"])
     cities = load_contract_cities(config["contract_cities_path"])
+    warmup_summary = warm_up_current_local_days(config, state, cities)
     # Process published observations with the last known good edge configuration first.
     # The slower TAF/Wunderground refresh runs after this minute's fact path.
     refresh_summary: dict[str, Any] | None = None
@@ -315,7 +451,7 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     for record in new_events:
         seen[record["event_id"]] = fetched_at
     state["seen"] = prune_seen(seen)
-    state["last_successful_scan_utc"] = fetched_at
+    state["last_successful_scan_utc"] = None  # Set to completion time only after every deterministic stage succeeds.
     state["last_report_count"] = len(normalized)
     state["last_new_event_count"] = len(new_events)
     state["consecutive_failure_started_utc"] = None
@@ -325,12 +461,33 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
         city = cities.get(event["airport_icao"])
         if city is None:
             continue
-        for signal in evaluate_observation(state, event, city, market_rules, config["max_report_age_seconds"]):
+        report_time = parse_time(event.get("report_time_utc"))
+        local_date = local_market_date(report_time, city) if report_time else None
+        if local_date is None or not _warmup_is_complete(state, city, local_date):
+            signals.append({
+                "signal_type": "no_signal", "reason": "daily_extrema_untrusted_warmup_incomplete",
+                "event_id": event.get("event_id"), "icao": city["icao"], "market_local_date": local_date,
+                "disclaimer": "No candidate is allowed until reportTime-to-IANA historical warm-up completes for this local market day.",
+            })
+            continue
+        if not cache_is_fresh(state.get("market_rules_refreshed_at_utc"), config["market_rules_max_age_seconds"]):
+            signals.append({
+                "signal_type": "no_signal", "reason": "market_rules_stale",
+                "event_id": event.get("event_id"), "icao": city["icao"], "market_local_date": local_date,
+                "market_rules_refreshed_at_utc": state.get("market_rules_refreshed_at_utc"),
+                "max_market_rules_age_seconds": config["market_rules_max_age_seconds"],
+            })
+            continue
+        for signal in evaluate_observation(
+            state, event, city, market_rules, config["max_report_age_seconds"], config["edge_config_max_age_seconds"],
+        ):
             signals.append(enrich_execution(signal, config["mode"], state))
     # Refresh future edge/rule inputs only after this minute's time-sensitive observations.
     refresh_summary = refresh_configuration(state, config, cities)
+    state["last_successful_scan_utc"] = iso_now()
     prune_state(state)
     atomic_json_write(config["state_path"], state)
+    health = write_health_snapshot(config, state, cities)
     event_file = append_jsonl(config["event_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", new_events)
     signal_file = append_jsonl(config["signal_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", signals)
     for event in new_events:
@@ -346,6 +503,8 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
         "reports_seen": len(normalized),
         "new_events": len(new_events),
         "candidate_signals": candidate_count,
+        "warmup": warmup_summary,
+        "health_status": health["status"],
         "event_file": str(event_file) if event_file else None,
         "signal_file": str(signal_file) if signal_file else None,
         "mode": config["mode"],
@@ -363,8 +522,10 @@ def run_loop(config: dict[str, Any]) -> None:
     # User-confirmed startup behavior: obtain edge inputs once before the first fact scan.
     startup_state = load_state(config["state_path"])
     startup_cities = load_contract_cities(config["contract_cities_path"])
+    startup_warmup = warm_up_current_local_days(config, startup_state, startup_cities)
     startup_summary = refresh_configuration(startup_state, config, startup_cities)
     atomic_json_write(config["state_path"], startup_state)
+    print(f"[启动 IANA warm-up] {startup_warmup}")
     print(f"[启动边缘配置] {startup_summary or {'status': 'cached'}}")
     failure_started: datetime | None = None
     while True:
@@ -375,6 +536,7 @@ def run_loop(config: dict[str, Any]) -> None:
             print("\n扫描器已停止。")
             return
         except Exception as exc:
+            write_failure_health(config, exc)
             failure_started = failure_started or utc_now()
             elapsed = (utc_now() - failure_started).total_seconds()
             status = "[扫描暂停：连续失败达到阈值]" if elapsed >= config["failure_pause_after_seconds"] else "[扫描失败]"
@@ -382,9 +544,59 @@ def run_loop(config: dict[str, Any]) -> None:
         sleep_to_next_interval(interval)
 
 
+def build_health_snapshot(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], last_error: str | None = None) -> dict[str, Any]:
+    now = utc_now()
+    target_dates = {icao: local_market_date(now, city) for icao, city in cities.items()}
+    untrusted_warmups = [
+        {"icao": city["icao"], "market_local_date": target_dates[city["icao"]], "status": state.get("daily_warmup", {}).get(_warmup_state_key(city, target_dates[city["icao"]]), {}).get("status", "missing")}
+        for city in cities.values() if not _warmup_is_complete(state, city, target_dates[city["icao"]])
+    ]
+    stale_edges: list[dict[str, str]] = []
+    for city in cities.values():
+        local_date = target_dates[city["icao"]]
+        for direction in ("high", "low"):
+            edge = state.get("edge_configs", {}).get(f"{city['city_id']}|{local_date}|{direction}", {})
+            if not cache_is_fresh(edge.get("configured_at_utc"), config["edge_config_max_age_seconds"]):
+                stale_edges.append({"icao": city["icao"], "market_local_date": local_date, "direction": direction})
+    last_scan_fresh = cache_is_fresh(state.get("last_successful_scan_utc"), config["scan_interval_seconds"] * 2 + 30)
+    market_rules_fresh = cache_is_fresh(state.get("market_rules_refreshed_at_utc"), config["market_rules_max_age_seconds"])
+    healthy = (
+        not last_error and last_scan_fresh and market_rules_fresh and not untrusted_warmups and not stale_edges
+        and not state.get("edge_failures", {}) and not state.get("market_failures", {})
+    )
+    return {
+        "generated_at_utc": iso_now(), "status": "healthy" if healthy else "degraded",
+        "critical_path": "deterministic_iana_state_machine_only", "llm_in_minute_path": False,
+        "last_successful_scan_utc": state.get("last_successful_scan_utc"), "last_scan_fresh": last_scan_fresh,
+        "market_rules_refreshed_at_utc": state.get("market_rules_refreshed_at_utc"), "market_rules_fresh": market_rules_fresh,
+        "untrusted_warmup_count": len(untrusted_warmups), "untrusted_warmups": untrusted_warmups,
+        "stale_edge_count": len(stale_edges), "stale_edges": stale_edges,
+        "edge_failure_count": len(state.get("edge_failures", {})), "market_failure_count": len(state.get("market_failures", {})),
+        "last_error": last_error,
+    }
+
+
+def write_health_snapshot(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], last_error: str | None = None) -> dict[str, Any]:
+    snapshot = build_health_snapshot(config, state, cities, last_error)
+    atomic_json_write(config["health_path"], snapshot)
+    return snapshot
+
+
+def write_failure_health(config: dict[str, Any], error: Exception) -> None:
+    prior = load_json(config["health_path"], {})
+    if not isinstance(prior, dict):
+        prior = {}
+    prior.update({
+        "generated_at_utc": iso_now(), "status": "degraded", "critical_path": "deterministic_iana_state_machine_only",
+        "llm_in_minute_path": False, "last_error": f"{type(error).__name__}: {error}",
+    })
+    atomic_json_write(config["health_path"], prior)
+
+
 def show_status(config: dict[str, Any]) -> None:
     state = load_state(config["state_path"])
     cities = load_contract_cities(config["contract_cities_path"])
+    health = build_health_snapshot(config, state, cities)
     print(json.dumps({
         "contract_station_count": len(cities),
         "scan_interval_seconds": config["scan_interval_seconds"],
@@ -397,6 +609,10 @@ def show_status(config: dict[str, Any]) -> None:
         "market_rules": len(state.get("market_rules", [])),
         "edge_failures": len(state.get("edge_failures", {})),
         "dedupe_entries": len(state.get("seen", {})),
+        "health_status": health["status"],
+        "untrusted_warmup_count": health["untrusted_warmup_count"],
+        "stale_edge_count": health["stale_edge_count"],
+        "market_rules_fresh": health["market_rules_fresh"],
     }, ensure_ascii=False, indent=2))
 
 

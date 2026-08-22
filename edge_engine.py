@@ -482,7 +482,7 @@ def market_rules_for(rules: list[dict[str, Any]], city_id: str, local_date: str,
     ]
 
 
-def evaluate_observation(state: dict[str, Any], event: dict[str, Any], city: dict[str, Any], market_rules: list[dict[str, Any]], max_latency_seconds: int = 600) -> list[dict[str, Any]]:
+def evaluate_observation(state: dict[str, Any], event: dict[str, Any], city: dict[str, Any], market_rules: list[dict[str, Any]], max_latency_seconds: int = 600, max_edge_config_age_seconds: int = 1800) -> list[dict[str, Any]]:
     report_time = parse_utc(event.get("report_time_utc"))
     fetched_at = parse_utc(event.get("fetched_at_utc")) or utc_now()
     if report_time is None:
@@ -528,6 +528,14 @@ def evaluate_observation(state: dict[str, Any], event: dict[str, Any], city: dic
             continue
         if config is None:
             signals.append({"signal_type": "no_signal", "reason": f"edge_source_unavailable_{direction}", "event_id": event.get("event_id"), "local_date": local_date})
+            continue
+        configured_at = parse_utc(config.get("configured_at_utc"))
+        if configured_at is None or (fetched_at - configured_at).total_seconds() > max_edge_config_age_seconds:
+            signals.append({
+                "signal_type": "no_signal", "reason": f"edge_config_stale_{direction}", "event_id": event.get("event_id"),
+                "local_date": local_date, "edge_configured_at_utc": config.get("configured_at_utc"),
+                "max_edge_config_age_seconds": max_edge_config_age_seconds,
+            })
             continue
         activation = float(config["activation_edge_native"])
         in_edge = value >= activation if direction == "high" else value <= activation

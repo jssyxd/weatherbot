@@ -16,13 +16,14 @@
 
 | 层 | 频率 | 数据 | 作用 |
 |---|---:|---|---|
+| IANA warm-up 层 | 启动、恢复及每个城市跨本地午夜后 | AWC 最近 30 小时 METAR/SPECI | 按 `reportTime UTC → ICAO IANA 时区` 重放当前当地日，只重建 high/low，**绝不生成信号**。未完成即失败关闭。 |
 | 事实观测层 | 60 秒 | AWC METAR/SPECI | 去重、按 `reportTime UTC → ICAO IANA 时区` 归属当地日、更新候选日高/日低。 |
 | 边缘配置层 | 启动时一次；之后 15 分钟 | AWC TAF → Open-Meteo ECMWF IFS 0.25° → WU Forecast | 按城市、当地市场日、最高/最低方向独立创建预测激活边缘。 |
 | 公开市场规则层 | 与边缘配置刷新同周期 | Polymarket Gamma 公开事件元数据 | 按整个事件聚合全部温度桶，解析每个桶的 NO token ID；不读账户、不下单。 |
 | 信号层 | 新报文到达时 | 本地确定性状态机 | 仅在边缘内出现新的候选日高/日低且紧邻桶被候选排除时生成审计信号。 |
 | Paper 成交层 | 仅候选信号时 | CLOB 公开订单簿和公开费率 | 逐档模拟 FAK 的可成交份额、平均价、费用与城市—当地日总现金上限；不签名、不提交订单。 |
 
-实时关键路径不包含 LLM。报文判重、当地日、候选极值、边缘、桶、精度保护、幂等和纸面预算均由确定性本地状态机处理。
+实时关键路径不包含 LLM。报文判重、IANA 当地日、历史重放、候选极值、边缘、桶、精度保护、幂等和纸面预算均由确定性本地状态机处理。任何 Hermes/LLM 只可离线读取 `data/health.json`、JSONL 日志并解释异常；不得参与分钟级判断、修改状态、下单或重试决策。
 
 ## 边缘来源优先级
 
@@ -36,6 +37,14 @@
 Open-Meteo 请求始终使用合同城市的 IANA `timezone`，并只取 `daily.time == market_local_date` 的值。C 市场请求摄氏度；F 市场请求华氏度。每个成功 ECMWF 边缘会记录明确模型 ID、请求/返回网格坐标、返回海拔、时区、UTC 偏移、原始响应哈希、端点和抓取时刻。绝不使用 `models=auto` / best-match，也不会用别的模型、前一日、气候值、相邻站或城市中心坐标静默填补。
 
 `high_activation = forecast_high − 1 度`，`low_activation = forecast_low + 1 度`。这是**进入关注区的门槛**，不是硬上/下限；实际温度显著超出预报时仍持续评估新的候选极值。Wunderground Forecast 适配器首次从公开 Forecast 页面发现其日预报地址，之后缓存该地址；不会把页面前端 key 写入配置或 Git。
+
+## IANA 当地日与恢复安全
+
+每个合约的日期键由合同指定站点的 IANA 时区决定：`market_local_date = reportTime_utc.astimezone(ZoneInfo(city_timezone)).date()`。`receiptTime` 只用于 AWC 来源延迟审计；`fetched_at` 只用于新鲜度门槛；它们**绝不**决定合约日归属。
+
+启动、恢复和每个城市进入新的当地日时，扫描器先请求最近 30 小时历史报文（每批默认 10 站，避免历史响应截断），只重建该城市当前 IANA 日的候选 high/low。此 warm-up 不标记实时事件、不输出候选、不读取订单簿。没有当前当地日报文、抓取失败或重放未完成时，实时层只写入 `daily_extrema_untrusted_warmup_incomplete`，不产生候选。
+
+边缘配置与市场规则均有 30 分钟最大有效期。缺少时间戳或超过有效期时，分别输出 `edge_config_stale_*` 或 `market_rules_stale`，而不是继续使用旧输入。`data/health.json` 持续记录 warm-up、扫描新鲜度、边缘和市场规则状态，供用户或离线解释器监视。
 
 ## 温度桶候选排除与观测安全边界
 
@@ -61,7 +70,7 @@ cp config.example.json config.json
 python3 metar_observer.py once
 ```
 
-`once` 会执行一轮扫描并写入本地状态。连续运行时，启动先刷新一次边缘配置，再按分钟扫描事实报文：
+`once` 会先完成当前 IANA 当地日的无信号 warm-up，再扫描一轮实时事实报文并写入本地状态。连续运行时，启动顺序是 IANA warm-up、边缘/市场规则刷新、按分钟扫描事实报文：
 
 ```bash
 # 连续运行（默认 paper；绝不提交真实交易）
@@ -74,7 +83,7 @@ python3 metar_observer.py status
 python3 metar_observer.py once --config /path/to/config.json
 ```
 
-运行时数据保存在被 Git 忽略的 `data/` 下：`observations/` 保存新报文，`signals/` 保存每个 signal/no-signal 理由，`state.json` 保存去重、当地日极值、边缘配置、公开市场规则、候选桶幂等键和 paper 总现金账本。初次启动需要形成当日基线；不应将启动前的历史报文误判为“刚到达的实时机会”。
+运行时数据保存在被 Git 忽略的 `data/` 下：`observations/` 保存新报文，`signals/` 保存每个 signal/no-signal 理由，`state.json` 保存去重、当地日极值、warm-up 审计、边缘配置、公开市场规则、候选桶幂等键和 paper 总现金账本，`health.json` 保存可监控的确定性健康快照。初次启动的历史重放不会被标记为“刚到达的实时机会”。
 
 ## 配置
 
@@ -87,11 +96,17 @@ python3 metar_observer.py once --config /path/to/config.json
   "edge_refresh_interval_seconds": 900,
   "max_report_age_seconds": 600,
   "failure_pause_after_seconds": 1800,
+  "warmup_history_hours": 30,
+  "warmup_stations_per_request": 10,
+  "warmup_retry_seconds": 60,
+  "edge_config_max_age_seconds": 1800,
+  "market_rules_max_age_seconds": 1800,
   "contract_cities_path": "config/contract_cities.json",
   "market_rules_path": "data/market_rules.json",
   "state_path": "data/state.json",
   "event_dir": "data/observations",
-  "signal_dir": "data/signals"
+  "signal_dir": "data/signals",
+  "health_path": "data/health.json"
 }
 ```
 
@@ -102,7 +117,13 @@ python3 metar_observer.py once --config /path/to/config.json
 | `edge_refresh_interval_seconds` | TAF、ECMWF、WU Forecast 与公开市场规则刷新 | 不得低于 900 秒。 |
 | `max_report_age_seconds` | 报文时刻至抓取的最大接受延迟 | 默认 600 秒；超时只记录 `no_signal`。 |
 | `failure_pause_after_seconds` | 连续扫描失败的暂停提示阈值 | 默认 1,800 秒。当前没有 live 执行器。 |
-| `stations_per_request` | 每个 AWC 请求合并的合同站数 | 默认 49，单次批量请求。 |
+| `stations_per_request` | 每分钟 AWC 请求合并的合同站数 | 默认 49，单次批量请求。 |
+| `warmup_history_hours` | 启动/恢复的历史重放窗口 | 默认 30；至少 25，以覆盖 IANA 夏令时回拨的 25 小时日。 |
+| `warmup_stations_per_request` | 历史重放的 AWC 分批站数 | 默认 10；最大 20，降低历史结果截断风险。 |
+| `warmup_retry_seconds` | 未完成 warm-up 的重试间隔 | 默认 60；未完成期间持续失败关闭。 |
+| `edge_config_max_age_seconds` | 预测边缘最大有效期 | 默认 1,800；过期边缘不参与候选。 |
+| `market_rules_max_age_seconds` | 公开市场规则最大有效期 | 默认 1,800；过期规则不参与候选。 |
+| `health_path` | 确定性运行健康快照 | 默认 `data/health.json`。 |
 
 ## Paper 与 Live 边界
 
@@ -129,11 +150,11 @@ python3 -m py_compile metar_observer.py edge_engine.py market_adapter.py paper_e
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖 49 城严格配置与固定坐标、当地日映射、TAF TX/TN 对齐、显式 ECMWF 回退与失败关闭、全事件桶聚合、相邻桶选择、华氏精度保护、COR 阻断、纸面订单簿/费用/总现金上限和 live 阻断。
+测试覆盖 49 城严格配置与固定坐标、IANA 当地日映射、跨午夜历史重放、warm-up 失败关闭、TAF TX/TN 对齐、显式 ECMWF 回退与失败关闭、边缘时效、全事件桶聚合、相邻桶选择、华氏精度保护、COR 阻断、纸面订单簿/费用/总现金上限和 live 阻断。
 
 ## 持续运行
 
-每分钟扫描需要长期在线的进程和持久化 `data/` 目录。可先在个人电脑后台运行以核验日志和延迟；如需 24/7，应选择提供持久磁盘、自动重启与日志监控的常驻托管环境。不要使用每分钟新建一个完整 AI 会话的定时任务；这套判断是本地确定性状态机，不需要 LLM 或 token 消耗。
+每分钟扫描需要长期在线的进程和持久化 `data/` 目录。可先在个人电脑后台运行以核验日志和延迟；如需 24/7，应选择提供持久磁盘、自动重启与日志监控的常驻托管环境。监视系统应读取 `data/health.json` 和 JSONL 日志；可让 Hermes/LLM 离线解释其中的异常并向用户报告，但不得把它接入分钟级判断。不要使用每分钟新建一个完整 AI 会话的定时任务；这套判断是本地确定性状态机，不需要 LLM 或 token 消耗。
 
 ## 数据来源与许可证
 
