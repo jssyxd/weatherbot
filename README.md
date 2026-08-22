@@ -1,261 +1,122 @@
-# 🌤️Poly(Weather) — Polymarket Weather Trading Bot(v3) Best Paired with Hermes
+# METAR/SPECI Observer
 
-Automated weather prediction market bot for Polymarket. Tracks 35 cities worldwide using a 5-model weather ensemble, computes expected value with Kelly sizing, and can run fully paper-simulated or with live CLOB order execution.
+这是一个**只读的机场气象观测扫描器**。它每分钟从 [AviationWeather.gov Data API](https://aviationweather.gov/data/api/) 获取已经发布的 METAR 与 SPECI，筛选新出现的报文，并以可审计的 JSONL 事件日志保存。
 
-Paper mode is default. Live trading requires explicit safety confirmation.
+本项目从 `technosheen/weatherbot` 的 MIT 许可代码库派生，但已移除所有预测、模型集成、市场请求、下单、钱包、结算、回测、凯利公式和收益计算代码。它**不会**调用任何数值天气预报、市场或交易接口。
 
-Follow this guide on setting up the hermes agent (but don't clone the repo from it) https://x.com/0xMovez/article/2045080054917476451
+> METAR/SPECI 是已发布的观测报告，不是预测。本工具仅记录报告内容和各时间戳；它不会发出交易指令，也不会替任何用户进行买卖。
 
----
+## 功能
 
-## What It Does
+每个扫描周期会以合规的批量请求读取配置中的 ICAO 站点，并仅处理 `METAR` 与 `SPECI` 类型。新报文会按 `ICAO + 报告类型 + 报告时间 + 原始报文` 去重，随后打印到标准输出，并追加写入按 UTC 日期分割的 JSONL 文件。
 
-Polymarket runs markets like *"Will the highest temperature in Chicago be between 46—47°F on March 7?"* These markets are often mispriced — the forecast says 78% likely but the market is trading at 8 cents.
+| 保留功能 | 行为 |
+|---|---|
+| 每分钟扫描 | 默认间隔为 60 秒；扫描周期自动对齐到下一分钟边界。 |
+| 已发布观测 | 只读取 AWC 已接收的 METAR/SPECI，不进行数值天气预报。 |
+| 多机场批量查询 | 默认包含原项目覆盖的 35 个机场；配置可增删 ICAO。 |
+| SPECI 捕获 | 例行 METAR 与非例行 SPECI 都保留，便于分析不规则天气变化。 |
+| 审计时间线 | 保存报文时间、AWC `receiptTime`、本机 UTC 抓取时间以及原始报文。 |
+| 去重与重启恢复 | 过去 72 小时的事件 ID 保存在状态文件，重启不会重复输出旧事件。 |
+| 只读存储 | 输出为 JSONL 和状态 JSON；不需要 API 密钥、钱包或私钥。 |
 
-The bot:
-1. Fetches up to 5 concurrent weather forecasts per city
-2. Builds an ensemble consensus and selects the best source
-3. Finds matching temperature buckets on Polymarket
-4. Runs a pre-trade analysis gate (price floor, portfolio drawdown, position cap, bucket rank, ensemble confidence)
-5. Sizes positions with fractional Kelly criterion
-6. Refreshes live ask/bid quotes immediately before entering and re-validates EV
-7. Resolves markets automatically by querying Polymarket's Gamma API
-8. Runs post-trade forensics and adapts thresholds from resolved outcomes
+## 不包含的内容
 
----
+| 已移除的能力 | 状态 |
+|---|---|
+| 数值天气预报模型与模型集成 | 已删除。 |
+| 集成预测、偏差校正、温度桶概率、EV、凯利仓位 | 已删除。 |
+| 市场查询、订单提交、取消、卖出 | 已删除。 |
+| 钱包、私钥、链上赎回、余额与仓位管理 | 已删除。 |
+| 预测回测、校准、胜率学习与收益报表 | 已删除。 |
 
-## Bot Versions
+## 安装与首次运行
 
-| File | Status | Description |
-|------|--------|-------------|
-| `bot_v1.py` | Reference | 6-city base bot. Good for understanding the core idea. |
-| `bot_v2.py` | Legacy | Intermediate version. Do not run in production. |
-| `bot_v3.py` | Production | Current operational bot. Live/paper. |
-
----
-
-## Architecture
-
-### Forecast sources
-| Source | Coverage | Notes |
-|--------|----------|-------|
-| ECMWF IFS 0.25° | Global | Default best source. Bias-corrected via Open-Meteo. |
-| ICON seamless (DWD) | Global | Strong for Europe. |
-| GFS/HRRR seamless | US only | Used for US cities via Open-Meteo; intentionally deprioritized because data shows it underperforms ECMWF for US cities. |
-| GEM seamless | Americas only | Canadian model. |
-| METAR | All (D+0 only) | Real-time station observations from aviationweather.gov. |
-
-### Ensemble consensus
-When 3+ models agree tightly (std < 1.0°F / 0.7°C), the ensemble mean becomes the best forecast. Otherwise ECMWF is preferred. Model disagreement is blended into sigma in quadrature.
-
-### 35 tracked cities
-
-US: NYC, Chicago, Miami, Dallas, Seattle, Atlanta, Los Angeles, Denver, Phoenix, Houston, Boston
-Europe: London, Paris, Munich, Ankara, Amsterdam, Madrid, Rome, Stockholm
-Asia / Middle East: Seoul, Tokyo, Shanghai, Singapore, Lucknow, Tel Aviv, Dubai, Mumbai, Bangkok, Jakarta
-Americas / Canada: Toronto, Sao Paulo, Buenos Aires
-Oceania / Africa: Wellington, Sydney, Johannesburg
-
-### Why airport coordinates matter
-Every Polymarket weather market resolves on a specific airport station. NYC → LaGuardia (KLGA), Dallas → Love Field (KDAL) — not DFW. City-center vs airport can differ 3–8°F. The bot uses exact airport lat/lon for every city.
-
----
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `bot_v3.py` | Main bot. `run`, `status`, `report` |
-| `clob_trader.py` | Polymarket CLOB wrapper — buy, sell, cancel, order status |
-| `weatherbot_redeem.py` | On-chain CTF/NegRisk redemption for resolved wins |
-| `weatherbot_audit.py` | Read-only wallet vs local reconciliation report |
-| `position_change_notifier.py` | Telegram notifier for position open/close events |
-| `config.json` | Runtime config (balance, gates, mode) — do not commit |
-| `.env` | Secrets (PK, CLOB credentials, Visual Crossing key) — NEVER commit |
-| `data/markets/` | One JSON per city/date — forecasts, snapshots, positions |
-| `data/state.json` | Bot accounting balance and win/loss record |
-| `data/calibration.json` | Per-city per-source sigma calibration |
-| `data/win_rates.json` | City+source win-rate tracking for EV multipliers |
-| `data/trade_journal.json` | Resolved trade forensics |
-| `data/learning/` | Nicolas adaptive model + trade log |
-
----
-
-## Installation
+本项目只使用 Python 标准库，Python 3.10+ 即可运行，不需要安装第三方包。
 
 ```bash
-git clone https://github.com/technosheen/weatherbot.git
+git clone https://github.com/jssyxd/weatherbot.git
 cd weatherbot
-python -m venv venv
-source venv/bin/activate
-pip install requests python-dotenv web3 py-clob-client
+cp config.example.json config.json
+python3 metar_observer.py once
 ```
 
-Create `.env`:
-```
-PK=your_private_key
-WALLET=0xYourWalletAddress
-SIG_TYPE=0
-CLOB_API_KEY=your_clob_api_key
-CLOB_SECRET=your_clob_secret
-CLOB_PASSPHRASE=your_clob_passphrase
+首次 `once` 执行会输出并写入过去一小时内可见的报文，作为本地事件基线。以后运行只会输出首次看到的新报文；去重状态保存在 `data/state.json`。
+
+```bash
+# 连续运行；每分钟扫描一次
+python3 metar_observer.py run
+
+# 查看最近一次扫描与去重状态
+python3 metar_observer.py status
+
+# 使用其他配置文件
+python3 metar_observer.py once --config /path/to/config.json
 ```
 
-Create `config.json` from `config.example.json` and tune for your risk tolerance. For pre-calibration, use conservative gates:
+## 配置
+
+`config.example.json` 的默认站点与原项目的 35 个机场一致。可以仅保留你需要的 ICAO，例如只扫描 ZSPD 与 RCTP：
 
 ```json
 {
-  "balance": 100.0,
-  "max_bet": 1.0,
-  "min_ev": 0.5,
-  "max_ev": 2.0,
-  "min_ensemble_std_f": 0.5,
-  "min_ensemble_std_c": 0.3,
-  "max_price": 0.30,
-  "min_volume": 300,
-  "min_hours": 4.0,
-  "max_hours": 48.0,
-  "kelly_fraction": 0.1,
-  "scan_interval": 3600,
-  "calibration_min": 30,
-  "vc_key": "YOUR_VISUAL_CROSSING_API_KEY",
-  "max_slippage": 0.03,
-  "mode": "paper",
-  "live_trade": false,
-  "v3_live_confirmed": false,
-  "min_price": 0.08,
-  "max_unrealized_loss": -5.0,
-  "max_open_positions": 10,
-  "balance_floor": 50.0,
-  "new_entries_enabled": true,
-  "auto_redeem_on_resolve": true
+  "scan_interval_seconds": 60,
+  "history_hours": 1,
+  "stations_per_request": 35,
+  "state_path": "data/state.json",
+  "event_dir": "data/observations",
+  "stations": [
+    {"icao": "ZSPD", "name": "Shanghai Pudong"},
+    {"icao": "RCTP", "name": "Taiwan Taoyuan"}
+  ]
 }
 ```
 
-**Important config fields:**
-- `live_trade`: enables CLOB order submission
-- `v3_live_confirmed`: explicit safety ack required before live trading
-- `new_entries_enabled`: set `false` for manage-only mode (monitor + resolve, no new buys)
-- `balance_floor`: hard stop — no new bets when bot accounting balance drops below this
+| 字段 | 含义 | 约束 |
+|---|---|---|
+| `scan_interval_seconds` | 两次扫描之间的秒数 | 不得低于 60；AWC 完整缓存按分钟更新。 |
+| `history_hours` | 每次查询回看的小时数 | 1–24；去重防止回看窗口内重复写入。 |
+| `stations_per_request` | 单次 AWC 请求合并的站点数 | 1–100；默认 35，降低请求数。 |
+| `state_path` | 去重与扫描状态文件 | 相对路径以项目目录为基准。 |
+| `event_dir` | JSONL 事件目录 | 按 UTC 日期生成文件。 |
+| `stations` | `icao` 与可选 `name` 的数组 | 仅应填写有效的四位 ICAO 代码。 |
 
----
+## 事件格式
 
-## Usage
+每条 JSONL 记录都可以独立解析，包含如下关键字段：
 
-### Paper mode (default)
-```bash
-python3 bot_v3.py status    # balance, open positions, unrealized PnL
-python3 bot_v3.py report    # full breakdown of resolved markets
-python3 bot_v3.py run       # continuous scan every hour + position monitor every 10 min
+```json
+{
+  "airport_icao": "ZSPD",
+  "report_type": "METAR",
+  "report_time_utc": "2026-08-22T12:00:00Z",
+  "receipt_time_utc": "2026-08-22T12:05:16.281Z",
+  "awc_receipt_delay_seconds": 316.281,
+  "fetched_at_utc": "2026-08-22T12:06:00Z",
+  "temperature_c": 28,
+  "raw_metar": "METAR ZSPD 221200Z 12007MPS 9999 BKN016 28/26 Q1005 NOSIG"
+}
 ```
 
-### Live mode
-Both `live_trade` and `v3_live_confirmed` must be `true` in `config.json`. The bot exits with code 2 if `live_trade` is true but `v3_live_confirmed` is false.
+三个时间字段不能互换：`report_time_utc` 是报文时刻，`receipt_time_utc` 是 AWC 记录的接收时间，`fetched_at_utc` 是扫描器自己的抓取时间。`awc_receipt_delay_seconds` 仅在两个源时间戳一致且非负时计算；否则为 `null`，并以 `awc_receipt_delay_status=source_time_inconsistent` 标记。它们都不等同于机场传感器的原始采样时刻。
 
-```bash
-# Start in a tmux session (persistent)
-tmux new-session -d -s weatherbot-v3 \
-  "cd weatherbot && source venv/bin/activate && PYTHONUNBUFFERED=1 python3 bot_v3.py run 2>&1 | tee -a /tmp/bot_v3_output.log"
+## 持续运行方式
 
-# Attach
- tmux attach -t weatherbot-v3
+每分钟扫描需要一个在后台持续运行的环境。以下两种方式都可行；请选择符合你的成本、可维护性和在线要求的方案。
 
-# Stop
- tmux send-keys -t weatherbot-v3 C-c
-```
+| 方式 | 运行效果 | 成本与限制 | 适合场景 |
+|---|---|---|---|
+| 本机后台进程 | 在你的电脑持续运行 `python3 metar_observer.py run` | 无额外托管费用，但电脑、网络和进程必须持续在线 | 先验证时延、仅个人使用、可接受本机中断。 |
+| 托管的后台任务/常驻服务 | 部署到可持续运行的托管环境 | 取决于所选服务；需要配置日志、重启与持久化存储 | 需要 24/7 扫描且不依赖个人电脑。 |
 
-### Redeem resolved wins
-```bash
-# Dry run first — prints expected payouts, gas, candidate markets
-python3 weatherbot_redeem.py
+在 Linux 主机上可先使用进程管理器或服务管理器启动；部署前请确保 `data/` 目录位于持久化磁盘，并监控进程重启与 API 错误日志。不要使用一次启动一个完整 AI 会话的分钟级定时任务来运行此类确定性轮询。
 
-# After reviewing, broadcast
-python3 weatherbot_redeem.py --broadcast
-```
+## 数据源与限流
 
-### Wallet audit (read-only)
-```bash
-python3 weatherbot_audit.py
-```
----
+上游使用 [AviationWeather.gov Data API](https://aviationweather.gov/data/api/)。其文档说明 METAR 覆盖全球、全量缓存每分钟更新、API 限制为每分钟最多 100 次请求，并建议按产品更新频率控制请求。默认配置将 35 个 ICAO 站合并为一个请求并以 60 秒间隔运行，远低于该限制。
 
-## Data Storage
+该 API 是**观测再发布层**。不同机场的上游观测、例行分钟相位和 SPECI 触发逻辑不同；AWC `receiptTime` 也不等于 Wunderground、其他聚合网站或任何市场的页面显示时间。
 
-Every market gets a JSON file in `data/markets/{city}_{date}.json` containing:
-- Hourly forecast snapshots from all models
-- Market price history
-- Position details (entry, exit, PnL, order IDs)
-- Final resolution outcome and actual temperature
+## 许可证与来源
 
-This data feeds:
-- **Self-calibration** — per-city per-source sigma updates after minimum resolved bets
-- **Win-rate tracking** — Bayesian-smoothed multipliers applied to EV thresholds
-- **Nicolas learning** — adaptive Kelly adjustment and EV floor from last N trades
-- **Post-trade forensics** — price tier, ensemble bucket, horizon, forecast drift, edge proximity
-
----
-
-## Pre-Trade Safety Gates (v3)
-
-1. **Manage-only gate** — if `new_entries_enabled` is false, no new positions ever open
-2. **Balance floor** — hard stop when accounting balance < floor
-3. **Price floor** — skip very-low-price bets (default 8¢, can be learned upward from forensics)
-4. **Portfolio drawdown gate** — pauses new bets when unrealized PnL < threshold
-5. **Open position cap** — max concurrent trading-slot positions (sub-5-share positions are held to resolution and do not consume slots)
-6. **Model consensus warning** — flagged when only 1 model supports the forecast
-7. **Bucket rank gate** — skips if target bucket is ranked > #4 by market price
-8. **Ensemble danger zone** — skips bets when ensemble std falls in a historically poor range
-9. **Exact-match centering** — for single-degree buckets, skips if forecast is too close to the bucket edge
-10. **EV cap** — skips bets with EV above a max threshold (historically correlated with losses)
-11. **Live quote re-validation** — fetches fresh ask/bid immediately before ordering; repriced EV must still clear gate
-12. **Sell-minimum sizing** — refuses to open positions below 5 shares because CLOB sell minimum is 5
-13. **City blacklist** — some cities are tracked but never bet due to negative historical edge
-14. **Per-city position limit** — only one open bet per city at any time
-
----
-
-## Live Reconciliation Safety
-
-v3 has first-class reconciliation helpers:
-- `assert_live_reconciliation_safe()` blocks new live trading if CLOB open orders or local pending states are untracked
-- Wallet-reconciled positions (proven by data-api + ERC1155 balances) survive stale CLOB order lookups
-- `prepare_live_exit()` handles unsellable positions by holding to resolution instead of creating orphan sells
-- Zombie guards prevent reopened markets from hiding resolved/closed positions
-- Ghost-resolution feeds forensics and learning even for locally-closed positions
-
-If `clob_trader.get_order_status()` returns `unknown` for older orders, do not infer filled/cancelled. Use `weatherbot_audit.py` or manual data-api/ERC1155 checks.
-
----
-
-## APIs Used
-
-| API | Auth | Purpose |
-|-----|------|---------|
-| Open-Meteo | None | ECMWF, ICON, GFS/HRRR, GEM forecasts |
-| Aviation Weather (METAR) | None | Real-time station observations |
-| Polymarket Gamma API | None | Market data, event search, resolution prices |
-| Polymarket CLOB | API key + secret + passphrase | Order placement, cancellation, status |
-| Visual Crossing | Free key | Historical temps for resolution |
-| Polygon RPC | None | On-chain redemption, ERC1155 balance checks |
-
----
-
-## Testing
-
-```bash
-cd weatherbot
-source venv/bin/activate
-python3 -m pytest tests/ -q
-```
-
-Tests cover:
-- Probability / EV math consistency between paper and live modes
-- Live safety gates (reconciliation, new-entries, state integrity)
-- CLOB buy/sell sizing and minimum-share guards
-- Persistence and atomic JSON writes
-
----
-
-## Disclaimer
-
-This is not financial advice. Prediction markets carry real risk. Start in paper mode, run extensive backtests, and only enable live mode after understanding the full reconciliation and safety model.
+本仓库保留源仓库的 [MIT License](LICENSE)。初始派生来源为 [technosheen/weatherbot](https://github.com/technosheen/weatherbot)，随后进行了非预测、非交易的观测扫描器重构。
