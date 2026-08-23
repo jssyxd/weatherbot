@@ -531,6 +531,7 @@ def acquire_single_instance_lock(state_path: Path):
     read-modify-write race impossible.
     """
     lock_path = state_path.parent / "observer.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("w")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
