@@ -144,7 +144,7 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
                 "paper_fill_rejected_city_day_cap",
                 "该城市当地日的含费用总现金余量不足以容纳本档纸面订单。",
                 required_intent_total_debit_usdc=float(available_budget),
-                total_debit_budget_usdc=0.0, spent_city_day_total_debit_usdc=float(already_spent),
+                total_debit_budget_usdc=float(available_budget), spent_city_day_total_debit_usdc=float(already_spent),
             )
         remaining = available_budget
         filled_shares = Decimal("0")

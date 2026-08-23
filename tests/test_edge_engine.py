@@ -179,6 +179,37 @@ class EdgeEngineTests(unittest.TestCase):
         replayed = edge.evaluate_observation(state, dict(event, event_id="jump-again"), city, rules, 900)
         self.assertNotIn("candidate_no_signal", [item["signal_type"] for item in replayed])
 
+    def test_half_open_tail_bucket_killed_by_opposite_direction_does_not_crash(self) -> None:
+        city = self.cities["ZSPD"]
+        state: dict = {
+            "daily_extrema": {"shanghai|2026-08-22": {
+                "city_id": "shanghai", "icao": "ZSPD", "market_local_date": "2026-08-22",
+                "market_unit": "C", "high": 24.0, "low": 24.0,
+            }},
+            "handled_candidate_buckets": {},
+        }
+        # "25°C or below" tail bucket (lo=None) IS killed by a new high of 26
+        # (high >= 25 makes "highest <= 25" impossible). Sorting must not
+        # crash on the None lo bound (v2 review catch).
+        rules = [{
+            "market_rule_id": "event-high", "city_id": "shanghai", "market_local_date": "2026-08-22",
+            "direction": "high", "market_unit": "C", "enabled": True,
+            "buckets": [
+                {"bucket_id": "or-below-25", "lo": None, "hi": 25, "no_token_id": "no-tail"},
+                {"bucket_id": "25", "lo": 25, "hi": 26, "no_token_id": "no-25"},
+            ],
+        }]
+        event = {
+            "event_id": "jump", "report_time_utc": "2026-08-22T14:00:00Z",
+            "fetched_at_utc": "2026-08-22T14:10:00Z", "temperature_c": 26,
+            "raw_metar": "METAR ZSPD 221400Z 12007MPS 9999 26/24 Q1005 NOSIG",
+            "receipt_time_utc": "2026-08-22T14:08:08Z",
+        }
+        signals = edge.evaluate_observation(state, event, city, rules, 900)
+        candidates = [item for item in signals if item["signal_type"] == "candidate_no_signal"]
+        # both the tail bucket and the [25,26) bucket are newly dead
+        self.assertEqual(sorted(item["bucket"]["bucket_id"] for item in candidates), ["25", "or-below-25"])
+
     def test_midrange_fluctuation_within_seen_range_does_not_trigger(self) -> None:
         city = self.cities["ZSPD"]
         state: dict = {

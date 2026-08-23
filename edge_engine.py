@@ -154,10 +154,21 @@ def select_dead_buckets(buckets: list[dict[str, Any]], direction: str, previous:
     ascending (coldest dead bucket first), low sorted by lo ascending.
     """
     invalidated = [bucket for bucket in buckets if _bucket_newly_invalidated(bucket, direction, previous, current)]
+    # Half-open tail buckets ("X°C or below" for high, "X°C or higher" for low)
+    # ARE killable in the opposite direction and carry a None bound on the
+    # sorting side; never call float() on None (2026-08-23 v2 review catch).
+    def _key_hi(bucket: dict[str, Any]) -> float:
+        hi = bucket.get("hi")
+        return float(hi) if hi is not None else float("inf")
+
+    def _key_lo(bucket: dict[str, Any]) -> float:
+        lo = bucket.get("lo")
+        return float(lo) if lo is not None else -float("inf")
+
     if direction == "high":
-        invalidated.sort(key=lambda bucket: (float(bucket.get("hi", -float("inf"))), float(bucket.get("lo", -float("inf")))))
+        invalidated.sort(key=lambda bucket: (_key_hi(bucket), _key_lo(bucket)))
     else:
-        invalidated.sort(key=lambda bucket: (float(bucket.get("lo", float("inf"))), float(bucket.get("hi", float("inf")))))
+        invalidated.sort(key=lambda bucket: (_key_lo(bucket), _key_hi(bucket)))
     return invalidated
 
 
