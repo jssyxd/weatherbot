@@ -16,8 +16,8 @@ from typing import Any
 
 CLOB_BOOK_ENDPOINT = "https://clob.polymarket.com/book"
 CLOB_FEE_RATE_ENDPOINT = "https://clob.polymarket.com/fee-rate"
-MIN_PRICE_EXCLUSIVE = Decimal("0.10")
-MAX_PRICE_EXCLUSIVE = Decimal("0.96")
+MIN_PRICE_EXCLUSIVE = Decimal("0.05")
+MAX_PRICE_EXCLUSIVE = Decimal("0.95")
 TARGET_TOTAL_DEBIT = Decimal("1.00")
 CITY_DAY_MAX_TOTAL_DEBIT = Decimal("2.00")
 
@@ -73,7 +73,7 @@ def _strict_price_cap(tick_size: Decimal) -> Decimal:
     quotient = (MAX_PRICE_EXCLUSIVE / tick_size).to_integral_value(rounding=ROUND_DOWN)
     cap = (quotient - 1) * tick_size if quotient * tick_size == MAX_PRICE_EXCLUSIVE else quotient * tick_size
     if cap <= MIN_PRICE_EXCLUSIVE:
-        raise RuntimeError("CLOB tick_size 无法构造严格小于 0.96 的可交易价格")
+        raise RuntimeError("CLOB tick_size 无法构造严格小于 0.95 的可交易价格")
     return cap
 
 

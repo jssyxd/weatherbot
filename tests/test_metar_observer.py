@@ -101,14 +101,30 @@ class MetarObserverTests(unittest.TestCase):
     def test_health_snapshot_is_degraded_when_iana_warmup_is_missing(self) -> None:
         city = self.cities["ZSPD"]
         config = {
-            "scan_interval_seconds": 60, "edge_config_max_age_seconds": 1800,
-            "market_rules_max_age_seconds": 1800,
+            "scan_interval_seconds": 60, "market_rules_max_age_seconds": 1800,
         }
         snapshot = observer.build_health_snapshot(config, {}, {"ZSPD": city})
         self.assertEqual(snapshot["status"], "degraded")
         self.assertFalse(snapshot["llm_in_minute_path"])
         self.assertEqual(snapshot["critical_path"], "deterministic_iana_state_machine_only")
         self.assertEqual(snapshot["untrusted_warmup_count"], 1)
+
+    def test_two_minute_scan_interval_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(json.dumps({"scan_interval_seconds": 120, "stations": ["ZSPD"]}), encoding="utf-8")
+            loaded = observer.load_config(config_path)
+            self.assertEqual(loaded["scan_interval_seconds"], 120)
+
+    def test_single_instance_lock_is_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            first = observer.acquire_single_instance_lock(state_path)
+            try:
+                with self.assertRaises(RuntimeError):
+                    observer.acquire_single_instance_lock(state_path)
+            finally:
+                first.close()
 
     def test_warmup_history_window_must_cover_ianna_fallback_day(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

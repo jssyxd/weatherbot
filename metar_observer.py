@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Minute-by-minute METAR/SPECI candidate-edge observer.
+"""Two-minute METAR/SPECI dead-bucket observer (tree1).
 
-The program scans published AviationWeather.gov METAR/SPECI reports every minute
-for 49 verified contract stations.  It uses TAF first and Wunderground Forecast
-only as a 15-minute edge-configuration input.  It never loads credentials,
-reads a wallet, signs an order, or submits a real trade.  ``mode=live`` is an
-explicitly blocked compatibility boundary until a separately reviewed executor
-is implemented by the user.
+The program scans published AviationWeather.gov METAR/SPECI reports every two
+minutes for 49 verified contract stations. It never uses forecasts: the day's
+first report initialises the IANA-local baseline and every later new daily
+extreme marks the previous-extreme temperature bucket as dead (candidate
+BUY_NO). It never loads credentials, reads a wallet, signs an order, or
+submits a real trade. ``mode=live`` is an explicitly blocked compatibility
+boundary until a separately reviewed executor is implemented by the user.
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -29,7 +32,6 @@ from edge_engine import (
     load_market_rules,
     local_market_date,
     observed_temperature_native,
-    refresh_edge_configs,
 )
 from market_adapter import refresh_market_rules
 from paper_execution import simulate_paper_fak
@@ -118,10 +120,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
     chunk_size = int(config.get("stations_per_request", 49))
     if chunk_size < 1 or chunk_size > 100:
         raise ValueError("stations_per_request 必须介于 1 和 100")
-    edge_interval = int(config.get("edge_refresh_interval_seconds", 900))
-    if edge_interval < 900:
-        raise ValueError("edge_refresh_interval_seconds 不得小于 900")
-    max_age = int(config.get("max_report_age_seconds", 600))
+    max_age = int(config.get("max_report_age_seconds", 900))
     if max_age < 60:
         raise ValueError("max_report_age_seconds 不得小于 60")
     failure_pause = int(config.get("failure_pause_after_seconds", 1800))
@@ -136,12 +135,9 @@ def load_config(config_path: Path) -> dict[str, Any]:
     warmup_chunk_size = int(config.get("warmup_stations_per_request", 10))
     if warmup_chunk_size < 1 or warmup_chunk_size > 20:
         raise ValueError("warmup_stations_per_request 必须介于 1 和 20，以降低历史报文单次响应截断风险")
-    edge_max_age = int(config.get("edge_config_max_age_seconds", 1800))
-    if edge_max_age < edge_interval:
-        raise ValueError("edge_config_max_age_seconds 不得小于 edge_refresh_interval_seconds")
     market_rules_max_age = int(config.get("market_rules_max_age_seconds", 1800))
-    if market_rules_max_age < edge_interval:
-        raise ValueError("market_rules_max_age_seconds 不得小于 edge_refresh_interval_seconds")
+    if market_rules_max_age < 600:
+        raise ValueError("market_rules_max_age_seconds 不得小于 600")
     mode = str(config.get("mode", "paper")).lower().strip()
     if mode not in {"paper", "live"}:
         raise ValueError("mode 只能为 paper 或 live")
@@ -149,13 +145,11 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "scan_interval_seconds": interval,
         "history_hours": history_hours,
         "stations_per_request": chunk_size,
-        "edge_refresh_interval_seconds": edge_interval,
         "max_report_age_seconds": max_age,
         "failure_pause_after_seconds": failure_pause,
         "warmup_retry_seconds": warmup_retry,
         "warmup_history_hours": warmup_history_hours,
         "warmup_stations_per_request": warmup_chunk_size,
-        "edge_config_max_age_seconds": edge_max_age,
         "market_rules_max_age_seconds": market_rules_max_age,
         "mode": mode,
         "state_path": BASE_DIR / str(config.get("state_path", "data/state.json")),
@@ -370,34 +364,49 @@ def warm_up_current_local_days(config: dict[str, Any], state: dict[str, Any], ci
     return {"status": "completed", "due_city_count": len(due), "reports_seen": len(all_reports), "history_hours": config["warmup_history_hours"], **summary}
 
 
-def edge_refresh_due(state: dict[str, Any], interval_seconds: int) -> bool:
-    prior = parse_time(state.get("last_edge_refresh_utc"))
-    return prior is None or (utc_now() - prior).total_seconds() >= interval_seconds
-
-
 def cache_is_fresh(timestamp: Any, max_age_seconds: int) -> bool:
     parsed = parse_time(timestamp)
     return parsed is not None and 0 <= (utc_now() - parsed).total_seconds() <= max_age_seconds
 
 
-def refresh_configuration(state: dict[str, Any], config: dict[str, Any], cities: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-    if not edge_refresh_due(state, config["edge_refresh_interval_seconds"]):
+def market_rules_cover_local_days(state: dict[str, Any], cities: dict[str, dict[str, Any]]) -> bool:
+    """True when cached rules include every city's current IANA-local market day.
+
+    Guards against the local-midnight gap: without it, a city that rolled to a
+    new local day could keep matching yesterday's rules until the refresh
+    interval elapses, silently suppressing candidates.
+    """
+    rules = state.get("market_rules", [])
+    if not rules:
+        return False
+    for city in cities.values():
+        local_date = local_market_date(utc_now(), city)
+        if not any(
+            rule.get("city_id") == city["city_id"] and rule.get("market_local_date") == local_date
+            for rule in rules
+        ):
+            return False
+    return True
+
+
+def refresh_market_rules_if_due(state: dict[str, Any], config: dict[str, Any], cities: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """Refresh Gamma market rules when stale or when any local day rolled over.
+
+    tree1 removes all forecast-edge configuration; only market rules (bucket /
+    token structure) are refreshed.
+    """
+    if cache_is_fresh(state.get("market_rules_refreshed_at_utc"), config["market_rules_max_age_seconds"]) and market_rules_cover_local_days(state, cities):
         return None
     local_dates = {icao: local_market_date(utc_now(), city) for icao, city in cities.items()}
-    edge_summary: dict[str, Any]
-    try:
-        edge_summary = refresh_edge_configs(state, cities, local_dates)
-    except Exception as exc:  # retain prior valid configurations; record an auditable failure
-        state["last_edge_refresh_error"] = f"{type(exc).__name__}: {exc}"
-        edge_summary = {"edge_refresh_error": state["last_edge_refresh_error"]}
     try:
         rules, failures = refresh_market_rules(cities, local_dates)
         state["market_rules"] = rules
         state["market_failures"] = failures
         state["market_rules_refreshed_at_utc"] = iso_now()
+        return {"market_rules": len(rules), "market_failures": len(failures)}
     except Exception as exc:
         state["last_market_refresh_error"] = f"{type(exc).__name__}: {exc}"
-    return edge_summary
+        return {"market_refresh_error": state["last_market_refresh_error"]}
 
 
 def enrich_execution(signal: dict[str, Any], mode: str, state: dict[str, Any]) -> dict[str, Any]:
@@ -429,9 +438,7 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     state = load_state(config["state_path"])
     cities = load_contract_cities(config["contract_cities_path"])
     warmup_summary = warm_up_current_local_days(config, state, cities)
-    # Process published observations with the last known good edge configuration first.
-    # The slower TAF/Wunderground refresh runs after this minute's fact path.
-    refresh_summary: dict[str, Any] | None = None
+    # Process published observations with the last known good market rules first.
     market_rules = state.get("market_rules") or load_market_rules(config["market_rules_path"])
     station_names = {icao: city["name"] for icao, city in cities.items()}
     station_ids = list(station_names)
@@ -479,11 +486,11 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
             })
             continue
         for signal in evaluate_observation(
-            state, event, city, market_rules, config["max_report_age_seconds"], config["edge_config_max_age_seconds"],
+            state, event, city, market_rules, config["max_report_age_seconds"],
         ):
             signals.append(enrich_execution(signal, config["mode"], state))
-    # Refresh future edge/rule inputs only after this minute's time-sensitive observations.
-    refresh_summary = refresh_configuration(state, config, cities)
+    # Refresh market rules only after this round's time-sensitive observations.
+    refresh_summary = refresh_market_rules_if_due(state, config, cities)
     state["last_successful_scan_utc"] = iso_now()
     prune_state(state)
     atomic_json_write(config["state_path"], state)
@@ -516,17 +523,39 @@ def sleep_to_next_interval(interval_seconds: int) -> None:
     time.sleep(max(0.1, interval_seconds - (now % interval_seconds)))
 
 
+def acquire_single_instance_lock(state_path: Path):
+    """Prevent concurrent observers from clobbering each other's state writes.
+
+    The 2026-08-23 toronto audit showed an old process overwriting a freshly
+    corrected state.json during restart; an exclusive flock makes that
+    read-modify-write race impossible.
+    """
+    lock_path = state_path.parent / "observer.lock"
+    handle = lock_path.open("w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise RuntimeError(
+            f"已有 metar_observer 实例持有 {lock_path}；请先停止旧进程（如 pgrep -f metar_observer）再启动。"
+        ) from exc
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
 def run_loop(config: dict[str, Any]) -> None:
     interval = config["scan_interval_seconds"]
+    lock_handle = acquire_single_instance_lock(config["state_path"])
     print(f"候选边缘扫描器已启动：每 {interval} 秒拉取已发布 METAR/SPECI；默认仅 paper 意图，绝不提交真实订单。")
-    # User-confirmed startup behavior: obtain edge inputs once before the first fact scan.
+    # Startup: IANA local-day warm-up first, then fresh market rules.
     startup_state = load_state(config["state_path"])
     startup_cities = load_contract_cities(config["contract_cities_path"])
     startup_warmup = warm_up_current_local_days(config, startup_state, startup_cities)
-    startup_summary = refresh_configuration(startup_state, config, startup_cities)
+    startup_rules = refresh_market_rules_if_due(startup_state, config, startup_cities)
     atomic_json_write(config["state_path"], startup_state)
     print(f"[启动 IANA warm-up] {startup_warmup}")
-    print(f"[启动边缘配置] {startup_summary or {'status': 'cached'}}")
+    print(f"[启动市场规则] {startup_rules or {'status': 'cached'}}")
     failure_started: datetime | None = None
     while True:
         try:
@@ -534,6 +563,7 @@ def run_loop(config: dict[str, Any]) -> None:
             failure_started = None
         except KeyboardInterrupt:
             print("\n扫描器已停止。")
+            lock_handle.close()
             return
         except Exception as exc:
             write_failure_health(config, exc)
@@ -551,18 +581,16 @@ def build_health_snapshot(config: dict[str, Any], state: dict[str, Any], cities:
         {"icao": city["icao"], "market_local_date": target_dates[city["icao"]], "status": state.get("daily_warmup", {}).get(_warmup_state_key(city, target_dates[city["icao"]]), {}).get("status", "missing")}
         for city in cities.values() if not _warmup_is_complete(state, city, target_dates[city["icao"]])
     ]
-    stale_edges: list[dict[str, str]] = []
+    stale_rules: list[dict[str, str]] = []
     for city in cities.values():
         local_date = target_dates[city["icao"]]
-        for direction in ("high", "low"):
-            edge = state.get("edge_configs", {}).get(f"{city['city_id']}|{local_date}|{direction}", {})
-            if not cache_is_fresh(edge.get("configured_at_utc"), config["edge_config_max_age_seconds"]):
-                stale_edges.append({"icao": city["icao"], "market_local_date": local_date, "direction": direction})
+        if not market_rules_cover_local_days(state, cities):
+            stale_rules.append({"icao": city["icao"], "market_local_date": local_date, "detail": "market_rules_missing_current_local_day"})
     last_scan_fresh = cache_is_fresh(state.get("last_successful_scan_utc"), config["scan_interval_seconds"] * 2 + 30)
     market_rules_fresh = cache_is_fresh(state.get("market_rules_refreshed_at_utc"), config["market_rules_max_age_seconds"])
     healthy = (
-        not last_error and last_scan_fresh and market_rules_fresh and not untrusted_warmups and not stale_edges
-        and not state.get("edge_failures", {}) and not state.get("market_failures", {})
+        not last_error and last_scan_fresh and market_rules_fresh and not untrusted_warmups and not stale_rules
+        and not state.get("market_failures", {})
     )
     return {
         "generated_at_utc": iso_now(), "status": "healthy" if healthy else "degraded",
@@ -570,8 +598,8 @@ def build_health_snapshot(config: dict[str, Any], state: dict[str, Any], cities:
         "last_successful_scan_utc": state.get("last_successful_scan_utc"), "last_scan_fresh": last_scan_fresh,
         "market_rules_refreshed_at_utc": state.get("market_rules_refreshed_at_utc"), "market_rules_fresh": market_rules_fresh,
         "untrusted_warmup_count": len(untrusted_warmups), "untrusted_warmups": untrusted_warmups,
-        "stale_edge_count": len(stale_edges), "stale_edges": stale_edges,
-        "edge_failure_count": len(state.get("edge_failures", {})), "market_failure_count": len(state.get("market_failures", {})),
+        "stale_rule_count": len(stale_rules), "stale_rules": stale_rules,
+        "market_failure_count": len(state.get("market_failures", {})),
         "last_error": last_error,
     }
 
@@ -600,18 +628,15 @@ def show_status(config: dict[str, Any]) -> None:
     print(json.dumps({
         "contract_station_count": len(cities),
         "scan_interval_seconds": config["scan_interval_seconds"],
-        "edge_refresh_interval_seconds": config["edge_refresh_interval_seconds"],
+        "max_report_age_seconds": config["max_report_age_seconds"],
         "mode": config["mode"],
         "live_executor": "not_present",
         "last_successful_scan_utc": state.get("last_successful_scan_utc"),
-        "last_edge_refresh_utc": state.get("last_edge_refresh_utc"),
-        "active_edge_configs": len(state.get("edge_configs", {})),
         "market_rules": len(state.get("market_rules", [])),
-        "edge_failures": len(state.get("edge_failures", {})),
+        "market_failures": len(state.get("market_failures", {})),
         "dedupe_entries": len(state.get("seen", {})),
         "health_status": health["status"],
         "untrusted_warmup_count": health["untrusted_warmup_count"],
-        "stale_edge_count": health["stale_edge_count"],
         "market_rules_fresh": health["market_rules_fresh"],
     }, ensure_ascii=False, indent=2))
 
@@ -628,7 +653,11 @@ def main() -> int:
     try:
         config = load_config(args.config)
         if args.command == "once":
-            scan_once(config)
+            lock_handle = acquire_single_instance_lock(config["state_path"])
+            try:
+                scan_once(config)
+            finally:
+                lock_handle.close()
         elif args.command == "run":
             run_loop(config)
         else:
