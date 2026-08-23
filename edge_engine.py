@@ -24,7 +24,11 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-REMARK_TEMPERATURE_RE = re.compile(r"\bT([01])(\d{3})\b")
+# AWC/NOAA remark temperature group, 9 chars: T[sign][TTT][DDHH] e.g.
+# T02430138 = +24.3°C (sign 0=+ 1=-, TTT = tenths of °C, trailing DDHH ignored).
+REMARK_TEMPERATURE_AWC_RE = re.compile(r"\bT([01])(\d{3})(\d{4})\b")
+# Legacy 4-char form: T[sign][TTT].
+REMARK_TEMPERATURE_LEGACY_RE = re.compile(r"\bT([01])(\d{3})\b")
 
 
 def utc_now() -> datetime:
@@ -108,7 +112,7 @@ def celsius_to_native(value_c: float, unit: str) -> float:
 
 def observed_temperature_native(event: dict[str, Any], city: dict[str, Any]) -> tuple[float, str] | None:
     raw = str(event.get("raw_metar") or "")
-    remark = REMARK_TEMPERATURE_RE.search(raw)
+    remark = REMARK_TEMPERATURE_AWC_RE.search(raw) or REMARK_TEMPERATURE_LEGACY_RE.search(raw)
     if remark:
         value_c = int(remark.group(2)) / 10.0
         if remark.group(1) == "1":

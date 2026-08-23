@@ -281,6 +281,44 @@ class EdgeEngineTests(unittest.TestCase):
         signals = edge.evaluate_observation(state, event, city, [rule], 900)
         self.assertIn("f_unit_precision_ambiguous", [item.get("reason") for item in signals])
 
+    def test_awc_nine_char_remark_temperature_group_is_parsed(self) -> None:
+        city = self.cities["ZSPD"]  # C market
+        # Real AWC format T[sign][TTT][DDHH]: T02220178 = +22.2°C
+        event = {"raw_metar": "METAR KLAX 230253Z 26008KT 10SM FEW280 22/17 A2984 RMK AO2 SLP098 T02220178 53006"}
+        parsed = edge.observed_temperature_native(event, city)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertAlmostEqual(parsed[0], 22.2, places=4)
+        self.assertEqual(parsed[1], "metar_remark_tenths_c")
+        # negative: T1[TTT] -> -3.8°C
+        event_neg = {"raw_metar": "METAR KXXX 230100Z 00000KT 10SM SKC M04/M08 A3010 RMK AO2 T10380000"}
+        parsed_neg = edge.observed_temperature_native(event_neg, city)
+        self.assertIsNotNone(parsed_neg)
+        assert parsed_neg is not None
+        self.assertAlmostEqual(parsed_neg[0], -3.8, places=4)
+
+    def test_fahrenheit_city_emits_candidate_when_remark_gives_tenths_precision(self) -> None:
+        city = self.cities["KLGA"]
+        state: dict = {
+            "daily_extrema": {"new-york-city|2026-08-22": {
+                "city_id": "new-york-city", "icao": "KLGA", "market_local_date": "2026-08-22",
+                "market_unit": "F", "high": 71.0, "low": 71.0,
+            }},
+            "handled_candidate_buckets": {},
+        }
+        rule = {
+            "market_rule_id": "event-high", "city_id": "new-york-city", "market_local_date": "2026-08-22",
+            "direction": "high", "market_unit": "F", "enabled": True,
+            "buckets": [{"bucket_id": "72", "lo": 72, "hi": 74, "market_id": "market-72", "no_token_id": "no-72"}],
+        }
+        # 23.5°C (RMK T-group T02350199) = 74.3°F >= 74 -> [72,74) bucket dead;
+        # with tenths precision the F precision guard must NOT block the candidate.
+        event = {"event_id": "f-remark", "report_time_utc": "2026-08-22T14:00:00Z", "fetched_at_utc": "2026-08-22T14:03:00Z", "temperature_c": 24, "raw_metar": "METAR KLGA 221400Z 00000KT 10SM 24/20 A3000 RMK AO2 T02350199"}
+        signals = edge.evaluate_observation(state, event, city, [rule], 900)
+        candidates = [item for item in signals if item["signal_type"] == "candidate_no_signal"]
+        self.assertEqual(len(candidates), 1, msg=[item.get("reason") for item in signals])
+        self.assertEqual(candidates[0]["bucket"]["bucket_id"], "72")
+
     def test_correction_is_audit_only_until_full_day_replay_exists(self) -> None:
         city = self.cities["ZSPD"]
         event = {"event_id": "cor", "report_time_utc": "2026-08-22T12:00:00Z", "fetched_at_utc": "2026-08-22T12:01:00Z", "temperature_c": 31, "raw_metar": "METAR ZSPD 221200Z COR 31/24 Q1005", "is_correction": True}
