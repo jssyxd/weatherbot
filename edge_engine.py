@@ -124,17 +124,6 @@ def _day_state_key(city: dict[str, Any], local_date: str) -> str:
     return f"{city['city_id']}|{local_date}"
 
 
-def _bucket_contains(bucket: dict[str, Any], value: float) -> bool:
-    """Half-open [lo, hi) containment; None bounds mean unbounded."""
-    lo = bucket.get("lo")
-    hi = bucket.get("hi")
-    if lo is not None and value < float(lo):
-        return False
-    if hi is not None and value >= float(hi):
-        return False
-    return True
-
-
 def _bucket_newly_invalidated(bucket: dict[str, Any], direction: str, previous: float | None, current: float) -> bool:
     """A bucket is newly dead when the current extreme crossed its boundary.
 
@@ -155,31 +144,21 @@ def _bucket_newly_invalidated(bucket: dict[str, Any], direction: str, previous: 
     return current < float(lo) and (previous is None or previous >= float(lo))
 
 
-def select_dead_bucket(buckets: list[dict[str, Any]], direction: str, previous: float | None, current: float) -> dict[str, Any] | None:
-    """Pick the single bucket the user should buy NO on.
+def select_dead_buckets(buckets: list[dict[str, Any]], direction: str, previous: float | None, current: float) -> list[dict[str, Any]]:
+    """Return EVERY bucket newly invalidated by the new extreme (tree1 v2).
 
-    User rule (tree1): the dead bucket is the one that held the previous
-    extreme value (12°C dropping to 11°C kills the "lowest 12°C" bucket
-    [12,13); 12°C rising to 13°C kills the "highest 12°C" bucket). When the
-    previous extreme is not covered by any bucket, fall back to the most
-    recently crossed boundary (max hi for high / min lo for low).
+    User rule: on a new daily high/low, ALL buckets that just became
+    impossible are tradeable, not only the one holding the previous extreme.
+    A fast 2-3 degree move kills 2-3 buckets at once (e.g. 24 -> 27 kills
+    [24,25), [25,26) and [26,27)). Order is deterministic: high sorted by hi
+    ascending (coldest dead bucket first), low sorted by lo ascending.
     """
     invalidated = [bucket for bucket in buckets if _bucket_newly_invalidated(bucket, direction, previous, current)]
-    if not invalidated:
-        return None
-    if previous is not None:
-        for bucket in invalidated:
-            if _bucket_contains(bucket, previous):
-                return bucket
     if direction == "high":
-        return max(
-            invalidated,
-            key=lambda bucket: (float(bucket.get("hi", -float("inf"))), float(bucket.get("lo", -float("inf")))),
-        )
-    return min(
-        invalidated,
-        key=lambda bucket: (float(bucket.get("lo", float("inf"))), float(bucket.get("hi", float("inf")))),
-    )
+        invalidated.sort(key=lambda bucket: (float(bucket.get("hi", -float("inf"))), float(bucket.get("lo", -float("inf")))))
+    else:
+        invalidated.sort(key=lambda bucket: (float(bucket.get("lo", float("inf"))), float(bucket.get("hi", float("inf")))))
+    return invalidated
 
 
 def market_rules_for(rules: list[dict[str, Any]], city_id: str, local_date: str, direction: str) -> list[dict[str, Any]]:
@@ -259,8 +238,7 @@ def evaluate_observation(
         for rule in rules:
             if rule.get("market_unit") != city["market_unit"]:
                 continue
-            selected = select_dead_bucket(rule.get("buckets", []), direction, previous, value)
-            if selected:
+            for selected in select_dead_buckets(rule.get("buckets", []), direction, previous, value):
                 candidate = dict(selected)
                 candidate["market_rule_id"] = rule.get("market_rule_id")
                 candidate["market_id"] = candidate.get("market_id")
@@ -281,28 +259,24 @@ def evaluate_observation(
                 "disclaimer": "An integer-C METAR body temperature cannot safely invalidate a Fahrenheit contract bucket without an RMK T-group.",
             })
             continue
-        selected_bucket = (
-            max(bucket_candidates, key=lambda bucket: (float(bucket.get("hi", -float("inf"))), float(bucket.get("lo", -float("inf")))))
-            if direction == "high"
-            else min(bucket_candidates, key=lambda bucket: (float(bucket.get("lo", float("inf"))), float(bucket.get("hi", float("inf")))))
-        )
-        handle_key = "|".join((str(selected_bucket.get("market_rule_id")), str(selected_bucket.get("bucket_id"))))
         handled = state.setdefault("handled_candidate_buckets", {})
-        if handle_key in handled:
-            signals.append({"signal_type": "no_signal", "reason": "candidate_bucket_already_handled", "event_id": event.get("event_id"), "local_date": local_date, "city_id": city["city_id"]})
-            continue
-        handled[handle_key] = event.get("fetched_at_utc")
-        signals.append({
-            "signal_type": "candidate_no_signal",
-            "candidate_status": "previous_extreme_bucket_invalidated_by_metar",
-            "event_id": event.get("event_id"),
-            "city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
-            "direction": direction, "market_unit": city["market_unit"],
-            "temperature_native": round(value, 4), "temperature_precision": precision,
-            "previous_candidate_extreme": round(previous, 4),
-            "bucket": selected_bucket, "handle_key": handle_key,
-            "disclaimer": "METAR/SPECI candidate signal only; not settlement-source confirmation.",
-        })
+        for selected_bucket in bucket_candidates:
+            handle_key = "|".join((str(selected_bucket.get("market_rule_id")), str(selected_bucket.get("bucket_id"))))
+            if handle_key in handled:
+                signals.append({"signal_type": "no_signal", "reason": "candidate_bucket_already_handled", "event_id": event.get("event_id"), "local_date": local_date, "city_id": city["city_id"], "handle_key": handle_key})
+                continue
+            handled[handle_key] = event.get("fetched_at_utc")
+            signals.append({
+                "signal_type": "candidate_no_signal",
+                "candidate_status": "dead_bucket_invalidated_by_metar",
+                "event_id": event.get("event_id"),
+                "city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
+                "direction": direction, "market_unit": city["market_unit"],
+                "temperature_native": round(value, 4), "temperature_precision": precision,
+                "previous_candidate_extreme": round(previous, 4),
+                "bucket": selected_bucket, "handle_key": handle_key,
+                "disclaimer": "METAR/SPECI candidate signal only; not settlement-source confirmation.",
+            })
     return signals
 
 

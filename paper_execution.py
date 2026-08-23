@@ -18,8 +18,22 @@ CLOB_BOOK_ENDPOINT = "https://clob.polymarket.com/book"
 CLOB_FEE_RATE_ENDPOINT = "https://clob.polymarket.com/fee-rate"
 MIN_PRICE_EXCLUSIVE = Decimal("0.05")
 MAX_PRICE_EXCLUSIVE = Decimal("0.95")
-TARGET_TOTAL_DEBIT = Decimal("1.00")
-CITY_DAY_MAX_TOTAL_DEBIT = Decimal("2.00")
+TARGET_TOTAL_DEBIT = Decimal("1.00")  # legacy default; real budget comes from _tier_total_debit
+CITY_DAY_MAX_TOTAL_DEBIT = Decimal("20.00")
+
+
+def _tier_total_debit(best_ask: Decimal) -> Decimal:
+    """Per-user spec: dead-bucket NO ask tiers.
+
+    5~30¢  -> 3 USDC intent (cheap dead bucket, bet more)
+    31~60¢ -> 2 USDC intent
+    61~95¢ -> 1 USDC intent (expensive NO, bet less)
+    """
+    if best_ask <= Decimal("0.30"):
+        return Decimal("3.00")
+    if best_ask <= Decimal("0.60"):
+        return Decimal("2.00")
+    return Decimal("1.00")
 
 
 def utc_now_string() -> str:
@@ -89,21 +103,17 @@ def _rejected(status: str, message: str, **details: Any) -> dict[str, Any]:
 
 
 def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    """Estimate a FAK BUY_NO fill from public book levels, under total-debit caps only."""
+    """Estimate a FAK BUY_NO fill from public book levels, under total-debit caps only.
+
+    Intent size is tiered by the NO best ask (5-30¢ -> 3 USDC, 31-60¢ -> 2 USDC,
+    61-95¢ -> 1 USDC); the city-day cap is 20 USDC.
+    """
     no_token_id = str(signal.get("bucket", {}).get("no_token_id") or "")
     city_day_key = f"{signal.get('city_id')}|{signal.get('market_local_date')}"
     ledger: dict[str, float] = state.setdefault("paper_city_day_total_debit", {})
     already_spent = Decimal(str(ledger.get(city_day_key, 0.0)))
-    remaining_city_budget = CITY_DAY_MAX_TOTAL_DEBIT - already_spent
-    if remaining_city_budget < TARGET_TOTAL_DEBIT:
-        return _rejected(
-            "paper_fill_rejected_city_day_cap",
-            "该城市当地日的含费用总现金余量不足以容纳固定 1 USDC 纸面订单。",
-            total_debit_budget_usdc=0.0, spent_city_day_total_debit_usdc=float(already_spent),
-        )
-    available_budget = TARGET_TOTAL_DEBIT
     if not no_token_id:
-        return _rejected("paper_fill_rejected_missing_no_token", "候选桶没有有效 NO token；未读取订单簿。", total_debit_budget_usdc=float(available_budget))
+        return _rejected("paper_fill_rejected_missing_no_token", "候选桶没有有效 NO token；未读取订单簿。")
     try:
         book, book_endpoint = fetch_order_book(no_token_id)
         fee, fee_endpoint = fetch_fee_rate(no_token_id)
@@ -124,8 +134,17 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
         if not MIN_PRICE_EXCLUSIVE < best_ask < MAX_PRICE_EXCLUSIVE:
             return _rejected(
                 "paper_fill_rejected_best_ask_outside_gate",
-                "最优 ask 不在严格价格门槛 (0.10, 0.96) 内。",
+                "最优 ask 不在严格价格门槛 (0.05, 0.95) 内。",
                 best_ask=float(best_ask), book_endpoint=book_endpoint, fee_endpoint=fee_endpoint,
+            )
+        available_budget = _tier_total_debit(best_ask)
+        remaining_city_budget = CITY_DAY_MAX_TOTAL_DEBIT - already_spent
+        if remaining_city_budget < available_budget:
+            return _rejected(
+                "paper_fill_rejected_city_day_cap",
+                "该城市当地日的含费用总现金余量不足以容纳本档纸面订单。",
+                required_intent_total_debit_usdc=float(available_budget),
+                total_debit_budget_usdc=0.0, spent_city_day_total_debit_usdc=float(already_spent),
             )
         remaining = available_budget
         filled_shares = Decimal("0")
@@ -178,4 +197,4 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
             "retrieved_at_utc": utc_now_string(),
         }
     except RuntimeError as exc:
-        return _rejected("paper_fill_unavailable", str(exc), no_token_id=no_token_id, total_debit_budget_usdc=float(available_budget))
+        return _rejected("paper_fill_unavailable", str(exc), no_token_id=no_token_id)

@@ -103,7 +103,8 @@ class EdgeEngineTests(unittest.TestCase):
                 {"bucket_id": "13", "lo": 13, "hi": 14, "no_token_id": "no-13"},
             ],
         }]
-        # 13 -> 11: "lowest 13°C" bucket [13,14) is impossible -> buy NO on 13.
+        # 13 -> 11: BOTH [13,14) and [12,13) are newly dead (11 < lo for both
+        # while previous 13 was still >= lo) -> buy NO on both buckets.
         event = {
             "event_id": "cold", "report_time_utc": "2026-08-22T14:00:00Z",
             "fetched_at_utc": "2026-08-22T14:10:00Z", "temperature_c": 11,
@@ -112,28 +113,24 @@ class EdgeEngineTests(unittest.TestCase):
         }
         signals = edge.evaluate_observation(state, event, city, rules, 900)
         candidates = [item for item in signals if item["signal_type"] == "candidate_no_signal"]
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["direction"], "low")
-        self.assertEqual(candidates[0]["bucket"]["bucket_id"], "13")
+        self.assertEqual([item["bucket"]["bucket_id"] for item in candidates], ["12", "13"])
+        self.assertEqual([item["direction"] for item in candidates], ["low", "low"])
         self.assertEqual(state["daily_extrema"]["shanghai|2026-08-22"]["low"], 11.0)
 
-    def test_multidegree_jump_still_targets_previous_extreme_bucket(self) -> None:
+    def test_multidegree_jump_kills_all_newly_invalidated_buckets(self) -> None:
         buckets = [
             {"bucket_id": "30", "lo": 30, "hi": 31},
             {"bucket_id": "31", "lo": 31, "hi": 32},
             {"bucket_id": "32", "lo": 32, "hi": 33},
         ]
-        # previous extreme 30.4 -> new high 33: the bucket holding 30.4 dies.
-        selected = edge.select_dead_bucket(buckets, "high", 30.4, 33.0)
-        self.assertIsNotNone(selected)
-        assert selected is not None
-        self.assertEqual(selected["bucket_id"], "30")
+        # 30.4 -> 33: all three buckets are newly dead; every one is tradeable.
+        dead = edge.select_dead_buckets(buckets, "high", 30.4, 33.0)
+        self.assertEqual([item["bucket_id"] for item in dead], ["30", "31", "32"])
         # user example: 12 -> 11 low kills "lowest 12°C" bucket [12,13)
         low_buckets = [{"bucket_id": "12", "lo": 12, "hi": 13}]
-        low_selected = edge.select_dead_bucket(low_buckets, "low", 12.0, 11.0)
-        self.assertIsNotNone(low_selected)
-        assert low_selected is not None
-        self.assertEqual(low_selected["bucket_id"], "12")
+        self.assertEqual([item["bucket_id"] for item in edge.select_dead_buckets(low_buckets, "low", 12.0, 11.0)], ["12"])
+        # an in-bucket move (no boundary crossed) kills nothing
+        self.assertEqual(edge.select_dead_buckets(low_buckets, "low", 12.0, 12.5), [])
 
     def test_open_ended_buckets_are_tolerated_and_never_dead(self) -> None:
         buckets = [
@@ -142,14 +139,45 @@ class EdgeEngineTests(unittest.TestCase):
             {"bucket_id": "or-above-30", "lo": 30, "hi": None},
         ]
         # Low direction 12 -> 11: picks the real bucket, open tails do not crash.
-        selected = edge.select_dead_bucket(buckets, "low", 12.0, 11.0)
-        self.assertIsNotNone(selected)
-        assert selected is not None
-        self.assertEqual(selected["bucket_id"], "12")
+        dead = edge.select_dead_buckets(buckets, "low", 12.0, 11.0)
+        self.assertEqual([item["bucket_id"] for item in dead], ["12"])
         # High direction 33 with only open-top bucket: nothing invalidated.
-        self.assertIsNone(edge.select_dead_bucket([{"bucket_id": "or-above-30", "lo": 30, "hi": None}], "high", 29.0, 33.0))
+        self.assertEqual(edge.select_dead_buckets([{"bucket_id": "or-above-30", "lo": 30, "hi": None}], "high", 29.0, 33.0), [])
         # Low direction with only open-bottom bucket: nothing invalidated.
-        self.assertIsNone(edge.select_dead_bucket([{"bucket_id": "or-below-20", "lo": None, "hi": 20}], "low", 12.0, 11.0))
+        self.assertEqual(edge.select_dead_buckets([{"bucket_id": "or-below-20", "lo": None, "hi": 20}], "low", 12.0, 11.0), [])
+
+    def test_fast_multi_degree_break_emits_one_candidate_per_dead_bucket(self) -> None:
+        city = self.cities["ZSPD"]
+        state: dict = {
+            "daily_extrema": {"shanghai|2026-08-22": {
+                "city_id": "shanghai", "icao": "ZSPD", "market_local_date": "2026-08-22",
+                "market_unit": "C", "high": 24.0, "low": 24.0,
+            }},
+            "handled_candidate_buckets": {},
+        }
+        rules = [{
+            "market_rule_id": "event-high", "city_id": "shanghai", "market_local_date": "2026-08-22",
+            "direction": "high", "market_unit": "C", "enabled": True,
+            "buckets": [
+                {"bucket_id": "24", "lo": 24, "hi": 25, "no_token_id": "no-24"},
+                {"bucket_id": "25", "lo": 25, "hi": 26, "no_token_id": "no-25"},
+                {"bucket_id": "26", "lo": 26, "hi": 27, "no_token_id": "no-26"},
+                {"bucket_id": "27", "lo": 27, "hi": 28, "no_token_id": "no-27"},
+            ],
+        }]
+        # 24 -> 27 in one report: buckets 24, 25, 26 are all impossible -> 3 NO buys.
+        event = {
+            "event_id": "jump", "report_time_utc": "2026-08-22T14:00:00Z",
+            "fetched_at_utc": "2026-08-22T14:10:00Z", "temperature_c": 27,
+            "raw_metar": "METAR ZSPD 221400Z 12007MPS 9999 27/24 Q1005 NOSIG",
+            "receipt_time_utc": "2026-08-22T14:08:08Z",
+        }
+        signals = edge.evaluate_observation(state, event, city, rules, 900)
+        candidates = [item for item in signals if item["signal_type"] == "candidate_no_signal"]
+        self.assertEqual([item["bucket"]["bucket_id"] for item in candidates], ["24", "25", "26"])
+        # idempotency: the same report replayed must not re-emit any candidate
+        replayed = edge.evaluate_observation(state, dict(event, event_id="jump-again"), city, rules, 900)
+        self.assertNotIn("candidate_no_signal", [item["signal_type"] for item in replayed])
 
     def test_midrange_fluctuation_within_seen_range_does_not_trigger(self) -> None:
         city = self.cities["ZSPD"]
