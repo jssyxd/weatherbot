@@ -1593,15 +1593,23 @@ def take_forecast_snapshot(city_slug, dates):
     loc     = LOCATIONS[city_slug]
     today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    with _cf.ThreadPoolExecutor(max_workers=4) as pool:
+    with _cf.ThreadPoolExecutor(max_workers=5) as pool:
         f_ecmwf = pool.submit(get_ecmwf, city_slug, dates)
         f_icon  = pool.submit(get_icon,  city_slug, dates)
         f_hrrr  = pool.submit(get_hrrr,  city_slug, dates)
         f_gem   = pool.submit(get_gem,   city_slug, dates)
+        # METAR (D+0 observed temp) fetched in the same pool: it used to run
+        # synchronously inside the snapshot loop below, so an 8s
+        # aviationweather.gov stall serialized behind the four NWP fetches and
+        # could add up to 8s per city (Bangkok 15.4s, etc.). Running it
+        # concurrently keeps the hard 8s timeout as a bound but never adds to
+        # the critical path of the NWP models.
+        f_metar = pool.submit(get_metar, city_slug)
         ecmwf = f_ecmwf.result()
         icon  = f_icon.result()
         hrrr  = f_hrrr.result()
         gem   = f_gem.result()
+        metar = f_metar.result()
 
     hrrr_cutoff = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d")
 
@@ -1613,7 +1621,7 @@ def take_forecast_snapshot(city_slug, dates):
             "icon":  icon.get(date),
             "hrrr":  hrrr.get(date) if date <= hrrr_cutoff else None,
             "gem":   gem.get(date),
-            "metar": get_metar(city_slug) if date == today else None,
+            "metar": metar if date == today else None,
         }
 
         # Build ensemble from all available NWP model temps
@@ -1924,6 +1932,14 @@ def scan_and_update():
                             continue
 
                     if volume >= MIN_VOLUME:
+                        # 2026-08-22: cached outcomePrices (≈ ±1¢) on dead markets produce
+                        # near-zero ask (e.g. $0.0105) with bid=0 — no real book to trade.
+                        # EV explodes on such quotes (Tokyo repeatedly showed EV +19~+30)
+                        # but the market cannot actually be bought. Skip placeholder quotes.
+                        if ask < 0.02:
+                            print(f"  [SKIP-ILLIQUID] {loc['name']} {date} — ask ${ask:.4f} near-zero (no real book)")
+                            save_market(mkt)
+                            continue
                         p  = bucket_prob(forecast_temp, t_low, t_high, sigma)
                         ev = calc_ev(p, ask)
                         ev_mult    = get_ev_multiplier(city_slug, best_source or "ecmwf")
@@ -1987,12 +2003,41 @@ def scan_and_update():
                 if best_signal:
                     skip_position = False
 
+                    # Refresh the signal against the live orderbook BEFORE pre-trade
+                    # analysis — the cached Gamma quote (outcomePrices ±1¢ proxy) can be
+                    # far off the real book (Seoul 2026-08-22: cached ask $0.135 vs real
+                    # $0.210). Analyzing on the live price means an APPROVED signal is
+                    # actually executable instead of being SKIPped at order time.
+                    try:
+                        r = requests.get(f"https://gamma-api.polymarket.com/markets/{best_signal['market_id']}", timeout=(3, 5))
+                        r.raise_for_status()
+                        mdata    = r.json()
+                        if LIVE_TRADE and (mdata.get("bestAsk") is None or mdata.get("bestBid") is None):
+                            raise ValueError("live quote missing bestAsk/bestBid")
+                        real_ask = float(mdata.get("bestAsk") if mdata.get("bestAsk") is not None else best_signal["entry_price"])
+                        real_bid = float(mdata.get("bestBid") if mdata.get("bestBid") is not None else best_signal["bid_at_entry"])
+                        real_spread = round(real_ask - real_bid, 4)
+                        if real_spread > MAX_SLIPPAGE or real_ask >= MAX_PRICE:
+                            print(f"  [SKIP] {loc['name']} {date} — real ask ${real_ask:.3f} spread ${real_spread:.3f}")
+                            skip_position = True
+                        else:
+                            ok, reason = validate_repriced_signal(best_signal, real_ask, real_bid, best_signal["ev_min_adj"])
+                            if not ok:
+                                print(f"  [SKIP] {loc['name']} {date} — {reason}")
+                                skip_position = True
+                    except Exception as e:
+                        print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {e}")
+                        if LIVE_TRADE:
+                            print("  [SKIP] live quote refresh failed — refusing to trade on stale Gamma proxy prices")
+                            skip_position = True
+
                     # Pre-trade analysis: price floor, portfolio gates, model consensus
-                    proceed, gate_reason = analyze_signal(
-                        best_signal, outcomes, snap, loc, city_slug, date, horizon
-                    )
-                    if not proceed:
-                        skip_position = True
+                    if not skip_position:
+                        proceed, gate_reason = analyze_signal(
+                            best_signal, outcomes, snap, loc, city_slug, date, horizon
+                        )
+                        if not proceed:
+                            skip_position = True
 
                     if not skip_position:
                         try:
