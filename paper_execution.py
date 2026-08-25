@@ -18,22 +18,13 @@ CLOB_BOOK_ENDPOINT = "https://clob.polymarket.com/book"
 CLOB_FEE_RATE_ENDPOINT = "https://clob.polymarket.com/fee-rate"
 MIN_PRICE_EXCLUSIVE = Decimal("0.05")
 MAX_PRICE_EXCLUSIVE = Decimal("0.95")
-TARGET_TOTAL_DEBIT = Decimal("1.00")  # legacy default; real budget comes from _tier_total_debit
+# Per-user spec: every paper order is a FIXED quantity of 5 shares (the
+# exchange minimum order size). No USDC-tier sizing: a $1-$3 intent often
+# cannot reach min_order_size=5 at ask >= 0.20, so those orders were being
+# rejected (paper_fill_rejected_below_min_order_size). The city-day total
+# debit cap (20 USDC) still bounds how many 5-share intents fit per day.
+TARGET_ORDER_SHARES = Decimal("5")
 CITY_DAY_MAX_TOTAL_DEBIT = Decimal("20.00")
-
-
-def _tier_total_debit(best_ask: Decimal) -> Decimal:
-    """Per-user spec: dead-bucket NO ask tiers.
-
-    5~30¢  -> 3 USDC intent (cheap dead bucket, bet more)
-    31~60¢ -> 2 USDC intent
-    61~95¢ -> 1 USDC intent (expensive NO, bet less)
-    """
-    if best_ask <= Decimal("0.30"):
-        return Decimal("3.00")
-    if best_ask <= Decimal("0.60"):
-        return Decimal("2.00")
-    return Decimal("1.00")
 
 
 def utc_now_string() -> str:
@@ -103,10 +94,10 @@ def _rejected(status: str, message: str, **details: Any) -> dict[str, Any]:
 
 
 def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    """Estimate a FAK BUY_NO fill from public book levels, under total-debit caps only.
+    """Estimate a FAK BUY_NO fill from public book levels.
 
-    Intent size is tiered by the NO best ask (5-30¢ -> 3 USDC, 31-60¢ -> 2 USDC,
-    61-95¢ -> 1 USDC); the city-day cap is 20 USDC.
+    Intent size is a FIXED 5 shares (the exchange minimum order size);
+    the city-day cap is 20 USDC total debit.
     """
     no_token_id = str(signal.get("bucket", {}).get("no_token_id") or "")
     city_day_key = f"{signal.get('city_id')}|{signal.get('market_local_date')}"
@@ -137,16 +128,15 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
                 "最优 ask 不在严格价格门槛 (0.05, 0.95) 内。",
                 best_ask=float(best_ask), book_endpoint=book_endpoint, fee_endpoint=fee_endpoint,
             )
-        available_budget = _tier_total_debit(best_ask)
         remaining_city_budget = CITY_DAY_MAX_TOTAL_DEBIT - already_spent
-        if remaining_city_budget < available_budget:
+        if remaining_city_budget <= 0:
             return _rejected(
                 "paper_fill_rejected_city_day_cap",
-                "该城市当地日的含费用总现金余量不足以容纳本档纸面订单。",
-                required_intent_total_debit_usdc=float(available_budget),
-                total_debit_budget_usdc=float(available_budget), spent_city_day_total_debit_usdc=float(already_spent),
+                "该城市当地日的含费用总现金余量已用尽。",
+                required_intent_total_debit_usdc=float(TARGET_ORDER_SHARES),
+                total_debit_budget_usdc=float(CITY_DAY_MAX_TOTAL_DEBIT), spent_city_day_total_debit_usdc=float(already_spent),
             )
-        remaining = available_budget
+        target_shares = TARGET_ORDER_SHARES
         filled_shares = Decimal("0")
         principal = Decimal("0")
         fees = Decimal("0")
@@ -159,8 +149,8 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
                 continue
             per_share_fee = fee_rate * price * (Decimal("1") - price)
             per_share_total = price + per_share_fee
-            affordable = _floor_size(remaining / per_share_total)
-            quantity = min(size, affordable)
+            # Fixed 5-share intent: walk levels until 5 shares are filled.
+            quantity = min(size, target_shares - filled_shares)
             quantity = _floor_size(quantity)
             if quantity <= 0:
                 break
@@ -169,18 +159,26 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
             filled_shares += quantity
             principal += level_principal
             fees += level_fee
-            remaining -= level_principal + level_fee
             fills.append({"price": float(price), "shares": float(quantity), "principal_usdc": float(level_principal), "estimated_fee_usdc": float(level_fee)})
+            if filled_shares >= target_shares:
+                break
         total_debit = principal + fees
         if filled_shares < min_order_size:
             return _rejected(
                 "paper_fill_rejected_below_min_order_size",
-                "在 1 USDC 含费用预算和价格门槛内，累计可买份额低于当前最小订单规模。",
+                "订单簿在价格门槛内的累计深度不足 5 股（最小订单规模）。",
                 best_ask=float(best_ask), min_order_size=float(min_order_size), estimated_shares=float(filled_shares),
                 book_endpoint=book_endpoint, fee_endpoint=fee_endpoint,
             )
+        if total_debit > remaining_city_budget:
+            return _rejected(
+                "paper_fill_rejected_city_day_cap",
+                "5 股订单含费用总成本超过该城市当地日的剩余现金余量。",
+                required_shares=float(target_shares), required_total_debit_usdc=float(total_debit),
+                total_debit_budget_usdc=float(CITY_DAY_MAX_TOTAL_DEBIT), spent_city_day_total_debit_usdc=float(already_spent),
+            )
         if total_debit <= 0:
-            return _rejected("paper_fill_rejected_no_affordable_depth", "没有能在 1 USDC 含费用预算内成交的有效深度。", book_endpoint=book_endpoint, fee_endpoint=fee_endpoint)
+            return _rejected("paper_fill_rejected_no_affordable_depth", "没有能在价格门槛内成交的有效深度。", book_endpoint=book_endpoint, fee_endpoint=fee_endpoint)
         ledger[city_day_key] = float((already_spent + total_debit).quantize(Decimal("0.00001")))
         return {
             "mode": "paper", "status": "paper_fill_estimate", "message": "公开订单簿快照的纸面 FAK 估算；不保证真实可成交，且未提交订单。",
@@ -188,10 +186,10 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
             "book_endpoint": book_endpoint, "fee_endpoint": fee_endpoint, "book_timestamp": book.get("timestamp"),
             "book_hash": book.get("hash"), "tick_size": float(tick_size), "min_order_size": float(min_order_size),
             "base_fee_bps": float(_decimal(fee["base_fee"], "base_fee")), "price_cap_exclusive": float(MAX_PRICE_EXCLUSIVE),
-            "effective_fak_limit_price": float(price_cap), "target_total_debit_usdc": float(available_budget),
+            "effective_fak_limit_price": float(price_cap), "target_shares": float(target_shares),
             "principal_usdc": float(principal), "estimated_fee_usdc": float(fees), "total_debit_usdc": float(total_debit),
             "average_price": float(principal / filled_shares), "estimated_shares": float(filled_shares),
-            "unspent_budget_usdc": float(available_budget - total_debit),
+            "unspent_city_day_budget_usdc": float(remaining_city_budget - total_debit),
             "spent_city_day_total_debit_usdc_before": float(already_spent),
             "spent_city_day_total_debit_usdc_after": ledger[city_day_key], "fills": fills,
             "retrieved_at_utc": utc_now_string(),
