@@ -30,7 +30,7 @@ def decide_buy_no(
     book_summary: dict[str, Any],
     target_shares: Decimal,
     min_order_size: Decimal,
-    max_price: Decimal = Decimal("0.95"),
+    max_price: Decimal = Decimal("0.98"),
     max_book_age_seconds: float = 3.0,
 ) -> ExecutionDecision:
     """Decide whether a BUY_NO is eligible; never creates/submits an order."""
@@ -38,7 +38,7 @@ def decide_buy_no(
     if mode not in {"observe", "paper", "live"}:
         return ExecutionDecision(False, "INVALID_MODE", "unsupported execution mode", token, mode)
     if mode == "live":
-        return ExecutionDecision(False, "LIVE_EXECUTOR_DISABLED", "tree2 has no enabled live executor", token, mode)
+        return ExecutionDecision(False, "LIVE_EXECUTOR_DISABLED", "tree3 has no enabled live executor", token, mode)
     if book_summary.get("status") == "STALE_OR_MISSING_BOOK":
         return ExecutionDecision(False, "STALE_OR_MISSING_BOOK", "fresh executable book is required", token, mode)
     if book_summary.get("status") == "ASK_OUTSIDE_LIMIT":
@@ -60,7 +60,7 @@ def decide_buy_no(
         code = "STALE_BOOK"
     elif best_ask is None:
         code = "NO_EXECUTABLE_ASK"
-    elif best_ask >= max_price:
+    elif best_ask > max_price:
         code = "ASK_OUTSIDE_LIMIT"
     elif depth < target_shares:
         code = "DEPTH_LT_TARGET"

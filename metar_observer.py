@@ -144,8 +144,24 @@ def load_config(config_path: Path) -> dict[str, Any]:
     if mode not in {"observe", "paper", "live"}:
         raise ValueError("mode 只能为 observe、paper 或 live")
     execution_engine = str(config.get("execution_engine", "legacy")).lower().strip()
-    if execution_engine not in {"legacy", "tree2"}:
-        raise ValueError("execution_engine 只能为 legacy 或 tree2")
+    if execution_engine not in {"legacy", "tree2", "tree3"}:
+        raise ValueError("execution_engine 只能为 legacy、tree2 或 tree3")
+    order_type = str(config.get("execution_order_type", "FAK")).upper().strip()
+    if order_type not in {"FAK", "FOK"}:
+        raise ValueError("execution_order_type 只能为 FAK 或 FOK")
+    target_order_shares = str(config.get("target_order_shares", "5"))
+    if target_order_shares != "5":
+        raise ValueError("当前 tree3 只允许固定 5 shares")
+    min_execution_price = float(config.get("min_execution_price", 0.05))
+    max_execution_price = float(config.get("max_execution_price", 0.98))
+    max_slippage = float(config.get("max_slippage", 0.10))
+    if not 0 <= min_execution_price <= max_execution_price <= 1:
+        raise ValueError("执行价格门必须满足 0 <= min <= max <= 1")
+    if max_slippage < 0:
+        raise ValueError("max_slippage 不得为负")
+    local_book_max_age = float(config.get("local_book_max_age_seconds", 3))
+    if local_book_max_age <= 0:
+        raise ValueError("local_book_max_age_seconds 必须大于 0")
     return {
         "scan_interval_seconds": interval,
         "history_hours": history_hours,
@@ -158,6 +174,13 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "market_rules_max_age_seconds": market_rules_max_age,
         "mode": mode,
         "execution_engine": execution_engine,
+        "execution_order_type": order_type,
+        "target_order_shares": target_order_shares,
+        "min_execution_price": min_execution_price,
+        "max_execution_price": max_execution_price,
+        "max_slippage": max_slippage,
+        "local_book_max_age_seconds": local_book_max_age,
+        "market_ws_enabled": bool(config.get("market_ws_enabled", False)),
         "state_path": BASE_DIR / str(config.get("state_path", "data/state.json")),
         "event_dir": BASE_DIR / str(config.get("event_dir", "data/observations")),
         "signal_dir": BASE_DIR / str(config.get("signal_dir", "data/signals")),
@@ -422,7 +445,10 @@ def enrich_execution(signal: dict[str, Any], mode: str, state: dict[str, Any]) -
         return signal
     result = dict(signal)
     if mode in {"paper", "observe"}:
-        result["execution"] = simulate_tree2(signal, state) if state.get("execution_engine") == "tree2" else simulate_paper_fak(signal, state)
+        if state.get("execution_engine") == "tree3":
+            result["execution"] = {"mode": "paper", "status": "tree3_local_book_required", "decision_code": "LOCAL_BOOK_PATH_NOT_ATTACHED", "message": "tree3 已要求 WebSocket 本地盘口；主循环尚未自动连接真实行情时 fail-closed。"}
+        else:
+            result["execution"] = simulate_tree2(signal, state) if state.get("execution_engine") == "tree2" else simulate_paper_fak(signal, state)
     else:
         result["execution"] = {
             "mode": "live",

@@ -26,7 +26,7 @@
 - **初始化**：当地日的第一个 METAR/SPECI 只开始记录（`daily_baseline_initialized`），不交易。
 - **触发**：之后的报文若出现**当日从未出现过的温度**——高于此前日高（新日高）或低于此前日低（新日低）——即触发。
 - **死桶**：新日高 12→13°C ⇒ "最高 12°C" 桶 `[12,13)` 明确不可能 ⇒ 买该桶 NO；新日低 12→11°C ⇒ "最低 12°C" 桶 `[12,13)` 明确不可能 ⇒ 买该桶 NO。**所有因此新失效的桶都扫描并下注**：快速升温/降温一次性跨过 2~3 度时（如 24→27°C），`[24,25)`、`[25,26)`、`[26,27)` 三个桶同时判死，全部买入 NO。已买过的桶（幂等键）不重复买。
-- **价格门**：NO 盘口 ask 严格位于 `(0.05, 0.95)`（5~95 美分，防守性门槛）才下注；**下单量固定 5 股**（交易所最小订单规模），从最优价逐档吃满 5 股。
+- **价格门**：NO 盘口 ask 位于 `[0.05, 0.98]`（5~98 美分，含首尾端点）才下注；**下单量固定 5 股**（交易所最小订单规模），从最优价逐档吃满 5 股。
 - **当日单城市上限**：含费用总现金支出最多 20 USDC。
 - **不动作**：温度在当日已见范围内波动（中间桶首次出现）不触发。
 
@@ -94,7 +94,7 @@ python3 metar_observer.py status
 | 门槛 | Paper 行为 |
 |---|---|
 | 方向 | 仅 `BUY_NO`。 |
-| 价格 | 最优 ask 严格位于 `(0.05, 0.95)`；每个纳入档位也必须满足。 |
+| 价格 | 最优 ask 位于 `[0.05, 0.98]`；每个纳入档位也必须满足，端点包含。 |
 | 下单量 | **固定 5 股**（交易所最小订单规模），从最优 ask 逐档吃满 5 股，不再按金额分档。 |
 | 价格精度与最小份额 | 使用当前 `tick_size` 与 `min_order_size`；不满足即拒绝。 |
 | 订单语义 | `FAK`：估算可立即成交的部分，未成交部分视作取消。 |
@@ -105,7 +105,7 @@ python3 metar_observer.py status
 
 ## tree2 生产安全改进（当前仍为只读/纸面）
 
-`tree2` 将执行模式明确为 `observe`、`paper` 和受阻断的 `live`。示例配置默认使用 `observe` + `execution_engine=tree2`；该组合会产生候选与纸面成交诊断，但**不会签名、提交或撤销任何真实订单**。`live` 仍然返回 `LIVE_EXECUTOR_DISABLED`，不能通过配置绕过。
+`tree2` 将执行模式明确为 `observe`、`paper` 和受阻断的 `live`；tree3 在此基础上使用本地 WebSocket 盘口。示例配置默认使用 `observe` + `execution_engine=tree3`；该组合会产生候选与纸面成交诊断，但**不会签名、提交或撤销任何真实订单**。`live` 仍然返回 `LIVE_EXECUTOR_DISABLED`，不能通过配置绕过。
 
 tree2 新增 `clob_market_data.py`，对 CLOB 订单簿进行 token 一致性校验，保存 `asset_id`、`market`、`timestamp`、`hash`、`min_order_size`、`tick_size`、bids、asks 和本地抓取时间。订单簿层优先尝试批量读取，失败时才退回单 token REST 读取，并使用短期缓存。对于交易决策，`NO asks=[]` 始终记录为 `EMPTY_ASK`；NO bids 或页面显示价不会被当作 NO 买入流动性。
 
@@ -132,3 +132,14 @@ python3 -m unittest discover -s tests -v
 精度层根据当前 `tick_size` 选择 price、size、amount 小数位，BUY 的 `makerAmount` 编码为价格乘 shares 的六位整数，`takerAmount` 编码为 shares 的六位整数。输入会先按 tick 和 size 规则向下规范化，并拒绝不支持的 tick、低于最小订单量或超过价格范围的订单。
 
 签名测试只使用仓库内测试夹具生成的固定私钥，验证 EIP-712 签名能够恢复预期地址、标准和负风险路由产生不同签名，并确认 `expiration` 不在 V2 signed message 中。生产环境不得把测试私钥用于任何账户，真实钱包加载和订单提交仍未实现。
+
+
+## tree3：实时盘口与固定 5 shares FAK
+
+`tree3` 已将执行价格门统一为 **`0.05 <= price <= 0.98`**，两端均接受；超出范围才拒绝。固定订单数量仍为 **5 shares**，默认订单类型为 **FAK**。滑点保护通过 `max_execution_price` / `max_price` 配置，示例默认上限为 `0.98`，属于相对宽泛的保护，但不是无限追价。
+
+tree3 新增 `local_order_book.py`、`websocket_market_data.py` 和 `tree3_runtime.py`。Market WebSocket 的 `book` 事件建立本地全量基线，`price_change` 事件更新单档深度，`tick_size_change` 更新交易精度；在收到有效基线前、断线后或本地簿过期时，快照不可供执行层使用。`best_bid_ask` 和 `last_trade_price` 只作为辅助行情事件，不能替代完整 ask 深度。
+
+执行入口 `tree3_execution.py` 接收本地 OrderBook 快照，直接计算固定 5 shares 的 FAK 逐档成交、VWAP、最坏价格和剩余取消；FOK 则额外要求保护价内完整满足 5 shares。该路径不调用 REST `/book`，不把 midpoint、last trade 或 bid 当作 BUY_NO 流动性。NautilusTrader 在本版本以隔离 runtime/adapter 边界表示，默认仍使用 fake/replay 方式验证，不能绕过 Execution Policy。
+
+`config.example.json` 已切换为 `execution_engine=tree3`、`execution_order_type=FAK`、`target_order_shares=5`、`min_execution_price=0.05`、`max_execution_price=0.98`、`max_slippage=0.10` 和 `market_ws_enabled=true`。主循环在真实本地盘口 runtime 未附加时会 fail-closed，避免把 tree3 配置误解为已经连接真实 WS 或已经可以真实下单。

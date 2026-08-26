@@ -44,11 +44,11 @@ class Tree2ExecutionTests(unittest.TestCase):
 
     def test_fixed_five_fak_excludes_ask_at_protection_cap(self) -> None:
         data = CLOBMarketData(max_snapshot_age_seconds=10)
-        high = dict(self.book, asks=[{"price": "0.95", "size": "10"}])
+        high = dict(self.book, asks=[{"price": "0.98", "size": "10"}])
         snapshot = data.snapshot_from_raw("no-1", high)
         intent = build_fixed_five_fak(snapshot, {"base_fee": 500})
-        self.assertEqual(intent.executable_shares, 0)
-        self.assertIsNone(intent.limit_price)
+        self.assertEqual(intent.executable_shares, Decimal("5"))
+        self.assertEqual(intent.limit_price, Decimal("0.98"))
 
     def test_paper_fill_requires_actual_ask_depth(self) -> None:
         data = CLOBMarketData(max_snapshot_age_seconds=10)
@@ -69,7 +69,7 @@ class Tree2ExecutionTests(unittest.TestCase):
 
     def test_ask_at_or_above_limit_is_rejected(self) -> None:
         data = CLOBMarketData(max_snapshot_age_seconds=10)
-        high = dict(self.book, asks=[{"price": "0.96", "size": "10"}])
+        high = dict(self.book, asks=[{"price": "0.99", "size": "5"}])
         with patch.object(data, "fetch_books", return_value={"no-1": data.snapshot_from_raw("no-1", high)}), \
              patch.object(data, "fetch_fee_rate", return_value={"base_fee": 500}):
             result = simulate(self.signal, {}, data)

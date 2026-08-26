@@ -200,11 +200,11 @@ class CLOBMarketData:
         self._fees[token] = (time.time(), dict(raw))
         return dict(raw)
 
-    def executable_summary(self, token_id: str, max_age_seconds: float | None = None, max_price: Decimal = Decimal("0.95")) -> dict[str, Any]:
+    def executable_summary(self, token_id: str, max_age_seconds: float | None = None, max_price: Decimal = Decimal("0.98")) -> dict[str, Any]:
         snapshot = self.get_cached(token_id, max_age_seconds)
         if snapshot is None:
             return {"status": "STALE_OR_MISSING_BOOK", "token_id": str(token_id)}
-        eligible_asks = [x for x in snapshot.asks if Decimal("0.05") < x["price"] < max_price]
+        eligible_asks = [x for x in snapshot.asks if Decimal("0.05") <= x["price"] <= max_price]
         if not eligible_asks:
             return {
                 "status": "EMPTY_ASK" if not snapshot.asks else "ASK_OUTSIDE_LIMIT",

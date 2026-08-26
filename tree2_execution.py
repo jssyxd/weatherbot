@@ -15,8 +15,9 @@ from execution_policy import decide_buy_no
 
 TARGET_ORDER_SHARES = Decimal("5")
 CITY_DAY_MAX_TOTAL_DEBIT = Decimal("20.00")
-MIN_PRICE_EXCLUSIVE = Decimal("0.05")
-MAX_PRICE_EXCLUSIVE = Decimal("0.95")
+MIN_EXECUTION_PRICE = Decimal("0.05")
+MAX_EXECUTION_PRICE = Decimal("0.98")
+DEFAULT_MAX_SLIPPAGE = Decimal("0.10")
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,7 @@ def build_fixed_five_fak(
     fee_payload: dict[str, Any],
     *,
     target_shares: Decimal = TARGET_ORDER_SHARES,
-    max_price: Decimal = MAX_PRICE_EXCLUSIVE,
+    max_price: Decimal = MAX_EXECUTION_PRICE,
 ) -> FAKIntent:
     """Build a fixed-share FAK intent using asks up to the worst fill price.
 
@@ -81,7 +82,7 @@ def build_fixed_five_fak(
     fills: list[dict[str, Decimal]] = []
     for level in sorted(snapshot.asks, key=lambda x: x["price"]):
         price, size = level["price"], level["size"]
-        if not MIN_PRICE_EXCLUSIVE < price < max_price or size <= 0:
+        if not MIN_EXECUTION_PRICE <= price <= max_price or size <= 0:
             continue
         quantity = min(size, target_shares - filled).quantize(size_quantum, rounding=ROUND_DOWN)
         if quantity <= 0:
@@ -116,7 +117,8 @@ def simulate(signal: dict[str, Any], state: dict[str, Any], market_data: CLOBMar
         books = data.fetch_books([token_id])
         snapshot = books[token_id]
         fee_payload = data.fetch_fee_rate(token_id)
-        summary = data.executable_summary(token_id, max_price=MAX_PRICE_EXCLUSIVE)
+        max_price = Decimal(str(state.get("max_execution_price", MAX_EXECUTION_PRICE)))
+        summary = data.executable_summary(token_id, max_price=max_price)
     except (CLOBDataError, KeyError) as exc:
         return {**base, "status": "paper_fill_unavailable", "decision_code": str(exc), "message": "CLOB snapshot unavailable"}
 
@@ -124,7 +126,7 @@ def simulate(signal: dict[str, Any], state: dict[str, Any], market_data: CLOBMar
     decision = decide_buy_no(
         mode="paper", token_id=token_id, book_summary=summary,
         target_shares=TARGET_ORDER_SHARES, min_order_size=min_order_size,
-        max_price=MAX_PRICE_EXCLUSIVE,
+        max_price=max_price,
     )
     result = {**base, "decision": decision.as_dict(), "book": snapshot.to_json(), "fee": fee_payload}
     if not decision.allowed:

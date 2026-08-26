@@ -72,7 +72,7 @@ class ExecutionBoundaryTests(unittest.TestCase):
 
     def test_paper_fill_rejects_ask_outside_strict_price_gate(self) -> None:
         state: dict = {}
-        for bad_price in ("0.04", "0.96"):
+        for bad_price in ("0.04", "0.99"):
             invalid_book = dict(self.book, asks=[{"price": bad_price, "size": "20"}])
             with patch("paper_execution.fetch_order_book", return_value=(invalid_book, "https://clob.test/book")), \
                  patch("paper_execution.fetch_fee_rate", return_value=(self.fee, "https://clob.test/fee")):
