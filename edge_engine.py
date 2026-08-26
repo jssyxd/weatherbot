@@ -5,7 +5,7 @@ It turns published METAR/SPECI observations into auditable *candidate* signals.
 
 tree1 strategy (user-confirmed, observation-only):
   * A market day is the airport city's IANA-local natural day 00:00-24:00
-    (reportTime UTC -> ZoneInfo(city tz) -> local date). Nothing is traded on
+    (report_time_utc -> ZoneInfo(city tz) -> local date). Nothing is traded on
     the day's first report: it only initialises the daily baseline.
   * Every later METAR/SPECI is recorded; when a report sets a new daily
     extreme (new high above the previous high, or new low below the previous
@@ -24,11 +24,13 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-# AWC/NOAA remark temperature group, 9 chars: T[sign][TTT][DDHH] e.g.
+# Standard METAR RMK temperature group, 9 chars: T[sign][TTT][DDHH] e.g.
 # T02430138 = +24.3°C (sign 0=+ 1=-, TTT = tenths of °C, trailing DDHH ignored).
-REMARK_TEMPERATURE_AWC_RE = re.compile(r"\bT([01])(\d{3})(\d{4})\b")
+REMARK_TEMPERATURE_RE = re.compile(r"\bT([01])(\d{3})(\d{4})\b")
 # Legacy 4-char form: T[sign][TTT].
 REMARK_TEMPERATURE_LEGACY_RE = re.compile(r"\bT([01])(\d{3})\b")
+# Standard body temperature/dewpoint group, e.g. 23/19 or M04/M08.
+BODY_TEMPERATURE_RE = re.compile(r"\b(M?\d{2})/(M?\d{2})\b")
 
 
 def utc_now() -> datetime:
@@ -97,7 +99,7 @@ def load_contract_cities(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def local_market_date(report_time_utc: datetime, city: dict[str, Any]) -> str:
-    """IANA-local market day: reportTime UTC -> airport timezone -> date.
+    """IANA-local market day: observed UTC -> airport timezone -> date.
 
     The day window is the city's local 00:00-24:00. A 16:00Z report for a
     UTC+8 city belongs to the *next* local day, never to the fetch/receipt
@@ -112,12 +114,19 @@ def celsius_to_native(value_c: float, unit: str) -> float:
 
 def observed_temperature_native(event: dict[str, Any], city: dict[str, Any]) -> tuple[float, str] | None:
     raw = str(event.get("raw_metar") or "")
-    remark = REMARK_TEMPERATURE_AWC_RE.search(raw) or REMARK_TEMPERATURE_LEGACY_RE.search(raw)
+    remark = REMARK_TEMPERATURE_RE.search(raw) or REMARK_TEMPERATURE_LEGACY_RE.search(raw)
     if remark:
         value_c = int(remark.group(2)) / 10.0
         if remark.group(1) == "1":
             value_c = -value_c
         return celsius_to_native(value_c, city["market_unit"]), "metar_remark_tenths_c"
+    body_temperature = BODY_TEMPERATURE_RE.search(raw)
+    if body_temperature:
+        encoded = body_temperature.group(1)
+        value_c = float(encoded[1:]) if encoded.startswith("M") else float(encoded)
+        if encoded.startswith("M"):
+            value_c *= -1
+        return celsius_to_native(value_c, city["market_unit"]), "metar_body_integer_c"
     value = event.get("temperature_c")
     if isinstance(value, (int, float)):
         return celsius_to_native(float(value), city["market_unit"]), "metar_body_integer_c"
@@ -197,19 +206,10 @@ def evaluate_observation(
     fetched_at = parse_utc(event.get("fetched_at_utc")) or utc_now()
     if report_time is None:
         return [{"signal_type": "no_signal", "reason": "missing_report_time", "event_id": event.get("event_id"), "city_id": city["city_id"]}]
-    # Latency baseline: use the AWC receipt time when available. AWC itself can
-    # take ~490s to publish an on-the-hour METAR; charging that publisher delay
-    # against our freshness gate makes hourly reports fail a tight window by a
-    # few milliseconds. Our true reaction lag is (fetched_at - receipt_time).
-    receipt_time = parse_utc(event.get("receipt_time_utc"))
-    if receipt_time is not None:
-        age = max(0.0, (fetched_at - receipt_time).total_seconds())
-        report_age = (fetched_at - report_time).total_seconds()
-        # absolute backstop against stale data even if receipt_time is present
-        if report_age > max_latency_seconds * 3:
-            return [{"signal_type": "no_signal", "reason": "report_too_old", "event_id": event.get("event_id"), "age_seconds": round(report_age, 3), "city_id": city["city_id"]}]
-    else:
-        age = (fetched_at - report_time).total_seconds()
+    # CheckWX short responses expose the observation time but no ingestion or
+    # receipt timestamp. Gate deterministically on absolute age from observed
+    # UTC to local fetch UTC; this avoids provider-specific latency assumptions.
+    age = (fetched_at - report_time).total_seconds()
     if age > max_latency_seconds:
         return [{"signal_type": "no_signal", "reason": "report_too_old", "event_id": event.get("event_id"), "age_seconds": round(age, 3), "city_id": city["city_id"]}]
     if event.get("is_correction") is True:

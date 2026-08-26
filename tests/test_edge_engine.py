@@ -234,26 +234,23 @@ class EdgeEngineTests(unittest.TestCase):
         self.assertEqual(signals[0]["reason"], "not_new_daily_high")
         self.assertEqual(signals[1]["reason"], "not_new_daily_low")
 
-    def test_receipt_time_latency_baseline_absorbs_awc_publish_delay(self) -> None:
-        # AWC received the on-hour report ~490s late; we fetched ~120s after
-        # receipt. True reaction lag is 120s, so a 300s gate must pass even
-        # though report_time -> fetch is ~610s.
+    def test_observed_time_gate_rejects_report_older_than_limit(self) -> None:
+        # CheckWX short responses expose observed UTC but no provider receipt
+        # timestamp. A 10-minute-old report must fail a 5-minute safety gate.
         city = self.cities["ZSPD"]
         event = {
             "event_id": "late", "report_time_utc": "2026-08-22T18:00:00Z",
-            "receipt_time_utc": "2026-08-22T18:08:08Z",
             "fetched_at_utc": "2026-08-22T18:10:00Z", "temperature_c": 25,
             "raw_metar": "METAR ZSPD 221800Z 12007MPS 9999 25/24 Q1005 NOSIG",
         }
         signals = edge.evaluate_observation({}, event, city, [], 300)
-        self.assertNotEqual(signals[0]["reason"], "report_too_old")
-        self.assertEqual(signals[0]["reason"], "daily_baseline_initialized")
+        self.assertEqual(signals[0]["reason"], "report_too_old")
+        self.assertEqual(signals[0]["age_seconds"], 600.0)
 
     def test_absolute_backstop_rejects_genuinely_stale_report(self) -> None:
         city = self.cities["ZSPD"]
         event = {
             "event_id": "stale", "report_time_utc": "2026-08-22T12:00:00Z",
-            "receipt_time_utc": "2026-08-22T12:01:00Z",
             "fetched_at_utc": "2026-08-22T12:46:00Z", "temperature_c": 25,
             "raw_metar": "METAR ZSPD 221200Z 12007MPS 9999 25/24 Q1005 NOSIG",
         }
@@ -281,9 +278,9 @@ class EdgeEngineTests(unittest.TestCase):
         signals = edge.evaluate_observation(state, event, city, [rule], 900)
         self.assertIn("f_unit_precision_ambiguous", [item.get("reason") for item in signals])
 
-    def test_awc_nine_char_remark_temperature_group_is_parsed(self) -> None:
+    def test_standard_nine_char_remark_temperature_group_is_parsed(self) -> None:
         city = self.cities["ZSPD"]  # C market
-        # Real AWC format T[sign][TTT][DDHH]: T02220178 = +22.2°C
+        # Standard METAR RMK format T[sign][TTT][DDHH]: T02220178 = +22.2°C
         event = {"raw_metar": "METAR KLAX 230253Z 26008KT 10SM FEW280 22/17 A2984 RMK AO2 SLP098 T02220178 53006"}
         parsed = edge.observed_temperature_native(event, city)
         self.assertIsNotNone(parsed)

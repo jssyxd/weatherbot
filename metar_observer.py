@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Two-minute METAR/SPECI dead-bucket observer (tree1).
+"""CheckWX v2 METAR/SPECI dead-bucket observer (tree4).
 
-The program scans published AviationWeather.gov METAR/SPECI reports every two
-minutes for 49 verified contract stations. It never uses forecasts: the day's
-first report initialises the IANA-local baseline and every later new daily
-extreme marks the previous-extreme temperature bucket as dead (candidate
-BUY_NO). It never loads credentials, reads a wallet, signs an order, or
-submits a real trade. ``mode=live`` is an explicitly blocked compatibility
-boundary until a separately reviewed executor is implemented by the user.
+The program reads published CheckWX Aviation Weather API METAR/SPECI reports
+for the verified contract stations. It never uses forecasts: after a complete
+CheckWX historical replay for the IANA-local day, each later new daily extreme
+may mark an already-impossible temperature bucket as a candidate BUY_NO. The
+API key is read only from an environment variable, never from configuration,
+URLs, audit records, or source control. It never loads a wallet, signs an
+order, or submits a real trade. ``mode=live`` remains explicitly blocked.
 """
 from __future__ import annotations
 
@@ -40,7 +40,10 @@ from audit_store import AuditStore
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE_DIR / "config.json"
-AWC_ENDPOINT = "https://aviationweather.gov/api/data/metar"
+CHECKWX_BASE_URL = "https://api.checkwx.com/v2"
+CHECKWX_API_KEY_ENV_DEFAULT = "CHECKWX_API_KEY"
+CHECKWX_MIN_CACHE_SECONDS = 900
+CHECKWX_MAX_ICAOS_PER_REQUEST = 25
 SUPPORTED_TYPES = {"METAR", "SPECI"}
 
 
@@ -53,7 +56,7 @@ def iso_now() -> str:
 
 
 def parse_time(value: Any) -> datetime | None:
-    """Accept aware datetimes, AWC ISO strings or epoch seconds, returning UTC."""
+    """Accept aware datetimes, ISO-8601 strings or epoch seconds, returning UTC."""
     if value is None:
         return None
     if isinstance(value, datetime):
@@ -113,15 +116,21 @@ def load_config(config_path: Path) -> dict[str, Any]:
         raise RuntimeError(f"未找到 {config_path.name}。请先复制 config.example.json 为 config.json。")
     if not isinstance(config, dict):
         raise ValueError("配置根节点必须是 JSON 对象")
-    interval = int(config.get("scan_interval_seconds", 60))
-    if interval < 60:
-        raise ValueError("scan_interval_seconds 不得小于 60；AWC 全量缓存按分钟更新")
-    history_hours = int(config.get("history_hours", 1))
-    if history_hours < 1 or history_hours > 24:
-        raise ValueError("history_hours 必须介于 1 和 24")
-    chunk_size = int(config.get("stations_per_request", 49))
-    if chunk_size < 1 or chunk_size > 100:
-        raise ValueError("stations_per_request 必须介于 1 和 100")
+    interval = int(config.get("scan_interval_seconds", CHECKWX_MIN_CACHE_SECONDS))
+    if interval < CHECKWX_MIN_CACHE_SECONDS:
+        raise ValueError(
+            f"scan_interval_seconds 不得小于 {CHECKWX_MIN_CACHE_SECONDS}；"
+            "CheckWX 文档要求 METAR/TAF 响应至少缓存 15 分钟"
+        )
+    chunk_size = int(config.get("stations_per_request", CHECKWX_MAX_ICAOS_PER_REQUEST))
+    if chunk_size < 1 or chunk_size > CHECKWX_MAX_ICAOS_PER_REQUEST:
+        raise ValueError(f"stations_per_request 必须介于 1 和 {CHECKWX_MAX_ICAOS_PER_REQUEST}")
+    history_limit = int(config.get("checkwx_previous_limit", 50))
+    if history_limit < 2 or history_limit > 50:
+        raise ValueError("checkwx_previous_limit 必须介于 2 和 50")
+    api_key_env = str(config.get("checkwx_api_key_env", CHECKWX_API_KEY_ENV_DEFAULT)).strip()
+    if not api_key_env or not api_key_env.replace("_", "").isalnum() or api_key_env[0].isdigit():
+        raise ValueError("checkwx_api_key_env 必须是有效的环境变量名")
     max_age = int(config.get("max_report_age_seconds", 900))
     if max_age < 60:
         raise ValueError("max_report_age_seconds 不得小于 60")
@@ -131,12 +140,9 @@ def load_config(config_path: Path) -> dict[str, Any]:
     warmup_retry = int(config.get("warmup_retry_seconds", 60))
     if warmup_retry < 60:
         raise ValueError("warmup_retry_seconds 不得小于 60")
-    warmup_history_hours = int(config.get("warmup_history_hours", 30))
-    if warmup_history_hours < 25 or warmup_history_hours > 96:
-        raise ValueError("warmup_history_hours 必须介于 25 和 96，以覆盖 IANA 夏令时回拨日")
-    warmup_chunk_size = int(config.get("warmup_stations_per_request", 10))
-    if warmup_chunk_size < 1 or warmup_chunk_size > 20:
-        raise ValueError("warmup_stations_per_request 必须介于 1 和 20，以降低历史报文单次响应截断风险")
+    warmup_chunk_size = int(config.get("warmup_stations_per_request", CHECKWX_MAX_ICAOS_PER_REQUEST))
+    if warmup_chunk_size < 1 or warmup_chunk_size > CHECKWX_MAX_ICAOS_PER_REQUEST:
+        raise ValueError(f"warmup_stations_per_request 必须介于 1 和 {CHECKWX_MAX_ICAOS_PER_REQUEST}")
     market_rules_max_age = int(config.get("market_rules_max_age_seconds", 1800))
     if market_rules_max_age < 600:
         raise ValueError("market_rules_max_age_seconds 不得小于 600")
@@ -164,12 +170,12 @@ def load_config(config_path: Path) -> dict[str, Any]:
         raise ValueError("local_book_max_age_seconds 必须大于 0")
     return {
         "scan_interval_seconds": interval,
-        "history_hours": history_hours,
         "stations_per_request": chunk_size,
+        "checkwx_previous_limit": history_limit,
+        "checkwx_api_key_env": api_key_env,
         "max_report_age_seconds": max_age,
         "failure_pause_after_seconds": failure_pause,
         "warmup_retry_seconds": warmup_retry,
-        "warmup_history_hours": warmup_history_hours,
         "warmup_stations_per_request": warmup_chunk_size,
         "market_rules_max_age_seconds": market_rules_max_age,
         "mode": mode,
@@ -196,69 +202,98 @@ def chunks(items: list[Any], size: int) -> list[list[Any]]:
     return [items[index:index + size] for index in range(0, len(items), size)]
 
 
-def fetch_awc_reports(station_ids: list[str], history_hours: int) -> tuple[list[dict[str, Any]], str]:
-    query = urllib.parse.urlencode({"ids": ",".join(station_ids), "format": "json", "hours": str(history_hours)}, safe=",")
-    url = f"{AWC_ENDPOINT}?{query}"
-    request = urllib.request.Request(url, headers={"User-Agent": "weatherbot/2.0 (+https://github.com/jssyxd/weatherbot)"})
+def _checkwx_api_key(api_key_env: str) -> str:
+    api_key = os.environ.get(api_key_env, "").strip()
+    if not api_key:
+        raise RuntimeError(
+            f"未设置 CheckWX API 密钥环境变量 {api_key_env}；"
+            "请在启动进程的环境中设置该变量，切勿将密钥写入 config.json 或提交到仓库。"
+        )
+    return api_key
+
+
+def fetch_checkwx_reports(
+    station_ids: list[str],
+    api_key_env: str,
+    previous_limit: int | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Fetch CheckWX v2 short METAR reports without exposing the API key in URLs."""
+    if not station_ids or len(station_ids) > CHECKWX_MAX_ICAOS_PER_REQUEST:
+        raise ValueError(f"每次 CheckWX 请求必须包含 1 至 {CHECKWX_MAX_ICAOS_PER_REQUEST} 个 ICAO")
+    icaos = ",".join(str(item).upper().strip() for item in station_ids)
+    safe_icaos = urllib.parse.quote(icaos, safe=",")
+    if previous_limit is None:
+        path = f"/metar/{safe_icaos}/short"
+    else:
+        if previous_limit < 2 or previous_limit > 50:
+            raise ValueError("CheckWX 历史请求的 previous_limit 必须介于 2 和 50")
+        path = f"/metar/{safe_icaos}/previous/{previous_limit}/short"
+    url = f"{CHECKWX_BASE_URL}{path}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "weatherbot-tree4/4.0 (+https://github.com/jssyxd/weatherbot)",
+            "X-API-Key": _checkwx_api_key(api_key_env),
+        },
+    )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             payload = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"AWC 请求失败（HTTP {exc.code}）") from exc
+        if exc.code == 401:
+            detail = "CheckWX 拒绝了 API 密钥（HTTP 401）"
+        elif exc.code == 403:
+            detail = "CheckWX 拒绝访问该端点（HTTP 403）；当前密钥可能不具备历史 METAR 权限"
+        elif exc.code == 429:
+            detail = "CheckWX 请求频率或日限额已达到上限（HTTP 429）"
+        else:
+            detail = f"CheckWX 请求失败（HTTP {exc.code}）"
+        raise RuntimeError(detail) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"AWC 网络请求失败: {exc.reason}") from exc
+        raise RuntimeError(f"CheckWX 网络请求失败: {exc.reason}") from exc
     try:
         result = json.loads(payload)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("AWC 返回了不可解析的 JSON") from exc
-    if not isinstance(result, list):
-        raise RuntimeError("AWC 返回格式异常：预期为报告数组")
-    return result, url
+        raise RuntimeError("CheckWX 返回了不可解析的 JSON") from exc
+    if not isinstance(result, dict) or not isinstance(result.get("results"), int) or not isinstance(result.get("data"), list):
+        raise RuntimeError("CheckWX 返回格式异常：预期为含 results 整数与 data 数组的对象")
+    if result["results"] != len(result["data"]):
+        raise RuntimeError("CheckWX 返回格式异常：results 与 data 长度不一致")
+    if not all(isinstance(item, dict) for item in result["data"]):
+        raise RuntimeError("CheckWX 短格式响应异常：data 必须是对象数组")
+    return result["data"], url
 
 
 def report_key(report: dict[str, Any]) -> str:
-    icao = str(report.get("icaoId", "")).upper()
-    kind = str(report.get("metarType", "")).upper()
-    report_time = as_utc_string(report.get("reportTime") or report.get("obsTime")) or "unknown-time"
-    raw = str(report.get("rawOb", ""))
-    return "|".join((icao, kind, report_time, raw))
+    icao = str(report.get("icao", "")).upper()
+    raw = str(report.get("raw_text", "")).strip()
+    report_type = raw.split(maxsplit=1)[0].upper() if raw else "UNKNOWN"
+    observed = as_utc_string(report.get("observed")) or "unknown-time"
+    return "|".join((icao, report_type, observed, raw))
 
 
 def normalize_report(report: dict[str, Any], station_names: dict[str, str], source_endpoint: str, fetched_at: str) -> dict[str, Any] | None:
-    report_type = str(report.get("metarType", "")).upper()
-    icao = str(report.get("icaoId", "")).upper()
-    raw = str(report.get("rawOb", "")).strip()
-    if report_type not in SUPPORTED_TYPES or not icao or not raw:
+    icao = str(report.get("icao", "")).upper().strip()
+    raw = str(report.get("raw_text", "")).strip()
+    report_type = raw.split(maxsplit=1)[0].upper() if raw else ""
+    report_time = parse_time(report.get("observed"))
+    if report_type not in SUPPORTED_TYPES or len(icao) != 4 or not icao.isalnum() or not raw or report_time is None:
         return None
-    report_time = parse_time(report.get("reportTime") or report.get("obsTime"))
-    receipt_time = parse_time(report.get("receiptTime"))
-    delay_seconds: float | None = None
-    delay_status = "unavailable"
-    if report_time and receipt_time:
-        computed_delay = round((receipt_time - report_time).total_seconds(), 3)
-        if computed_delay >= 0:
-            delay_seconds = computed_delay
-            delay_status = "available"
-        else:
-            delay_status = "source_time_inconsistent"
+    fetched_time = parse_time(fetched_at)
+    report_age_seconds = round((fetched_time - report_time).total_seconds(), 3) if fetched_time else None
     return {
         "event_id": report_key(report),
-        "source": "AviationWeather.gov Data API",
+        "source": "CheckWX Aviation Weather API v2",
         "source_endpoint": source_endpoint,
         "fetched_at_utc": fetched_at,
         "airport_icao": icao,
-        "airport_name": station_names.get(icao, report.get("name") or icao),
+        "airport_name": station_names.get(icao, icao),
         "report_type": report_type,
-        "report_time_utc": as_utc_string(report.get("reportTime") or report.get("obsTime")),
-        "receipt_time_utc": as_utc_string(report.get("receiptTime")),
-        "awc_receipt_delay_seconds": delay_seconds,
-        "awc_receipt_delay_status": delay_status,
-        "temperature_c": report.get("temp"),
-        "dewpoint_c": report.get("dewp"),
-        "wind_direction_degrees": report.get("wdir"),
-        "wind_speed_kt": report.get("wspd"),
-        "visibility_meters": report.get("visib"),
-        "flight_category": report.get("fltCat"),
+        "report_time_utc": as_utc_string(report.get("observed")),
+        "checkwx_report_age_seconds": report_age_seconds,
+        "checkwx_report_age_status": "available" if report_age_seconds is not None and report_age_seconds >= 0 else "source_time_inconsistent",
+        "temperature_c": None,
         "is_correction": " COR " in f" {raw} ",
         "raw_metar": raw,
     }
@@ -313,20 +348,20 @@ def _warmup_due_cities(state: dict[str, Any], cities: dict[str, dict[str, Any]],
 
 
 def _rebuild_daily_extrema_from_history(state: dict[str, Any], cities: dict[str, dict[str, Any]], reports: list[dict[str, Any]], fetched_at: str, source_endpoint: str, target_dates: dict[str, str]) -> dict[str, int]:
-    """Rebuild only current market-local days; this path never emits signals or marks events seen."""
+    """Rebuild only current local days from CheckWX records; never emit signals."""
     values: dict[str, list[tuple[float, str]]] = {}
     for report in reports:
-        report_type = str(report.get("metarType", "")).upper()
-        icao = str(report.get("icaoId", "")).upper()
+        icao = str(report.get("icao", "")).upper()
         city = cities.get(icao)
-        raw = str(report.get("rawOb", "")).strip()
-        report_time = parse_time(report.get("reportTime") or report.get("obsTime"))
+        raw = str(report.get("raw_text", "")).strip()
+        report_type = raw.split(maxsplit=1)[0].upper() if raw else ""
+        report_time = parse_time(report.get("observed"))
         if report_type not in SUPPORTED_TYPES or city is None or not raw or report_time is None:
             continue
         local_date = local_market_date(report_time, city)
         if local_date != target_dates[icao]:
             continue
-        temperature = observed_temperature_native({"raw_metar": raw, "temperature_c": report.get("temp")}, city)
+        temperature = observed_temperature_native({"raw_metar": raw, "temperature_c": None}, city)
         if temperature is None:
             continue
         value, _precision = temperature
@@ -366,7 +401,7 @@ def _rebuild_daily_extrema_from_history(state: dict[str, Any], cities: dict[str,
 
 
 def warm_up_current_local_days(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Fail closed until a deterministic reportTime-to-IANA replay has completed for every current local day."""
+    """Fail closed until a deterministic observed-time-to-IANA replay completes for every current local day."""
     target_dates = {icao: local_market_date(utc_now(), city) for icao, city in cities.items()}
     due = _warmup_due_cities(state, cities, target_dates, config["warmup_retry_seconds"])
     if not due:
@@ -377,7 +412,11 @@ def warm_up_current_local_days(config: dict[str, Any], state: dict[str, Any], ci
     endpoints: list[str] = []
     try:
         for station_chunk in chunks(station_ids, config["warmup_stations_per_request"]):
-            reports, endpoint = fetch_awc_reports(station_chunk, config["warmup_history_hours"])
+            reports, endpoint = fetch_checkwx_reports(
+                station_chunk,
+                config["checkwx_api_key_env"],
+                previous_limit=config["checkwx_previous_limit"],
+            )
             all_reports.extend(reports)
             endpoints.append(endpoint)
     except Exception as exc:
@@ -391,7 +430,10 @@ def warm_up_current_local_days(config: dict[str, Any], state: dict[str, Any], ci
         return {"status": "failed_fetch", "due_city_count": len(due), "error": f"{type(exc).__name__}: {exc}"}
     due_by_icao = {city["icao"]: city for city in due}
     summary = _rebuild_daily_extrema_from_history(state, due_by_icao, all_reports, fetched_at, ";".join(endpoints), target_dates)
-    return {"status": "completed", "due_city_count": len(due), "reports_seen": len(all_reports), "history_hours": config["warmup_history_hours"], **summary}
+    return {
+        "status": "completed", "due_city_count": len(due), "reports_seen": len(all_reports),
+        "checkwx_previous_limit": config["checkwx_previous_limit"], **summary,
+    }
 
 
 def cache_is_fresh(timestamp: Any, max_age_seconds: int) -> bool:
@@ -459,11 +501,9 @@ def enrich_execution(signal: dict[str, Any], mode: str, state: dict[str, Any]) -
 
 
 def format_event(event: dict[str, Any]) -> str:
-    delay = event.get("awc_receipt_delay_seconds")
-    delay_text = f" | AWC延迟 {delay:.0f}s" if isinstance(delay, (int, float)) else ""
-    temperature = event.get("temperature_c")
-    temperature_text = f" | {temperature}°C" if temperature is not None else ""
-    return f"[新{event['report_type']}] {event['airport_icao']} {event['report_time_utc']}{temperature_text}{delay_text}\n  {event['raw_metar']}"
+    report_age = event.get("checkwx_report_age_seconds")
+    age_text = f" | CheckWX报文龄期 {report_age:.0f}s" if isinstance(report_age, (int, float)) else ""
+    return f"[新{event['report_type']}] {event['airport_icao']} {event['report_time_utc']}{age_text}\n  {event['raw_metar']}"
 
 
 def scan_once(config: dict[str, Any]) -> dict[str, Any]:
@@ -479,7 +519,7 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     all_reports: list[dict[str, Any]] = []
     endpoints: list[str] = []
     for station_chunk in chunks(station_ids, config["stations_per_request"]):
-        reports, endpoint = fetch_awc_reports(station_chunk, config["history_hours"])
+        reports, endpoint = fetch_checkwx_reports(station_chunk, config["checkwx_api_key_env"])
         all_reports.extend(reports)
         endpoints.append(endpoint)
     normalized = [
@@ -508,7 +548,7 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
             signals.append({
                 "signal_type": "no_signal", "reason": "daily_extrema_untrusted_warmup_incomplete",
                 "event_id": event.get("event_id"), "icao": city["icao"], "market_local_date": local_date,
-                "disclaimer": "No candidate is allowed until reportTime-to-IANA historical warm-up completes for this local market day.",
+                "disclaimer": "No candidate is allowed until observed-time-to-IANA historical warm-up completes for this local market day.",
             })
             continue
         if not cache_is_fresh(state.get("market_rules_refreshed_at_utc"), config["market_rules_max_age_seconds"]):
