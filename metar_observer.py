@@ -35,6 +35,8 @@ from edge_engine import (
 )
 from market_adapter import refresh_market_rules
 from paper_execution import simulate_paper_fak
+from tree2_execution import simulate as simulate_tree2
+from audit_store import AuditStore
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE_DIR / "config.json"
@@ -139,8 +141,11 @@ def load_config(config_path: Path) -> dict[str, Any]:
     if market_rules_max_age < 600:
         raise ValueError("market_rules_max_age_seconds 不得小于 600")
     mode = str(config.get("mode", "paper")).lower().strip()
-    if mode not in {"paper", "live"}:
-        raise ValueError("mode 只能为 paper 或 live")
+    if mode not in {"observe", "paper", "live"}:
+        raise ValueError("mode 只能为 observe、paper 或 live")
+    execution_engine = str(config.get("execution_engine", "legacy")).lower().strip()
+    if execution_engine not in {"legacy", "tree2"}:
+        raise ValueError("execution_engine 只能为 legacy 或 tree2")
     return {
         "scan_interval_seconds": interval,
         "history_hours": history_hours,
@@ -152,10 +157,12 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "warmup_stations_per_request": warmup_chunk_size,
         "market_rules_max_age_seconds": market_rules_max_age,
         "mode": mode,
+        "execution_engine": execution_engine,
         "state_path": BASE_DIR / str(config.get("state_path", "data/state.json")),
         "event_dir": BASE_DIR / str(config.get("event_dir", "data/observations")),
         "signal_dir": BASE_DIR / str(config.get("signal_dir", "data/signals")),
         "health_path": BASE_DIR / str(config.get("health_path", "data/health.json")),
+        "audit_db_path": BASE_DIR / str(config.get("audit_db_path", "data/audit.sqlite3")),
         "contract_cities_path": BASE_DIR / str(config.get("contract_cities_path", "config/contract_cities.json")),
         "market_rules_path": BASE_DIR / str(config.get("market_rules_path", "data/market_rules.json")),
         "stations": normalize_stations(config.get("stations")) if config.get("stations") is not None else [],
@@ -414,8 +421,8 @@ def enrich_execution(signal: dict[str, Any], mode: str, state: dict[str, Any]) -
     if signal.get("signal_type") != "candidate_no_signal":
         return signal
     result = dict(signal)
-    if mode == "paper":
-        result["execution"] = simulate_paper_fak(signal, state)
+    if mode in {"paper", "observe"}:
+        result["execution"] = simulate_tree2(signal, state) if state.get("execution_engine") == "tree2" else simulate_paper_fak(signal, state)
     else:
         result["execution"] = {
             "mode": "live",
@@ -436,6 +443,7 @@ def format_event(event: dict[str, Any]) -> str:
 def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     fetched_at = iso_now()
     state = load_state(config["state_path"])
+    state["execution_engine"] = config.get("execution_engine", "legacy")
     cities = load_contract_cities(config["contract_cities_path"])
     warmup_summary = warm_up_current_local_days(config, state, cities)
     # Process published observations with the last known good market rules first.
@@ -497,6 +505,20 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     health = write_health_snapshot(config, state, cities)
     event_file = append_jsonl(config["event_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", new_events)
     signal_file = append_jsonl(config["signal_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", signals)
+    audit_store = AuditStore(config["audit_db_path"])
+    try:
+        for signal in signals:
+            execution = signal.get("execution") or {}
+            audit_store.append(
+                created_at_utc=iso_now(),
+                event_type="signal_execution_decision",
+                correlation_id=str(signal.get("event_id") or signal.get("bucket", {}).get("bucket_id") or ""),
+                mode=config["mode"],
+                token_id=str(signal.get("bucket", {}).get("no_token_id") or "") or None,
+                payload={"signal": signal, "execution": execution},
+            )
+    finally:
+        audit_store.close()
     for event in new_events:
         print(format_event(event))
     candidate_count = sum(item.get("signal_type") == "candidate_no_signal" for item in signals)
@@ -551,6 +573,7 @@ def run_loop(config: dict[str, Any]) -> None:
     print(f"候选边缘扫描器已启动：每 {interval} 秒拉取已发布 METAR/SPECI；默认仅 paper 意图，绝不提交真实订单。")
     # Startup: IANA local-day warm-up first, then fresh market rules.
     startup_state = load_state(config["state_path"])
+    startup_state["execution_engine"] = config.get("execution_engine", "legacy")
     startup_cities = load_contract_cities(config["contract_cities_path"])
     startup_warmup = warm_up_current_local_days(config, startup_state, startup_cities)
     startup_rules = refresh_market_rules_if_due(startup_state, config, startup_cities)

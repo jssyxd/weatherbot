@@ -1,5 +1,6 @@
 {
-  "mode": "paper",
+  "mode": "observe",
+  "execution_engine": "tree2",
   "scan_interval_seconds": 120,
   "history_hours": 2,
   "stations_per_request": 49,
@@ -14,5 +15,6 @@
   "state_path": "data/state.json",
   "event_dir": "data/observations",
   "signal_dir": "data/signals",
-  "health_path": "data/health.json"
+  "health_path": "data/health.json",
+  "audit_db_path": "data/audit.sqlite3"
 }

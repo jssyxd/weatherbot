@@ -102,3 +102,24 @@ python3 metar_observer.py status
 | 费用 | 使用 token 的当前 `base_fee`，按官方 taker fee 公式估算。 |
 
 `live` 模式只输出 `blocked_no_live_executor` 审计记录，永不读取订单簿、永不提交订单。
+
+## tree2 生产安全改进（当前仍为只读/纸面）
+
+`tree2` 将执行模式明确为 `observe`、`paper` 和受阻断的 `live`。示例配置默认使用 `observe` + `execution_engine=tree2`；该组合会产生候选与纸面成交诊断，但**不会签名、提交或撤销任何真实订单**。`live` 仍然返回 `LIVE_EXECUTOR_DISABLED`，不能通过配置绕过。
+
+tree2 新增 `clob_market_data.py`，对 CLOB 订单簿进行 token 一致性校验，保存 `asset_id`、`market`、`timestamp`、`hash`、`min_order_size`、`tick_size`、bids、asks 和本地抓取时间。订单簿层优先尝试批量读取，失败时才退回单 token REST 读取，并使用短期缓存。对于交易决策，`NO asks=[]` 始终记录为 `EMPTY_ASK`；NO bids 或页面显示价不会被当作 NO 买入流动性。
+
+`execution_policy.py` 将决策拆成可审计的拒绝码，包括 `STALE_OR_MISSING_BOOK`、`EMPTY_ASK`、`ASK_OUTSIDE_LIMIT`、`DEPTH_LT_TARGET`、`DEPTH_LT_MIN_ORDER` 和 `LIVE_EXECUTOR_DISABLED`。`tree2_execution.py` 只基于带时间戳的 CLOB 快照模拟 5 股 FAK 纸面成交，并记录盘口快照、费用响应、逐档深度、平均价和总成本。
+
+`audit_store.py` 提供 SQLite WAL 审计账本，用于后续保存信号、快照、决策和风险账本；当前 tree2 尚未将所有 legacy JSONL 历史自动迁移到 SQLite，部署时应先使用新配置运行只读观察并核对数据，再进行迁移。
+
+### tree2 使用方式
+
+```bash
+cp config.example.json config.json
+python3 metar_observer.py once
+python3 metar_observer.py run
+python3 -m unittest discover -s tests -v
+```
+
+真实执行器、账户余额/授权读取、签名、订单状态机、撤单和 market WebSocket 订阅仍然是后续独立阶段，不能将当前 tree2 的 `paper_fill_estimate` 解释为真实成交。生产上线前必须完成人工放行、账户级限额、kill switch、订单回报和恢复演练。
