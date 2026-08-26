@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -138,6 +139,30 @@ class MetarObserverTests(unittest.TestCase):
         self.assertEqual(state["daily_extrema"][key]["high"], 30.0)
         self.assertEqual(state["daily_warmup"][key]["status"], "complete")
         self.assertEqual(state["daily_extrema"][key]["warmup_latest_report_time_utc"], "2026-08-22T15:59:00Z")
+
+    def test_warmup_fetches_only_icao_codes_still_due(self) -> None:
+        shanghai = self.cities["ZSPD"]
+        los_angeles = self.cities["KLAX"]
+        fixed_now = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+        state = {
+            "daily_warmup": {
+                "shanghai|2026-08-22": {
+                    "status": "complete", "market_local_date": "2026-08-22",
+                }
+            }
+        }
+        config = {
+            "warmup_retry_seconds": 60,
+            "warmup_stations_per_request": 25,
+            "checkwx_api_key_env": "TREE4_TEST_CHECKWX_KEY",
+            "checkwx_previous_limit": 50,
+        }
+        with patch("metar_observer.utc_now", return_value=fixed_now):
+            with patch("metar_observer.fetch_checkwx_reports", return_value=([], "https://checkwx.test/history")) as mocked:
+                observer.warm_up_current_local_days(state=state, config=config, cities={"ZSPD": shanghai, "KLAX": los_angeles})
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(mocked.call_args.args[0], ["KLAX"])
+        self.assertEqual(mocked.call_args.kwargs["previous_limit"], 50)
 
     def test_warmup_fails_closed_when_current_iana_day_has_no_report(self) -> None:
         city = self.cities["ZSPD"]

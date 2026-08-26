@@ -407,7 +407,7 @@ def warm_up_current_local_days(config: dict[str, Any], state: dict[str, Any], ci
     if not due:
         return {"status": "already_complete", "city_count": len(cities)}
     fetched_at = iso_now()
-    station_ids = list(cities)
+    station_ids = [city["icao"] for city in due]
     all_reports: list[dict[str, Any]] = []
     endpoints: list[str] = []
     try:
