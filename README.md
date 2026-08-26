@@ -109,7 +109,7 @@ python3 metar_observer.py status
 
 tree2 新增 `clob_market_data.py`，对 CLOB 订单簿进行 token 一致性校验，保存 `asset_id`、`market`、`timestamp`、`hash`、`min_order_size`、`tick_size`、bids、asks 和本地抓取时间。订单簿层优先尝试批量读取，失败时才退回单 token REST 读取，并使用短期缓存。对于交易决策，`NO asks=[]` 始终记录为 `EMPTY_ASK`；NO bids 或页面显示价不会被当作 NO 买入流动性。
 
-`execution_policy.py` 将决策拆成可审计的拒绝码，包括 `STALE_OR_MISSING_BOOK`、`EMPTY_ASK`、`ASK_OUTSIDE_LIMIT`、`DEPTH_LT_TARGET`、`DEPTH_LT_MIN_ORDER` 和 `LIVE_EXECUTOR_DISABLED`。`tree2_execution.py` 只基于带时间戳的 CLOB 快照模拟 5 股 FAK 纸面成交，并记录盘口快照、费用响应、逐档深度、平均价和总成本。
+`execution_policy.py` 将决策拆成可审计的拒绝码，包括 `STALE_OR_MISSING_BOOK`、`EMPTY_ASK`、`ASK_OUTSIDE_LIMIT`、`DEPTH_LT_TARGET`、`DEPTH_LT_MIN_ORDER` 和 `LIVE_EXECUTOR_DISABLED`。`tree2_execution.py` 只基于带时间戳的 CLOB 快照构造固定 **5 shares BUY_NO FAK** 纸面订单意图：从保护价以内的最低 ask 开始逐档遍历，填满 5 shares；最后一档价格作为最坏可接受价格，剩余未成交数量按 FAK 语义取消。该模块记录盘口快照、费用响应、逐档深度、平均价、保护价和总成本，仍不签名、不提交订单。
 
 `audit_store.py` 提供 SQLite WAL 审计账本，用于后续保存信号、快照、决策和风险账本；当前 tree2 尚未将所有 legacy JSONL 历史自动迁移到 SQLite，部署时应先使用新配置运行只读观察并核对数据，再进行迁移。
 

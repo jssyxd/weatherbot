@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,6 +20,17 @@ class Tree2SafetyTests(unittest.TestCase):
             "asks": [{"price": "0.10", "size": "5"}],
             "bids": [{"price": "0.09", "size": "10"}],
         }
+
+    def test_batch_books_uses_post_payload_and_parses_tokens(self) -> None:
+        raw = [self.raw_book]
+        data = CLOBMarketData(max_snapshot_age_seconds=10)
+        with patch.object(data, "_request_json", return_value=raw) as request:
+            books = data.fetch_books(["no-1"])
+        request.assert_called_once()
+        args, kwargs = request.call_args
+        self.assertTrue(args[0].endswith("/books"))
+        self.assertEqual(kwargs["payload"], [{"token_id": "no-1"}])
+        self.assertEqual(books["no-1"].best_ask, Decimal("0.10"))
 
     def test_book_parser_rejects_token_mismatch(self) -> None:
         with self.assertRaises(CLOBDataError):

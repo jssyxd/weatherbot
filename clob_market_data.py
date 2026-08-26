@@ -198,13 +198,14 @@ class CLOBMarketData:
         self._fees[token] = (time.time(), dict(raw))
         return dict(raw)
 
-    def executable_summary(self, token_id: str, max_age_seconds: float | None = None) -> dict[str, Any]:
+    def executable_summary(self, token_id: str, max_age_seconds: float | None = None, max_price: Decimal = Decimal("0.95")) -> dict[str, Any]:
         snapshot = self.get_cached(token_id, max_age_seconds)
         if snapshot is None:
             return {"status": "STALE_OR_MISSING_BOOK", "token_id": str(token_id)}
-        if not snapshot.asks:
+        eligible_asks = [x for x in snapshot.asks if Decimal("0.05") < x["price"] < max_price]
+        if not eligible_asks:
             return {
-                "status": "EMPTY_ASK",
+                "status": "EMPTY_ASK" if not snapshot.asks else "ASK_OUTSIDE_LIMIT",
                 "token_id": snapshot.token_id,
                 "book_timestamp": snapshot.timestamp,
                 "book_hash": snapshot.book_hash,
@@ -219,5 +220,6 @@ class CLOBMarketData:
             "book_age_seconds": round(time.time() - snapshot.fetched_at_epoch, 3),
             "best_bid": str(snapshot.best_bid) if snapshot.best_bid is not None else None,
             "best_ask": str(snapshot.best_ask) if snapshot.best_ask is not None else None,
-            "ask_depth_shares": str(sum(x["size"] for x in snapshot.asks)),
+            "ask_depth_shares": str(sum(x["size"] for x in eligible_asks)),
+            "ask_levels": [{"price": str(x["price"]), "size": str(x["size"])} for x in eligible_asks],
         }

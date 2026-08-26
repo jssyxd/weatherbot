@@ -41,6 +41,8 @@ def decide_buy_no(
         return ExecutionDecision(False, "LIVE_EXECUTOR_DISABLED", "tree2 has no enabled live executor", token, mode)
     if book_summary.get("status") == "STALE_OR_MISSING_BOOK":
         return ExecutionDecision(False, "STALE_OR_MISSING_BOOK", "fresh executable book is required", token, mode)
+    if book_summary.get("status") == "ASK_OUTSIDE_LIMIT":
+        return ExecutionDecision(False, "ASK_OUTSIDE_LIMIT", "all asks are outside the allowed protection price", token, mode, book_timestamp=book_summary.get("book_timestamp"), book_hash=book_summary.get("book_hash"))
     if book_summary.get("status") == "EMPTY_ASK":
         return ExecutionDecision(
             False,
