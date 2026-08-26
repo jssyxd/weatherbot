@@ -10,7 +10,8 @@
   "market_ws_enabled": true,
 
   "checkwx_api_key_env": "CHECKWX_API_KEY",
-  "scan_interval_seconds": 900,
+  "scan_interval_seconds": 60,
+  "rate_limit_backoff_seconds": 60,
   "stations_per_request": 25,
   "checkwx_previous_limit": 50,
   "max_report_age_seconds": 900,

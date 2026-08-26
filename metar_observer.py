@@ -42,9 +42,17 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 CHECKWX_BASE_URL = "https://api.checkwx.com/v2"
 CHECKWX_API_KEY_ENV_DEFAULT = "CHECKWX_API_KEY"
-CHECKWX_MIN_CACHE_SECONDS = 900
+MIN_SCAN_INTERVAL_SECONDS = 60
 CHECKWX_MAX_ICAOS_PER_REQUEST = 25
 SUPPORTED_TYPES = {"METAR", "SPECI"}
+
+
+class CheckWXRateLimitError(RuntimeError):
+    """A 429 response carrying an optional, vendor-specified retry delay."""
+
+    def __init__(self, retry_after_seconds: int | None = None) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__("CheckWX 请求频率或日限额已达到上限（HTTP 429）")
 
 
 def utc_now() -> datetime:
@@ -116,12 +124,12 @@ def load_config(config_path: Path) -> dict[str, Any]:
         raise RuntimeError(f"未找到 {config_path.name}。请先复制 config.example.json 为 config.json。")
     if not isinstance(config, dict):
         raise ValueError("配置根节点必须是 JSON 对象")
-    interval = int(config.get("scan_interval_seconds", CHECKWX_MIN_CACHE_SECONDS))
-    if interval < CHECKWX_MIN_CACHE_SECONDS:
-        raise ValueError(
-            f"scan_interval_seconds 不得小于 {CHECKWX_MIN_CACHE_SECONDS}；"
-            "CheckWX 文档要求 METAR/TAF 响应至少缓存 15 分钟"
-        )
+    interval = int(config.get("scan_interval_seconds", MIN_SCAN_INTERVAL_SECONDS))
+    if interval < MIN_SCAN_INTERVAL_SECONDS:
+        raise ValueError(f"scan_interval_seconds 不得小于 {MIN_SCAN_INTERVAL_SECONDS}")
+    rate_limit_backoff = int(config.get("rate_limit_backoff_seconds", interval))
+    if rate_limit_backoff < interval:
+        raise ValueError("rate_limit_backoff_seconds 不得小于 scan_interval_seconds")
     chunk_size = int(config.get("stations_per_request", CHECKWX_MAX_ICAOS_PER_REQUEST))
     if chunk_size < 1 or chunk_size > CHECKWX_MAX_ICAOS_PER_REQUEST:
         raise ValueError(f"stations_per_request 必须介于 1 和 {CHECKWX_MAX_ICAOS_PER_REQUEST}")
@@ -170,6 +178,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
         raise ValueError("local_book_max_age_seconds 必须大于 0")
     return {
         "scan_interval_seconds": interval,
+        "rate_limit_backoff_seconds": rate_limit_backoff,
         "stations_per_request": chunk_size,
         "checkwx_previous_limit": history_limit,
         "checkwx_api_key_env": api_key_env,
@@ -246,7 +255,14 @@ def fetch_checkwx_reports(
         elif exc.code == 403:
             detail = "CheckWX 拒绝访问该端点（HTTP 403）；当前密钥可能不具备历史 METAR 权限"
         elif exc.code == 429:
-            detail = "CheckWX 请求频率或日限额已达到上限（HTTP 429）"
+            retry_after: int | None = None
+            raw_retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+            try:
+                if raw_retry_after is not None:
+                    retry_after = max(MIN_SCAN_INTERVAL_SECONDS, int(raw_retry_after))
+            except (TypeError, ValueError):
+                retry_after = None
+            raise CheckWXRateLimitError(retry_after) from exc
         else:
             detail = f"CheckWX 请求失败（HTTP {exc.code}）"
         raise RuntimeError(detail) from exc
@@ -655,6 +671,13 @@ def run_loop(config: dict[str, Any]) -> None:
             print("\n扫描器已停止。")
             lock_handle.close()
             return
+        except CheckWXRateLimitError as exc:
+            write_failure_health(config, exc)
+            failure_started = failure_started or utc_now()
+            backoff = max(config["rate_limit_backoff_seconds"], exc.retry_after_seconds or 0)
+            print(f"[CheckWX 限流退避] {exc}；等待 {backoff} 秒后重试。", file=sys.stderr)
+            time.sleep(backoff)
+            continue
         except Exception as exc:
             write_failure_health(config, exc)
             failure_started = failure_started or utc_now()

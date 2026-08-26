@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -91,6 +92,16 @@ class MetarObserverTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "results 与 data 长度不一致"):
                     observer.fetch_checkwx_reports(["ZSPD"], "TREE4_TEST_CHECKWX_KEY")
 
+    def test_checkwx_429_uses_retry_after_header(self) -> None:
+        error = urllib.error.HTTPError(
+            "https://api.checkwx.com/v2/metar/ZSPD/short", 429, "Too Many Requests", {"Retry-After": "120"}, None,
+        )
+        with patch.dict("os.environ", {"TREE4_TEST_CHECKWX_KEY": "test-only-key"}, clear=False):
+            with patch("urllib.request.urlopen", side_effect=error):
+                with self.assertRaises(observer.CheckWXRateLimitError) as raised:
+                    observer.fetch_checkwx_reports(["ZSPD"], "TREE4_TEST_CHECKWX_KEY")
+        self.assertEqual(raised.exception.retry_after_seconds, 120)
+
     def test_checkwx_key_must_exist_in_environment(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "未设置 CheckWX API 密钥环境变量"):
             observer.fetch_checkwx_reports(["ZSPD"], "TREE4_MISSING_CHECKWX_API_KEY")
@@ -104,17 +115,17 @@ class MetarObserverTests(unittest.TestCase):
         stations = observer.normalize_stations([{"icao": "zspd", "name": "Shanghai Pudong"}, "ZSPD", "RCTP"])
         self.assertEqual(stations, [{"icao": "ZSPD", "name": "Shanghai Pudong"}, {"icao": "RCTP", "name": "RCTP"}])
 
-    def test_interval_below_checkwx_cache_window_is_rejected(self) -> None:
+    def test_interval_below_one_minute_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 899, "stations": ["ZSPD"]}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 59, "stations": ["ZSPD"]}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 
     def test_checkwx_batch_size_above_25_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"stations_per_request": 26, "scan_interval_seconds": 900}), encoding="utf-8")
+            config_path.write_text(json.dumps({"stations_per_request": 26, "scan_interval_seconds": 60}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 
@@ -177,19 +188,20 @@ class MetarObserverTests(unittest.TestCase):
 
     def test_health_snapshot_is_degraded_when_iana_warmup_is_missing(self) -> None:
         city = self.cities["ZSPD"]
-        config = {"scan_interval_seconds": 900, "market_rules_max_age_seconds": 1800}
+        config = {"scan_interval_seconds": 60, "market_rules_max_age_seconds": 1800}
         snapshot = observer.build_health_snapshot(config, {}, {"ZSPD": city})
         self.assertEqual(snapshot["status"], "degraded")
         self.assertFalse(snapshot["llm_in_minute_path"])
         self.assertEqual(snapshot["critical_path"], "deterministic_iana_state_machine_only")
         self.assertEqual(snapshot["untrusted_warmup_count"], 1)
 
-    def test_checkwx_15_minute_scan_interval_is_accepted(self) -> None:
+    def test_one_minute_scan_interval_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 900, "stations": ["ZSPD"]}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 60, "stations": ["ZSPD"]}), encoding="utf-8")
             loaded = observer.load_config(config_path)
-            self.assertEqual(loaded["scan_interval_seconds"], 900)
+            self.assertEqual(loaded["scan_interval_seconds"], 60)
+            self.assertEqual(loaded["rate_limit_backoff_seconds"], 60)
             self.assertEqual(loaded["stations_per_request"], 25)
 
     def test_single_instance_lock_is_exclusive(self) -> None:
@@ -205,7 +217,7 @@ class MetarObserverTests(unittest.TestCase):
     def test_checkwx_previous_limit_must_be_supported_range(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 900, "checkwx_previous_limit": 51}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 60, "checkwx_previous_limit": 51}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 

@@ -9,7 +9,7 @@
 | 当前实况请求 | `GET https://api.checkwx.com/v2/metar/{最多25个ICAO}/short`，使用 `X-API-Key` 请求头。 |
 | 温度口径 | 优先 `RMK T[01][TTT][DDHH]` 的 0.1°C；否则确定性解析正文 `M?DD/M?DD` 整数摄氏度。 |
 | 时间口径 | 用 CheckWX `observed` UTC 归属机场 IANA 当地自然日；`fetched_at` 仅用于 `observed` 至本地抓取的绝对新鲜度门。 |
-| 批量与缓存 | 每次最多 25 个 ICAO；按官方建议，默认扫描间隔为 900 秒，避免违反至少 15 分钟的 METAR/TAF 缓存建议。[1] |
+| 批量与扫描 | 每次最多 25 个 ICAO；按 tree4 的运行要求默认每 60 秒全量扫描。CheckWX 文档仍建议缓存 METAR/TAF 至少 15 分钟，因此需通过运行日志持续监控 429 与实际首见收益。[1] |
 | 暖机 | 启动/当地日切换时使用 `/v2/metar/{icao-list}/previous/{2..50}/short` 重新构建当天极值；若历史接口权限、响应或当前日数据不足，则保持失败关闭，不产生候选。 |
 | 非目标数据 | 不使用 TAF、ECMWF、任何预测输入、Station、BOT、G-AIRMET 或 URL 查询参数密钥模式。 |
 
@@ -30,7 +30,8 @@ python3 metar_observer.py run
 | 配置项 | 默认值 | 含义 |
 |---|---:|---|
 | `checkwx_api_key_env` | `CHECKWX_API_KEY` | 保存密钥的环境变量名，而非密钥本身。 |
-| `scan_interval_seconds` | `900` | CheckWX METAR 轮询间隔；不得低于 900 秒。 |
+| `scan_interval_seconds` | `60` | CheckWX METAR 全量轮询间隔；不得低于 60 秒。 |
+| `rate_limit_backoff_seconds` | `60` | 收到 HTTP 429 后的最小退避时间；若服务端提供更长 `Retry-After`，优先采用更长值。 |
 | `stations_per_request` | `25` | 当前 METAR 批量 ICAO 数；不得超过接口上限。 |
 | `checkwx_previous_limit` | `50` | 每站暖机历史数量，支持范围为 2–50。 |
 | `max_report_age_seconds` | `900` | `observed` 到本次抓取的最大可接受龄期。 |
@@ -45,7 +46,7 @@ CheckWX 文档将历史 METAR 端点归类为高级端点；该端点需要相�
 
 ## 时效性验证而非预设结论
 
-切换 CheckWX 的目的是检验其数据可用时间是否早于旧免费来源；这并不是已被本仓库证明的结论。官方建议对 METAR 响应至少缓存 15 分钟，因此默认 900 秒扫描间隔优先遵守供应商使用约束，不能将 tree4 直接宣称为更快。[1] tree4 会在每个审计事件中保留 `report_time_utc`、`fetched_at_utc` 和 `checkwx_report_age_seconds`，可以在稳定运行后按同一 ICAO、相同 `raw_metar` 对比首见时间，形成可复查的延迟分布。
+切换 CheckWX 的目的是检验其数据可用时间是否早于旧免费来源；这并不是已被本仓库证明的结论。tree4 按运行要求每 60 秒扫描一次，并会在每个审计事件中保留 `report_time_utc`、`fetched_at_utc` 和 `checkwx_report_age_seconds`，以同一 ICAO、相同 `raw_metar` 对比首见时间。CheckWX 文档仍建议 METAR/TAF 至少缓存 15 分钟；因此 429、响应龄期与实际首见收益必须被持续审计，不能仅以扫描频率宣称更快。[1]
 
 建议持续运行至少数周，特别覆盖整点 METAR、SPECI、机场当地午夜、夏令时切换和网络异常场景。只有在样本量、机场集合、轮询节奏及“首见”的定义一致时，才应判断 CheckWX 是否在目标机场上更早可用。
 
@@ -56,7 +57,7 @@ sudo pip3 install -r requirements.txt
 python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖 CheckWX 请求头鉴权、密钥不进入 URL、短格式 JSON 契约、25 ICAO 上限、900 秒缓存门、历史暖机失败关闭、IANA 当地日、正文和 RMK 温度解析、华氏精度保护、本地订单簿以及纸面 FAK 风控边界。它们不调用真实 API，也不会发出订单。
+当前测试覆盖 CheckWX 请求头鉴权、密钥不进入 URL、短格式 JSON 契约、25 ICAO 上限、60 秒扫描门、HTTP 429 的 `Retry-After` 退避、历史暖机失败关闭、IANA 当地日、正文和 RMK 温度解析、华氏精度保护、本地订单簿以及纸面 FAK 风控边界。它们不调用真实 API，也不会发出订单。
 
 ## tree3 保留边界
 
