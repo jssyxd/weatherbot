@@ -123,3 +123,12 @@ python3 -m unittest discover -s tests -v
 ```
 
 真实执行器、账户余额/授权读取、签名、订单状态机、撤单和 market WebSocket 订阅仍然是后续独立阶段，不能将当前 tree2 的 `paper_fill_estimate` 解释为真实成交。生产上线前必须完成人工放行、账户级限额、kill switch、订单回报和恢复演练。
+
+
+### CLOB V2 订单基础层
+
+`order_signing.py` 实现的是**离线订单基础层**，不是下单器。它遵循 CLOB V2 的 EIP-712 结构：domain 使用 `Polymarket CTF Exchange`、版本 `2`、Polygon chain ID 137，并根据订单簿 `neg_risk` 选择标准或 Neg Risk Exchange。V2 签名消息移除了 V1 的 `taker`、`nonce`、`feeRateBps` 和 `expiration`，加入 `timestamp`、`metadata` 和 `builder`；`expiration` 仍保留在未来的 `/order` wire body 中，但不进入签名消息。
+
+精度层根据当前 `tick_size` 选择 price、size、amount 小数位，BUY 的 `makerAmount` 编码为价格乘 shares 的六位整数，`takerAmount` 编码为 shares 的六位整数。输入会先按 tick 和 size 规则向下规范化，并拒绝不支持的 tick、低于最小订单量或超过价格范围的订单。
+
+签名测试只使用仓库内测试夹具生成的固定私钥，验证 EIP-712 签名能够恢复预期地址、标准和负风险路由产生不同签名，并确认 `expiration` 不在 V2 signed message 中。生产环境不得把测试私钥用于任何账户，真实钱包加载和订单提交仍未实现。

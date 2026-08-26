@@ -32,6 +32,7 @@ class BookSnapshot:
     market: str | None
     min_order_size: Decimal | None
     tick_size: Decimal | None
+    neg_risk: bool | None
     asks: tuple[dict[str, Decimal], ...]
     bids: tuple[dict[str, Decimal], ...]
     source: str
@@ -129,6 +130,7 @@ class CLOBMarketData:
             market=str(raw.get("market")) if raw.get("market") is not None else None,
             min_order_size=cls._decimal(raw.get("min_order_size"), "min_order_size"),
             tick_size=cls._decimal(raw.get("tick_size"), "tick_size"),
+            neg_risk=(bool(raw["neg_risk"]) if "neg_risk" in raw and raw["neg_risk"] is not None else None),
             asks=levels("asks"),
             bids=levels("bids"),
             source=source,
