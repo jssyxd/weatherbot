@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""CheckWX v2 METAR/SPECI dead-bucket observer (tree4).
+"""CheckWX v2 observer and tail-end consensus YES paper strategy (tree6yes).
 
-The program reads published CheckWX Aviation Weather API METAR/SPECI reports
-for the verified contract stations. It never uses forecasts: after a complete
-CheckWX historical replay for the IANA-local day, each later new daily extreme
-may mark an already-impossible temperature bucket as a candidate BUY_NO. The
-API key is read only from an environment variable, never from configuration,
-URLs, audit records, or source control. It never loads a wallet, signs an
-order, or submits a real trade. ``mode=live`` remains explicitly blocked.
+The program pulls published CheckWX METAR/SPECI reports every 15 minutes and
+uses public Polymarket market data only to form paper-only YES-side intents.
+It never uses a forecast model, loads a wallet, signs an order, or submits,
+cancels, or amends a real trade. ``mode=live`` remains explicitly blocked.
 """
 from __future__ import annotations
 
@@ -24,25 +21,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from edge_engine import (
-    append_jsonl,
-    atomic_json_write,
-    evaluate_observation,
-    load_contract_cities,
-    load_market_rules,
-    local_market_date,
-    observed_temperature_native,
-)
+from edge_engine import append_jsonl, atomic_json_write, load_contract_cities, load_market_rules, local_market_date, observed_temperature_native
 from market_adapter import refresh_market_rules
-from paper_execution import simulate_paper_fak
-from tree2_execution import simulate as simulate_tree2
 from audit_store import AuditStore
+from local_order_book import LocalBookSnapshot
+from tail_consensus_strategy import TailConsensusConfig, evaluate_tail_entries, mark_temperature_breaks, monitor_tail_positions
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 CHECKWX_BASE_URL = "https://api.checkwx.com/v2"
 CHECKWX_API_KEY_ENV_DEFAULT = "CHECKWX_API_KEY"
-MIN_SCAN_INTERVAL_SECONDS = 60
+MIN_SCAN_INTERVAL_SECONDS = 900
 CHECKWX_MAX_ICAOS_PER_REQUEST = 25
 SUPPORTED_TYPES = {"METAR", "SPECI"}
 
@@ -157,9 +146,9 @@ def load_config(config_path: Path) -> dict[str, Any]:
     mode = str(config.get("mode", "paper")).lower().strip()
     if mode not in {"observe", "paper", "live"}:
         raise ValueError("mode 只能为 observe、paper 或 live")
-    execution_engine = str(config.get("execution_engine", "legacy")).lower().strip()
-    if execution_engine not in {"legacy", "tree2", "tree3"}:
-        raise ValueError("execution_engine 只能为 legacy、tree2 或 tree3")
+    execution_engine = str(config.get("execution_engine", "tree6yes")).lower().strip()
+    if execution_engine != "tree6yes":
+        raise ValueError("tree6yes 仅支持 execution_engine=tree6yes；已移除所有 NO 侧执行路径")
     order_type = str(config.get("execution_order_type", "FAK")).upper().strip()
     if order_type not in {"FAK", "FOK"}:
         raise ValueError("execution_order_type 只能为 FAK 或 FOK")
@@ -176,6 +165,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
     local_book_max_age = float(config.get("local_book_max_age_seconds", 3))
     if local_book_max_age <= 0:
         raise ValueError("local_book_max_age_seconds 必须大于 0")
+    tail_consensus = TailConsensusConfig.from_mapping({**config, "local_book_max_age_seconds": local_book_max_age})
     return {
         "scan_interval_seconds": interval,
         "rate_limit_backoff_seconds": rate_limit_backoff,
@@ -195,7 +185,8 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "max_execution_price": max_execution_price,
         "max_slippage": max_slippage,
         "local_book_max_age_seconds": local_book_max_age,
-        "market_ws_enabled": bool(config.get("market_ws_enabled", False)),
+        "market_ws_enabled": bool(config.get("market_ws_enabled", True)),
+        "tail_consensus": tail_consensus,
         "state_path": BASE_DIR / str(config.get("state_path", "data/state.json")),
         "event_dir": BASE_DIR / str(config.get("event_dir", "data/observations")),
         "signal_dir": BASE_DIR / str(config.get("signal_dir", "data/signals")),
@@ -242,7 +233,7 @@ def fetch_checkwx_reports(
         url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "weatherbot-tree4/4.0 (+https://github.com/jssyxd/weatherbot)",
+            "User-Agent": "weatherbot-tree6yes/6.0 (+https://github.com/jssyxd/weatherbot)",
             "X-API-Key": _checkwx_api_key(api_key_env),
         },
     )
@@ -259,7 +250,7 @@ def fetch_checkwx_reports(
             raw_retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
             try:
                 if raw_retry_after is not None:
-                    retry_after = max(MIN_SCAN_INTERVAL_SECONDS, int(raw_retry_after))
+                    retry_after = max(0, int(raw_retry_after))
             except (TypeError, ValueError):
                 retry_after = None
             raise CheckWXRateLimitError(retry_after) from exc
@@ -324,6 +315,7 @@ def load_state(state_path: Path) -> dict[str, Any]:
         ("edge_failures", {}), ("daily_extrema", {}), ("daily_warmup", {}), ("handled_candidate_buckets", {}),
         ("market_rules", []), ("market_rules_refreshed_at_utc", None), ("market_failures", {}), ("consecutive_failure_started_utc", None),
         ("paper_city_day_notional", {}), ("paper_city_day_total_debit", {}), ("execution_paused", False),
+        ("tail_consensus", {}), ("tail_positions", {}),
     ):
         state.setdefault(key, default)
     return state
@@ -338,6 +330,14 @@ def prune_state(state: dict[str, Any], keep_days: int = 3) -> None:
     cutoff = (utc_now() - timedelta(days=keep_days)).date().isoformat()
     for key in ("daily_extrema", "daily_warmup"):
         state[key] = {item_key: value for item_key, value in state.get(key, {}).items() if str(value.get("market_local_date", "")) >= cutoff}
+    state["tail_positions"] = {
+        item_key: value for item_key, value in state.get("tail_positions", {}).items()
+        if isinstance(value, dict) and str(value.get("market_local_date", "")) >= cutoff
+    }
+    state["tail_consensus"] = {
+        item_key: value for item_key, value in state.get("tail_consensus", {}).items()
+        if isinstance(value, dict) and str(value.get("last_seen_utc", "")) >= cutoff
+    }
 
 
 def _warmup_state_key(city: dict[str, Any], local_date: str) -> str:
@@ -497,23 +497,15 @@ def refresh_market_rules_if_due(state: dict[str, Any], config: dict[str, Any], c
         return {"market_refresh_error": state["last_market_refresh_error"]}
 
 
-def enrich_execution(signal: dict[str, Any], mode: str, state: dict[str, Any]) -> dict[str, Any]:
-    """Attach a read-only paper-fill estimate or a live safety block; never submit an order."""
-    if signal.get("signal_type") != "candidate_no_signal":
-        return signal
-    result = dict(signal)
-    if mode in {"paper", "observe"}:
-        if state.get("execution_engine") == "tree3":
-            result["execution"] = {"mode": "paper", "status": "tree3_local_book_required", "decision_code": "LOCAL_BOOK_PATH_NOT_ATTACHED", "message": "tree3 已要求 WebSocket 本地盘口；主循环尚未自动连接真实行情时 fail-closed。"}
-        else:
-            result["execution"] = simulate_tree2(signal, state) if state.get("execution_engine") == "tree2" else simulate_paper_fak(signal, state)
-    else:
-        result["execution"] = {
-            "mode": "live",
-            "status": "blocked_no_live_executor",
-            "message": "此版本不包含钱包、签名或订单提交器；live 模式只产生阻断审计记录。",
-        }
-    return result
+def signal_token_id(signal: dict[str, Any]) -> str | None:
+    """Return the audited YES token without ever falling back to a NO token."""
+    execution = signal.get("execution") if isinstance(signal.get("execution"), dict) else {}
+    token_id = execution.get("token_id") or signal.get("token_id")
+    if token_id:
+        return str(token_id)
+    bucket = signal.get("bucket") if isinstance(signal.get("bucket"), dict) else {}
+    new_bucket = signal.get("new_bucket") if isinstance(signal.get("new_bucket"), dict) else {}
+    return str(bucket.get("yes_token_id") or new_bucket.get("yes_token_id") or "") or None
 
 
 def format_event(event: dict[str, Any]) -> str:
@@ -522,14 +514,18 @@ def format_event(event: dict[str, Any]) -> str:
     return f"[新{event['report_type']}] {event['airport_icao']} {event['report_time_utc']}{age_text}\n  {event['raw_metar']}"
 
 
-def scan_once(config: dict[str, Any]) -> dict[str, Any]:
+def scan_once(config: dict[str, Any], local_books: dict[str, LocalBookSnapshot] | None = None) -> dict[str, Any]:
+    """Run one 15-minute weather/market-structure scan and emit YES-only paper signals.
+
+    ``local_books`` is injected by the public market-stream monitor.  Missing,
+    stale, incomplete or ambiguous books never create an entry, exit or rotation.
+    """
     fetched_at = iso_now()
+    scan_now = utc_now()
     state = load_state(config["state_path"])
-    state["execution_engine"] = config.get("execution_engine", "legacy")
+    state["execution_engine"] = config["execution_engine"]
     cities = load_contract_cities(config["contract_cities_path"])
     warmup_summary = warm_up_current_local_days(config, state, cities)
-    # Process published observations with the last known good market rules first.
-    market_rules = state.get("market_rules") or load_market_rules(config["market_rules_path"])
     station_names = {icao: city["name"] for icao, city in cities.items()}
     station_ids = list(station_names)
     all_reports: list[dict[str, Any]] = []
@@ -548,7 +544,7 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     for record in new_events:
         seen[record["event_id"]] = fetched_at
     state["seen"] = prune_seen(seen)
-    state["last_successful_scan_utc"] = None  # Set to completion time only after every deterministic stage succeeds.
+    state["last_successful_scan_utc"] = None
     state["last_report_count"] = len(normalized)
     state["last_new_event_count"] = len(new_events)
     state["consecutive_failure_started_utc"] = None
@@ -556,31 +552,29 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     signals: list[dict[str, Any]] = []
     for event in new_events:
         city = cities.get(event["airport_icao"])
-        if city is None:
-            continue
         report_time = parse_time(event.get("report_time_utc"))
-        local_date = local_market_date(report_time, city) if report_time else None
-        if local_date is None or not _warmup_is_complete(state, city, local_date):
-            signals.append({
-                "signal_type": "no_signal", "reason": "daily_extrema_untrusted_warmup_incomplete",
-                "event_id": event.get("event_id"), "icao": city["icao"], "market_local_date": local_date,
-                "disclaimer": "No candidate is allowed until observed-time-to-IANA historical warm-up completes for this local market day.",
-            })
+        local_date = local_market_date(report_time, city) if city is not None and report_time else None
+        if city is None or local_date is None or not _warmup_is_complete(state, city, local_date):
+            signals.append({"signal_type": "no_signal", "reason": "daily_extrema_untrusted_warmup_incomplete", "event_id": event.get("event_id"), "icao": event.get("airport_icao"), "market_local_date": local_date})
             continue
-        if not cache_is_fresh(state.get("market_rules_refreshed_at_utc"), config["market_rules_max_age_seconds"]):
-            signals.append({
-                "signal_type": "no_signal", "reason": "market_rules_stale",
-                "event_id": event.get("event_id"), "icao": city["icao"], "market_local_date": local_date,
-                "market_rules_refreshed_at_utc": state.get("market_rules_refreshed_at_utc"),
-                "max_market_rules_age_seconds": config["market_rules_max_age_seconds"],
-            })
+        age = (scan_now - report_time).total_seconds()
+        if age > config["max_report_age_seconds"]:
+            signals.append({"signal_type": "no_signal", "reason": "report_too_old", "event_id": event.get("event_id"), "city_id": city["city_id"], "age_seconds": round(age, 3)})
             continue
-        for signal in evaluate_observation(
-            state, event, city, market_rules, config["max_report_age_seconds"],
-        ):
-            signals.append(enrich_execution(signal, config["mode"], state))
-    # Refresh market rules only after this round's time-sensitive observations.
+        # This is the only trigger that can mark a held YES bucket for exit.
+        signals.extend(mark_temperature_breaks(state, config["tail_consensus"], event, city, scan_now))
+
+    # Refresh after processing this round's observed temperatures, then run the
+    # consensus state machine against the latest discovered YES-token mappings.
     refresh_summary = refresh_market_rules_if_due(state, config, cities)
+    market_rules = state.get("market_rules") or load_market_rules(config["market_rules_path"])
+    books = local_books or {}
+    if config["mode"] in {"paper", "observe"}:
+        signals.extend(evaluate_tail_entries(state, config["tail_consensus"], cities, market_rules, books, scan_now))
+        signals.extend(monitor_tail_positions(state, config["tail_consensus"], cities, market_rules, books, scan_now))
+    else:
+        signals.append({"signal_type": "no_signal", "reason": "live_executor_disabled", "disclaimer": "tree6yes has no live executor; no wallet, signature, or CLOB order path exists."})
+
     state["last_successful_scan_utc"] = iso_now()
     prune_state(state)
     atomic_json_write(config["state_path"], state)
@@ -590,35 +584,33 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     audit_store = AuditStore(config["audit_db_path"])
     try:
         for signal in signals:
-            execution = signal.get("execution") or {}
+            execution = signal.get("execution") or signal.get("entry_execution") or {}
+            bucket = signal.get("bucket") if isinstance(signal.get("bucket"), dict) else signal.get("new_bucket")
+            if not isinstance(bucket, dict):
+                bucket = {}
             audit_store.append(
-                created_at_utc=iso_now(),
-                event_type="signal_execution_decision",
-                correlation_id=str(signal.get("event_id") or signal.get("bucket", {}).get("bucket_id") or ""),
-                mode=config["mode"],
-                token_id=str(signal.get("bucket", {}).get("no_token_id") or "") or None,
-                payload={"signal": signal, "execution": execution},
+                created_at_utc=iso_now(), event_type="tail_yes_signal_decision",
+                correlation_id=str(signal.get("event_id") or signal.get("position_key") or bucket.get("bucket_id") or ""),
+                mode=config["mode"], token_id=signal_token_id(signal), payload={"signal": signal, "execution": execution},
             )
     finally:
         audit_store.close()
     for event in new_events:
         print(format_event(event))
-    candidate_count = sum(item.get("signal_type") == "candidate_no_signal" for item in signals)
+    entry_count = sum(item.get("signal_type") == "tail_yes_entry" for item in signals)
+    alert_count = sum(item.get("signal_type") == "market_reversal_alert" for item in signals)
+    rotation_count = sum(item.get("signal_type") == "tail_yes_rotation" for item in signals)
     print(
         f"[扫描完成] {fetched_at} | 合同站 {len(station_ids)} | 近期报告 {len(normalized)} | 新增事件 {len(new_events)} | "
-        f"候选NO信号 {candidate_count} | 模式 {config['mode']}" + (f" | 配置刷新 {refresh_summary}" if refresh_summary else "")
+        f"候选YES入场 {entry_count} | 85¢盘口预警 {alert_count} | 温度确认换手 {rotation_count} | 模式 {config['mode']}"
+        + (f" | 配置刷新 {refresh_summary}" if refresh_summary else "")
     )
     return {
-        "fetched_at_utc": fetched_at,
-        "station_count": len(station_ids),
-        "reports_seen": len(normalized),
-        "new_events": len(new_events),
-        "candidate_signals": candidate_count,
-        "warmup": warmup_summary,
-        "health_status": health["status"],
-        "event_file": str(event_file) if event_file else None,
-        "signal_file": str(signal_file) if signal_file else None,
-        "mode": config["mode"],
+        "fetched_at_utc": fetched_at, "station_count": len(station_ids), "reports_seen": len(normalized),
+        "new_events": len(new_events), "tail_yes_entries": entry_count, "market_reversal_alerts": alert_count,
+        "tail_yes_rotations": rotation_count, "open_tail_positions": len(state.get("tail_positions", {})),
+        "warmup": warmup_summary, "health_status": health["status"], "event_file": str(event_file) if event_file else None,
+        "signal_file": str(signal_file) if signal_file else None, "mode": config["mode"],
     }
 
 
@@ -650,41 +642,9 @@ def acquire_single_instance_lock(state_path: Path):
 
 
 def run_loop(config: dict[str, Any]) -> None:
-    interval = config["scan_interval_seconds"]
-    lock_handle = acquire_single_instance_lock(config["state_path"])
-    print(f"候选边缘扫描器已启动：每 {interval} 秒拉取已发布 METAR/SPECI；默认仅 paper 意图，绝不提交真实订单。")
-    # Startup: IANA local-day warm-up first, then fresh market rules.
-    startup_state = load_state(config["state_path"])
-    startup_state["execution_engine"] = config.get("execution_engine", "legacy")
-    startup_cities = load_contract_cities(config["contract_cities_path"])
-    startup_warmup = warm_up_current_local_days(config, startup_state, startup_cities)
-    startup_rules = refresh_market_rules_if_due(startup_state, config, startup_cities)
-    atomic_json_write(config["state_path"], startup_state)
-    print(f"[启动 IANA warm-up] {startup_warmup}")
-    print(f"[启动市场规则] {startup_rules or {'status': 'cached'}}")
-    failure_started: datetime | None = None
-    while True:
-        try:
-            scan_once(config)
-            failure_started = None
-        except KeyboardInterrupt:
-            print("\n扫描器已停止。")
-            lock_handle.close()
-            return
-        except CheckWXRateLimitError as exc:
-            write_failure_health(config, exc)
-            failure_started = failure_started or utc_now()
-            backoff = max(config["rate_limit_backoff_seconds"], exc.retry_after_seconds or 0)
-            print(f"[CheckWX 限流退避] {exc}；等待 {backoff} 秒后重试。", file=sys.stderr)
-            time.sleep(backoff)
-            continue
-        except Exception as exc:
-            write_failure_health(config, exc)
-            failure_started = failure_started or utc_now()
-            elapsed = (utc_now() - failure_started).total_seconds()
-            status = "[扫描暂停：连续失败达到阈值]" if elapsed >= config["failure_pause_after_seconds"] else "[扫描失败]"
-            print(f"{status} {type(exc).__name__}: {exc}", file=sys.stderr)
-        sleep_to_next_interval(interval)
+    """Run the tree6yes coordinator: 15-minute scans plus public book protection."""
+    from tree6yes_runtime import Tree6YesRuntime
+    Tree6YesRuntime(sys.modules[__name__], config).run()
 
 
 def build_health_snapshot(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], last_error: str | None = None) -> dict[str, Any]:
@@ -751,11 +711,15 @@ def show_status(config: dict[str, Any]) -> None:
         "health_status": health["status"],
         "untrusted_warmup_count": health["untrusted_warmup_count"],
         "market_rules_fresh": health["market_rules_fresh"],
+        "strategy": "tail_consensus_yes_only",
+        "open_tail_positions": len(state.get("tail_positions", {})),
+        "tail_consensus_tracked_tokens": len(state.get("tail_consensus", {})),
+        "market_reversal_alert_threshold": str(config["tail_consensus"].market_alert_bid),
     }, ensure_ascii=False, indent=2))
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="每分钟扫描已发布 METAR/SPECI 的候选温度边缘工具")
+    parser = argparse.ArgumentParser(description="每 15 分钟扫描天气数据、以公共盘口保护尾盘 YES 纸面策略的工具")
     parser.add_argument("command", choices=("once", "run", "status"), nargs="?", default="once")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="配置文件路径（默认：config.json）")
     return parser.parse_args()

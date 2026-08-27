@@ -103,12 +103,15 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
             continue
         if not isinstance(outcomes, list) or not isinstance(token_ids, list) or len(outcomes) != len(token_ids):
             continue
+        yes_token = next((str(token_ids[index]) for index, outcome in enumerate(outcomes) if outcome == "Yes"), None)
         no_token = next((str(token_ids[index]) for index, outcome in enumerate(outcomes) if outcome == "No"), None)
-        if not no_token:
+        # tree6yes is a YES-only strategy. Retain both canonical token mappings
+        # for auditability, but reject malformed markets missing either outcome.
+        if not yes_token or not no_token:
             continue
         buckets.append({
             "bucket_id": str(market.get("id")), "label": outcome_text, "lo": lo, "hi": hi,
-            "market_id": str(market.get("id")), "no_token_id": no_token,
+            "market_id": str(market.get("id")), "yes_token_id": yes_token, "no_token_id": no_token,
         })
     if not buckets:
         return []

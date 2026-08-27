@@ -26,7 +26,7 @@ class MarketAdapterTests(unittest.TestCase):
         self.assertEqual(market.parse_bucket("20°C or below"), (None, 21.0, "C"))
         self.assertEqual(market.parse_bucket("32°C or higher"), (32.0, None, "C"))
 
-    def test_event_parser_groups_all_buckets_and_retains_each_no_token(self) -> None:
+    def test_event_parser_groups_all_buckets_and_retains_each_outcome_token(self) -> None:
         city = {"city_id": "shanghai", "icao": "ZSPD", "market_unit": "C"}
         event = {
             "id": "event-1", "slug": "highest-temperature-in-shanghai-on-august-22-2026",
@@ -46,6 +46,7 @@ class MarketAdapterTests(unittest.TestCase):
         rules = market.parse_event_rules(event, city, "2026-08-22", "high")
         self.assertEqual(len(rules), 1)
         self.assertEqual([item["bucket_id"] for item in rules[0]["buckets"]], ["market-30", "market-31"])
+        self.assertEqual(rules[0]["buckets"][1]["yes_token_id"], "yes-31")
         self.assertEqual(rules[0]["buckets"][1]["no_token_id"], "no-31")
 
 

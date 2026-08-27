@@ -61,7 +61,7 @@ class MarketStream:
             payload = message
         if not isinstance(payload, dict):
             raise MarketStreamError("invalid_event_shape")
-        event_type = str(payload.get("type", "")).lower()
+        event_type = str(payload.get("type") or payload.get("event_type") or "").lower()
         body = payload.get("payload", payload)
         if event_type in {"subscribe", "subscribed", "ack"}:
             self.mark_subscribed()
@@ -73,10 +73,10 @@ class MarketStream:
         if event_type == "price_change":
             return self._apply_price_changes(body)
         if event_type == "tick_size_change":
-            token = str(body.get("tokenId") or "")
+            token = str(body.get("tokenId") or body.get("token_id") or body.get("asset_id") or "")
             return self._book(token).apply_tick_size_change(body)
         if event_type == "last_trade_price":
-            token = str(body.get("tokenId") or "")
+            token = str(body.get("tokenId") or body.get("token_id") or body.get("asset_id") or "")
             book = self._book(token)
             book.last_trade_price = book._optional_decimal(body.get("price"), "last_trade_price")
             return book.snapshot()
@@ -90,7 +90,7 @@ class MarketStream:
         return self.books[token]
 
     def _apply_book(self, body: dict[str, Any]) -> LocalBookSnapshot:
-        result = self._book(str(body.get("tokenId") or body.get("asset_id") or "")).apply_book(body)
+        result = self._book(str(body.get("tokenId") or body.get("token_id") or body.get("asset_id") or "")).apply_book(body)
         self.event_count += 1
         return result
 
@@ -102,9 +102,10 @@ class MarketStream:
         for change in changes:
             if not isinstance(change, dict):
                 raise MarketStreamError("invalid_price_change")
-            if body.get("timestamp") is not None:
-                change = {**change, "timestamp": body["timestamp"]}
-            results.append(self._book(str(change.get("tokenId") or "")).apply_price_change(change))
+            normalized = {**change, "timestamp": body["timestamp"]} if body.get("timestamp") is not None else dict(change)
+            if normalized.get("tokenId") is None:
+                normalized["tokenId"] = normalized.get("token_id") or normalized.get("asset_id")
+            results.append(self._book(str(normalized.get("tokenId") or "")).apply_price_change(normalized))
         self.event_count += 1
         return tuple(results)
 

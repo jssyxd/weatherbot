@@ -1,69 +1,93 @@
-# METAR/SPECI Dead-Bucket Observer（tree4）
+# weatherbot：tree6yes 尾盘共识 YES 纸面策略
 
-**tree4** 在 tree3 的本地盘口、纸面 FAK 与严格失败关闭边界之上，已将航空实况唯一切换为 **CheckWX Aviation Weather API v2**。实时数据路径使用 `GET /v2/metar/{icao-list}/short`，在请求头中传递 `X-API-Key`；不再请求 AviationWeather.gov / AWC，也不解析其专有 JSON 字段。CheckWX 的短格式仅提供 ICAO、原始报文与 `observed` UTC 时刻，因此 tree4 从原始 METAR/SPECI 正文确定性解析温度，并在存在 RMK `T` 精确温度组时优先使用 0.1°C 精度。[1] [2]
+`tree6yes` 是独立于 `tree4` 的新分支。它移除了主流程中“死桶后买 NO”的候选与执行路径，改为在城市当地的尾盘时段寻找**单一、稳定、可执行的 YES 共识桶**。本仓库仍然只生成本地审计记录和纸面成交估算：它不会读取钱包、私钥或账户；不会签名；不会向 Polymarket 提交、撤销或修改真实订单。即使配置为 `mode: "live"`，程序也只会记录阻断结果。
 
-> **策略边界没有改变。** METAR/SPECI 只是候选观测，不是结算源；本仓库没有钱包加载、私钥读取、真实订单提交或撤单能力。`live` 模式仍只写入阻断审计记录，绝不交易。
+> 这是一套自动化交易研究与纸面执行工具，不是收益保证。温度合约可能因观测修正、结算规则、行情流动性、数据延迟或剧烈反转产生全部损失。应先长期验证纸面记录，再自行决定是否把任何逻辑用于独立的真实交易系统。
 
-| 项目 | tree4 行为 |
-|---|---|
-| 当前实况请求 | `GET https://api.checkwx.com/v2/metar/{最多25个ICAO}/short`，使用 `X-API-Key` 请求头。 |
-| 温度口径 | 优先 `RMK T[01][TTT][DDHH]` 的 0.1°C；否则确定性解析正文 `M?DD/M?DD` 整数摄氏度。 |
-| 时间口径 | 用 CheckWX `observed` UTC 归属机场 IANA 当地自然日；`fetched_at` 仅用于 `observed` 至本地抓取的绝对新鲜度门。 |
-| 批量与扫描 | 每次最多 25 个 ICAO；按 tree4 的运行要求默认每 60 秒全量扫描。CheckWX 文档仍建议缓存 METAR/TAF 至少 15 分钟，因此需通过运行日志持续监控 429 与实际首见收益。[1] |
-| 暖机 | 启动/当地日切换时使用 `/v2/metar/{icao-list}/previous/{2..50}/short` 重新构建当天极值；若历史接口权限、响应或当前日数据不足，则保持失败关闭，不产生候选。 |
-| 非目标数据 | 不使用 TAF、ECMWF、任何预测输入、Station、BOT、G-AIRMET 或 URL 查询参数密钥模式。 |
+## 已确认的策略规则
 
-## 安装与安全配置
+| 项目 | tree6yes 的规则 |
+| --- | --- |
+| 天气 API 频率 | CheckWX METAR/SPECI 每 **900 秒（15 分钟）**完整扫描一次。任何低于 900 秒的配置都会被拒绝。 |
+| 市场结构频率 | Gamma 合约结构每 15 分钟或城市当地日切换时刷新，用于获得当日温度桶和对应 `yes_token_id`。 |
+| 盘口数据 | 保留 Polymarket **公共**市场数据流，接收订单簿快照和变动，不轮询订单簿。 |
+| 高温尾盘 | 仅在城市当地时间 **12:00–17:00** 考虑高温合约。 |
+| 低温尾盘 | 仅在城市当地时间 **01:00–05:00** 考虑低温合约。 |
+| 共识稳定门 | 同一 YES token 的最优 ask 必须连续至少 **30 分钟不低于 90¢**；跌破、缺失、订单簿过期或 token 变更即重新计时。 |
+| 初始入场 | 仅一个 YES 桶同时满足稳定、时间、深度与最优 ask **92¢–98¢（含端点）**时，生成 5 股纸面 FAK 买入。多个合格桶时拒绝，避免把不一致的市场误判为单一共识。 |
+| 入场限价 | 默认 `best_ask_plus_one_tick`：`min(best ask + tick size, 98¢)`。可改为 `best_ask`，但永不超过 98¢。 |
+| 85¢ 风险信号 | 已成交持仓的 YES 最优 bid 跌破 **85¢** 时立即写入 `market_reversal_alert`。**仅预警和审计**，不会在缺乏实测温度证据时卖出或换手。 |
+| 温度证据换手 | 后续 15 分钟天气扫描确认新日内极值越出当前 YES 桶时，按旧 YES 的可执行 bid 纸面卖出；若存在唯一、可执行的新 YES 桶，则纸面买入初始股数的 **3 倍**。 |
+| 换手次数 | 每个 `城市 × 当地日期 × 高/低温方向` 最多换手 **1 次**。之后再次反转只尝试纸面退出，绝不继续追单。 |
 
-项目保持 Python 标准库的 CheckWX 请求实现；既有订单签名测试依赖仅在运行完整测试集时需要安装。先由示例配置创建本地配置，再将 API 密钥只注入启动进程环境。`config.json`、`.env` 和 `data/` 已被忽略，真实密钥绝不可写入仓库、配置 JSON、请求 URL、审计记录或截图。[1]
+Polymarket 的显示价格是 bid/ask 中点或最近成交价，未必是可交易价格。tree6yes 的入场只使用 YES ask 和 ask 深度，退出只使用 YES bid 和 bid 深度；不把 midpoint、Gamma 展示价格或不存在的 NO ask 当作可执行流动性。[1]
+
+## 延迟边界
+
+15 分钟的 CheckWX 拉取和“实测温度发生越界的瞬间即确认”不能同时做到。没有天气推送源时，实测温度越界只能在下一轮成功扫描、报文新鲜且当天历史暖机完成时得到确认，延迟接近一个扫描周期。公共市场数据流可以近实时提示盘口下跌，但**盘口信号不是实测温度证据**，因此已按确认要求限制为 85¢ 仅预警。[2]
+
+## 安装与配置
 
 ```bash
-git clone --branch tree4 https://github.com/jssyxd/weatherbot.git
+git clone --branch tree6yes https://github.com/jssyxd/weatherbot.git
 cd weatherbot
 cp config.example.json config.json
-export CHECKWX_API_KEY='在此设置你的密钥'
-python3 metar_observer.py status
-python3 metar_observer.py once
-python3 metar_observer.py run
+python3 -m pip install -r requirements.txt
+export CHECKWX_API_KEY='仅在启动环境中设置，不要写入 config.json'
 ```
 
-| 配置项 | 默认值 | 含义 |
-|---|---:|---|
-| `checkwx_api_key_env` | `CHECKWX_API_KEY` | 保存密钥的环境变量名，而非密钥本身。 |
-| `scan_interval_seconds` | `60` | CheckWX METAR 全量轮询间隔；不得低于 60 秒。 |
-| `rate_limit_backoff_seconds` | `60` | 收到 HTTP 429 后的最小退避时间；若服务端提供更长 `Retry-After`，优先采用更长值。 |
-| `stations_per_request` | `25` | 当前 METAR 批量 ICAO 数；不得超过接口上限。 |
-| `checkwx_previous_limit` | `50` | 每站暖机历史数量，支持范围为 2–50。 |
-| `max_report_age_seconds` | `900` | `observed` 到本次抓取的最大可接受龄期。 |
-| `warmup_stations_per_request` | `25` | 暖机历史请求分块大小。 |
-| `warmup_retry_seconds` | `900` | 暖机失败重试节奏。 |
+`CHECKWX_API_KEY` 只从进程环境变量读取，绝不应写入 Git、`config.json`、请求 URL、审计记录或截图。CheckWX 历史 METAR 暖机接口可能需要额外订阅权限；若暖机失败、当前本地日数据不足、订单簿缺失/过期、价格或深度不达标，策略保持失败关闭，不产生纸面入场、退出或换手。
 
-## 历史暖机权限与失败关闭
+关键配置均已写入 `config.example.json`：
 
-CheckWX 文档将历史 METAR 端点归类为高级端点；该端点需要相应的订阅权限。[2] 在这次 tree4 实施的受控实测中，当前密钥可以成功返回 `/v2/metar/KLAX/short`，但 `/v2/metar/KLAX/previous/50/short` 返回 HTTP 403，并提示需要 premium API plan。因此当前代码会继续采集和审计实时短格式 METAR，但**不会把未完成暖机的当天数据推进到候选信号状态机**。这是刻意的安全设计，避免在当天既有极值未知时错误判定温度桶已经失效。
+```json
+{
+  "execution_engine": "tree6yes",
+  "scan_interval_seconds": 900,
+  "market_rules_max_age_seconds": 900,
+  "tail_consensus_stability_seconds": 1800,
+  "tail_consensus_stable_min_price": "0.90",
+  "tail_consensus_entry_min_price": "0.92",
+  "tail_consensus_entry_max_price": "0.98",
+  "tail_consensus_market_alert_bid": "0.85",
+  "tail_consensus_rotation_multiplier": "3",
+  "tail_consensus_max_rotations": 1
+}
+```
 
-若要完整启用 tree4 的候选逻辑，需让所用 CheckWX 订阅具有历史 METAR 权限；随后无需改动代码，只需以该环境变量重启观察器。任何 401、403、429、非 JSON 响应、`results` 与 `data` 数量不一致，或当前当地日没有可用历史报文，都会记录为退化状态并保持不动作。
+`execution_engine` 必须为 `tree6yes`；原有 `legacy`、`tree2` 与 `tree3` 的 NO 侧主流程不再被接受。`tail_consensus_max_rotations` 被固定为 1，`tail_consensus_rotation_multiplier` 被固定为 3，以防通过配置取消已确认的风险上限。
 
-## 时效性验证而非预设结论
+## 运行
 
-切换 CheckWX 的目的是检验其数据可用时间是否早于旧免费来源；这并不是已被本仓库证明的结论。tree4 按运行要求每 60 秒扫描一次，并会在每个审计事件中保留 `report_time_utc`、`fetched_at_utc` 和 `checkwx_report_age_seconds`，以同一 ICAO、相同 `raw_metar` 对比首见时间。CheckWX 文档仍建议 METAR/TAF 至少缓存 15 分钟；因此 429、响应龄期与实际首见收益必须被持续审计，不能仅以扫描频率宣称更快。[1]
+```bash
+# 一次性天气/市场结构扫描；因没有常驻盘口流，任何需要盘口的动作都会失败关闭。
+python3 metar_observer.py once
 
-建议持续运行至少数周，特别覆盖整点 METAR、SPECI、机场当地午夜、夏令时切换和网络异常场景。只有在样本量、机场集合、轮询节奏及“首见”的定义一致时，才应判断 CheckWX 是否在目标机场上更早可用。
+# 方案 A：15 分钟天气与结构扫描 + 常驻公共盘口流 + 85¢即时仅预警。
+python3 metar_observer.py run
+
+# 查看本地状态，不请求天气或市场数据。
+python3 metar_observer.py status
+```
+
+`run` 会在首次成功的市场结构刷新后订阅所有当日 YES tokens，并按官方要求每 10 秒发送应用层心跳。每逢市场结构刷新或城市当地日切换，订阅集合会重建；重连和订单簿未完成基线期间都不会产生交易意图。[2]
+
+## 审计与状态
+
+所有新观测写入 `data/observations/`，策略判定写入 `data/signals/`，同时追加至 `data/audit.sqlite3`。`data/state.json` 会保存 `tail_consensus`（稳定窗口）及 `tail_positions`（纸面仓位、入场价、持股数、温度证据、换手次数）。这些目录及本地密钥配置应保持在 `.gitignore` 中。
 
 ## 测试
 
 ```bash
-sudo pip3 install -r requirements.txt
 python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖 CheckWX 请求头鉴权、密钥不进入 URL、短格式 JSON 契约、25 ICAO 上限、60 秒扫描门、HTTP 429 的 `Retry-After` 退避、历史暖机失败关闭、IANA 当地日、正文和 RMK 温度解析、华氏精度保护、本地订单簿以及纸面 FAK 风控边界。它们不调用真实 API，也不会发出订单。
+新增测试覆盖 15 分钟最低轮询间隔、YES token 映射、30 分钟稳定门、92¢/98¢ 边界、加一跳限价上限、多个共识桶失败关闭、85¢ 仅预警、温度确认后“卖旧 YES + 买新 YES 三倍”、一次换手上限，以及公共市场数据流字段兼容性。
 
-## tree3 保留边界
+## 参考资料
 
-tree3 的本地 WebSocket 盘口、完整 ask 深度、固定 5 shares FAK 纸面估算、审计账本、价格保护与 `live` 阻断仍保持原状。tree4 只替换了航空实况供应商与与之绑定的配置、标准化、暖机、审计字段和测试；它不将 `midpoint`、成交价或 bid 误作可买入的 NO ask，也不新增任何真实执行路径。
+[1] [Polymarket：价格与订单簿](https://docs.polymarket.com/concepts/prices-orderbook)
 
-## References
+[2] [Polymarket：实时市场数据](https://docs.polymarket.com/market-data/realtime-data)
 
-[1]: https://www.checkwxapi.com/documentation/introduction "CheckWX Introduction"
-[2]: https://www.checkwxapi.com/documentation/metar "CheckWX METAR endpoints"
+[3] [CheckWX API 文档](https://www.checkwxapi.com/documentation/introduction)

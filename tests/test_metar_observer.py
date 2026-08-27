@@ -115,17 +115,17 @@ class MetarObserverTests(unittest.TestCase):
         stations = observer.normalize_stations([{"icao": "zspd", "name": "Shanghai Pudong"}, "ZSPD", "RCTP"])
         self.assertEqual(stations, [{"icao": "ZSPD", "name": "Shanghai Pudong"}, {"icao": "RCTP", "name": "RCTP"}])
 
-    def test_interval_below_one_minute_is_rejected(self) -> None:
+    def test_interval_below_fifteen_minutes_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 59, "stations": ["ZSPD"]}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 899, "stations": ["ZSPD"]}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 
     def test_checkwx_batch_size_above_25_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"stations_per_request": 26, "scan_interval_seconds": 60}), encoding="utf-8")
+            config_path.write_text(json.dumps({"stations_per_request": 26, "scan_interval_seconds": 900}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 
@@ -195,13 +195,13 @@ class MetarObserverTests(unittest.TestCase):
         self.assertEqual(snapshot["critical_path"], "deterministic_iana_state_machine_only")
         self.assertEqual(snapshot["untrusted_warmup_count"], 1)
 
-    def test_one_minute_scan_interval_is_accepted(self) -> None:
+    def test_fifteen_minute_scan_interval_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 60, "stations": ["ZSPD"]}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 900, "stations": ["ZSPD"]}), encoding="utf-8")
             loaded = observer.load_config(config_path)
-            self.assertEqual(loaded["scan_interval_seconds"], 60)
-            self.assertEqual(loaded["rate_limit_backoff_seconds"], 60)
+            self.assertEqual(loaded["scan_interval_seconds"], 900)
+            self.assertEqual(loaded["rate_limit_backoff_seconds"], 900)
             self.assertEqual(loaded["stations_per_request"], 25)
 
     def test_single_instance_lock_is_exclusive(self) -> None:

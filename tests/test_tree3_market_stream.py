@@ -39,6 +39,15 @@ class Tree3MarketStreamTests(unittest.TestCase):
         self.assertEqual(result[-1].version, 3)
         self.assertEqual(result[-1].book_hash, "h2")
 
+    def test_official_event_type_and_asset_id_fields_are_supported(self) -> None:
+        first = self.stream.handle_message({"event_type": "book", "payload": self.book() | {"tokenId": None, "asset_id": "no-1"}})
+        self.assertEqual(first.best_ask, Decimal("0.10"))
+        result = self.stream.handle_message({"event_type": "price_change", "payload": {"timestamp": "100100", "price_changes": [
+            {"asset_id": "no-1", "price": "0.10", "size": "0", "side": "SELL", "hash": "h2"},
+            {"asset_id": "no-1", "price": "0.11", "size": "5", "side": "SELL", "hash": "h2"},
+        ]}})
+        self.assertEqual(result[-1].best_ask, Decimal("0.11"))
+
     def test_increment_before_baseline_is_rejected(self) -> None:
         with self.assertRaisesRegex(OrderBookStateError, "book_baseline_required"):
             self.stream.handle_message({"type": "price_change", "payload": {
