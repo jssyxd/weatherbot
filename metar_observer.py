@@ -40,7 +40,6 @@ from tree2_execution import simulate as simulate_tree2
 from clob_market_data import CLOBDataError, CLOBMarketData
 from audit_store import AuditStore
 from aviationweather_warmup import AWC_MAX_ICAOS_PER_REQUEST, AviationWeatherError, fetch_aviationweather_history
-from tree11_yes_strategy import ensure_tree11_state, evaluate_fact_reversal, record_taf_versions
 from tree5_strategy import (
     due_exit_token_ids,
     due_taf_cities,
@@ -230,9 +229,6 @@ def load_config(config_path: Path) -> dict[str, Any]:
     closure_interval = int(config.get("tree5_closure_check_seconds", 60))
     if closure_interval < 60:
         raise ValueError("tree5_closure_check_seconds 不得小于 60")
-    tree11_taf_poll = int(config.get("tree11_taf_poll_seconds", MIN_SCAN_INTERVAL_SECONDS))
-    if tree11_taf_poll < MIN_SCAN_INTERVAL_SECONDS:
-        raise ValueError(f"tree11_taf_poll_seconds 不得小于 {MIN_SCAN_INTERVAL_SECONDS}")
     return {
         "scan_interval_seconds": interval,
         "rate_limit_backoff_seconds": rate_limit_backoff,
@@ -277,9 +273,6 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "tree5_closure_trend_move_native": float(config.get("tree5_closure_trend_move_native", 0.5)),
         "tree5_closure_price_decline": float(config.get("tree5_closure_price_decline", 0.20)),
         "tree5_action_dir": BASE_DIR / str(config.get("tree5_action_dir", "data/tree5_actions")),
-        "tree11_enabled": bool(config.get("tree11_enabled", False)),
-        "tree11_taf_poll_seconds": tree11_taf_poll,
-        "tree11_action_dir": BASE_DIR / str(config.get("tree11_action_dir", "data/tree11_actions")),
         "state_path": BASE_DIR / str(config.get("state_path", "data/state.json")),
         "event_dir": BASE_DIR / str(config.get("event_dir", "data/observations")),
         "signal_dir": BASE_DIR / str(config.get("signal_dir", "data/signals")),
@@ -502,25 +495,6 @@ def append_tree5_actions(config: dict[str, Any], actions: list[dict[str, Any]]) 
                 event_type=str(action.get("action_type") or "tree5_action"),
                 correlation_id=str(action.get("entry_key") or action.get("forecast_key") or action.get("city_id") or ""),
                 mode=config["mode"], token_id=str(action.get("token_id") or "") or None, payload=action,
-            )
-    finally:
-        audit_store.close()
-    return path
-
-
-def append_tree11_actions(config: dict[str, Any], actions: list[dict[str, Any]]) -> Path | None:
-    """Persist tree11 paper signals without invoking an order or account client."""
-    if not actions:
-        return None
-    created_at = iso_now()
-    path = append_jsonl(config["tree11_action_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", actions)
-    audit_store = AuditStore(config["audit_db_path"])
-    try:
-        for action in actions:
-            audit_store.append(
-                created_at_utc=created_at, event_type=str(action.get("action_type") or "tree11_action"),
-                correlation_id=str(action.get("signal_id") or action.get("event_id") or action.get("city_id") or ""),
-                mode="paper", token_id=str(action.get("token_id") or "") or None, payload=action,
             )
     finally:
         audit_store.close()
@@ -884,37 +858,6 @@ def process_tree5_taf_entries(config: dict[str, Any], state: dict[str, Any], cit
     return actions
 
 
-def process_tree11_taf_versions(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], now: datetime, visible_monotonic_ns: int) -> list[dict[str, Any]]:
-    """Capture the latest program-visible TAF version at bounded two-minute cadence.
-
-    The function never infers a version from future data. It records only the
-    raw TAF returned in this scan and carries its local visibility time into the
-    tree11 state ledger. Failed fetches are audit events and leave prior versions
-    intact for replay.
-    """
-    if not config.get("tree11_enabled", False):
-        return []
-    tree = ensure_tree11_state(state)
-    last_poll = parse_time(tree.get("last_taf_poll_utc"))
-    if last_poll is not None and (now - last_poll).total_seconds() < config["tree11_taf_poll_seconds"]:
-        return []
-    actions: list[dict[str, Any]] = []
-    reports: list[dict[str, Any]] = []
-    endpoints: list[str] = []
-    try:
-        for station_chunk in chunks([city["icao"] for city in cities.values()], config["stations_per_request"]):
-            records, endpoint = fetch_checkwx_taf_reports(station_chunk, config["checkwx_api_key_env"])
-            reports.extend(records)
-            endpoints.append(endpoint)
-    except Exception as exc:
-        tree["last_taf_poll_attempt_utc"] = iso_utc(now)
-        actions.append({"action_type": "tree11_taf_version", "status": "failed_fetch", "visible_at_utc": iso_utc(now), "error": f"{type(exc).__name__}: {exc}", "safety": {"paper_only": True, "orders_submitted": 0, "credentials_loaded": False}})
-        return actions
-    tree["last_taf_poll_attempt_utc"] = iso_utc(now)
-    tree["last_taf_poll_utc"] = iso_utc(now)
-    actions.extend(record_taf_versions(state, reports, cities, now, visible_monotonic_ns, ";".join(endpoints)))
-    return actions
-
 
 def tree5_maintenance_once(config: dict[str, Any]) -> dict[str, Any]:
     """Perform due 5/20/60/120-second exit attempts and minute closure checks.
@@ -961,7 +904,6 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     market_rules = state.get("market_rules") or load_market_rules(config["market_rules_path"])
     scan_time = parse_time(fetched_at) or utc_now()
     tree5_actions = process_tree5_taf_entries(config, state, cities, market_rules, scan_time)
-    tree11_actions = process_tree11_taf_versions(config, state, cities, scan_time, time.monotonic_ns())
     station_names = {icao: city["name"] for icao, city in cities.items()}
     station_ids = list(station_names)
     realtime = fetch_realtime_weather_reports(config, station_ids)
@@ -1005,13 +947,6 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
                 tree5_actions.extend(
                     invalidate_entries_from_observation(state, city, local_date, scan_time, observed_temperature=observed_native)
                 )
-                if config.get("tree11_enabled", False):
-                    tree11_event = {**event, "temperature_native": observed_native}
-                    tree11_actions.extend(evaluate_fact_reversal(
-                        state, tree11_event, city, market_rules, scan_time, time.monotonic_ns(),
-                        warmup_complete=_warmup_is_complete(state, city, local_date),
-                        max_report_age_seconds=300,
-                    ))
         if local_date is None or not _warmup_is_complete(state, city, local_date):
             signals.append({
                 "signal_type": "no_signal", "reason": "daily_extrema_untrusted_warmup_incomplete",
@@ -1048,7 +983,6 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     event_file = append_jsonl(config["event_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", new_events)
     signal_file = append_jsonl(config["signal_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", signals)
     tree5_action_file = append_tree5_actions(config, tree5_actions)
-    tree11_action_file = append_tree11_actions(config, tree11_actions)
     audit_store = AuditStore(config["audit_db_path"])
     try:
         for signal in signals:
@@ -1082,8 +1016,6 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
         "signal_file": str(signal_file) if signal_file else None,
         "tree5_actions": len(tree5_actions),
         "tree5_action_file": str(tree5_action_file) if tree5_action_file else None,
-        "tree11_actions": len(tree11_actions),
-        "tree11_action_file": str(tree11_action_file) if tree11_action_file else None,
         "mode": config["mode"],
     }
 
