@@ -100,11 +100,11 @@ def record_taf_versions(
             }
             provenance["taf_version_id"] = _stable_hash(provenance)
             if any(isinstance(old, dict) and old.get("taf_version_id") == provenance["taf_version_id"] for old in versions):
-                actions.append({"action_type": "tree11_taf_version", "status": "duplicate_visible_version", "taf_version_id": provenance["taf_version_id"], "forecast_key": key})
+                actions.append({"action_type": "tree11_taf_version", "status": "duplicate_visible_version", "taf_version_id": provenance["taf_version_id"], "forecast_key": key, "safety": {"paper_only": True, "orders_submitted": 0, "credentials_loaded": False}})
                 continue
             versions.append(provenance)
             versions.sort(key=lambda value: (int(value.get("visible_at_monotonic_ns", 0)), str(value.get("taf_issued_utc") or "")))
-            actions.append({"action_type": "tree11_taf_version", "status": "recorded", "taf_version_id": provenance["taf_version_id"], "forecast_key": key, **provenance})
+            actions.append({"action_type": "tree11_taf_version", "status": "recorded", "taf_version_id": provenance["taf_version_id"], "forecast_key": key, **provenance, "safety": {"paper_only": True, "orders_submitted": 0, "credentials_loaded": False}})
     return actions
 
 
@@ -233,6 +233,7 @@ def evaluate_fact_reversal(
             "signal_id": signal_id, "status": "PENDING_CONSENSUS", "action_type": "tree11_paper_yes_intent", "city_id": city["city_id"],
             "icao": city["icao"], "market_local_date": local_date, "direction": direction, "market_rule_id": new_rule.get("market_rule_id"),
             "old_market_rule_id": old_rule.get("market_rule_id"), "old_bucket": old_bucket, "new_bucket": new_bucket,
+            "market_bucket_ids": [str(bucket.get("bucket_id")) for bucket in new_rule.get("buckets", []) if isinstance(bucket, dict) and bucket.get("bucket_id")],
             "token_id": new_bucket.get("yes_token_id"), "side": "BUY", "outcome": "YES", "requested_shares": "5",
             "report": base, "taf_at_t0": taf, "observed_extreme": observed_extreme, "consensus_status": "NOT_EVALUATED",
             "execution_status": "NOT_EVALUATED", "safety": {"paper_only": True, "orders_submitted": 0, "credentials_loaded": False},

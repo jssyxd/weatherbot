@@ -274,6 +274,30 @@ class MetarObserverTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 
+    def test_tree11_records_taf_versions_on_two_minute_schedule_without_orders(self) -> None:
+        city = {"city_id": "shanghai", "icao": "ZSSS", "timezone": "Asia/Shanghai", "market_unit": "C", "market_city_slug": "shanghai"}
+        config = {"tree11_enabled": True, "tree11_taf_poll_seconds": 120, "stations_per_request": 25, "checkwx_api_key_env": "TEST_KEY"}
+        state: dict = {}
+        now = datetime(2026, 8, 27, 2, 0, tzinfo=timezone.utc)
+        report = {"icao": "ZSSS", "issued": "2026-08-27T00:00:00Z", "raw_text": "TAF ZSSS 270000Z 2700/2806 TX30/2710Z TN27/2704Z"}
+        with patch.object(observer, "fetch_checkwx_taf_reports", return_value=([report], "https://example.test/taf")) as mocked:
+            actions = observer.process_tree11_taf_versions(config, state, {"ZSSS": city}, now, 100)
+            repeated = observer.process_tree11_taf_versions(config, state, {"ZSSS": city}, now, 101)
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(sum(item["status"] == "recorded" for item in actions), 2)
+        self.assertEqual(repeated, [])
+        versions = state["tree11"]["taf_versions"]
+        self.assertEqual(len(versions["shanghai|2026-08-27|high"]), 1)
+        self.assertEqual(len(versions["shanghai|2026-08-27|low"]), 1)
+        self.assertEqual(actions[0]["safety"]["orders_submitted"], 0)
+
+    def test_tree11_taf_poll_below_two_minutes_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(json.dumps({"scan_interval_seconds": 120, "tree11_taf_poll_seconds": 119}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tree11_taf_poll_seconds"):
+                observer.load_config(config_path)
+
 
 if __name__ == "__main__":
     unittest.main()

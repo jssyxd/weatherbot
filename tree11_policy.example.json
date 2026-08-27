@@ -24,6 +24,7 @@
     "target_shares": "5",
     "require_fresh_l2": true,
     "maximum_book_age_seconds": 3,
+    "maximum_entry_delay_seconds": 5,
     "require_tick_size": true,
     "require_min_order_size": true,
     "minimum_visible_ask_shares": "5",
