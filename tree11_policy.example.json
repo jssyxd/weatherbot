@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "mode": "paper_only",
+  "orders_submitted": 0,
+  "taf_basis": "latest_program_visible_before_t0",
+  "report_max_age_seconds": 300,
+  "require_warmup_complete": true,
+  "require_distinct_old_and_new_bucket": true,
+  "require_current_taf_still_maps_to_old_bucket": true,
+  "directional_markets_are_independent": true,
+  "consensus": {
+    "lookback_window_seconds": 7200,
+    "minimum_snapshot_count": 45,
+    "maximum_final_snapshot_age_seconds": 240,
+    "price_statistic": "time_weighted_executable_bid_median",
+    "old_bucket_required_rank": 1,
+    "minimum_price_lead": "0.02",
+    "depth_statistic": "visible_bid_depth_at_target_shares",
+    "minimum_old_bucket_depth_usdc": "10.00",
+    "minimum_old_bucket_depth_share_multiple": "3",
+    "exclude_stale_or_incomplete_l2": true
+  },
+  "new_bucket_entry": {
+    "target_shares": "5",
+    "require_fresh_l2": true,
+    "maximum_book_age_seconds": 3,
+    "require_tick_size": true,
+    "require_min_order_size": true,
+    "minimum_visible_ask_shares": "5",
+    "pricing_profiles": [
+      {"id": "best_ask", "limit_kind": "best_ask", "maximum_price": "0.95"},
+      {"id": "best_ask_plus_one_tick", "limit_kind": "best_ask_plus_ticks", "ticks": 1, "maximum_price": "0.95"}
+    ]
+  },
+  "future_position_lifecycle": {
+    "enabled": false,
+    "reason": "Requires separately tested order reconciliation, cancellation and confirmed-position handling."
+  }
+}
