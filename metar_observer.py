@@ -595,13 +595,15 @@ def fetch_current_reports_with_fallback(config: dict[str, Any], station_ids: lis
     reports: list[dict[str, Any]] = []
     checkwx_errors: list[str] = []
     checkwx_endpoints: list[str] = []
+    checkwx_retry_after_seconds = 0
     returned_icaos: set[str] = set()
     for station_chunk in chunks(station_ids, config["stations_per_request"]):
         try:
             current, endpoint = fetch_checkwx_reports(station_chunk, config["checkwx_api_key_env"])
         except CheckWXRateLimitError as exc:
             checkwx_errors.append(f"{','.join(station_chunk)}: {type(exc).__name__}: {exc}")
-            continue
+            checkwx_retry_after_seconds = max(checkwx_retry_after_seconds, exc.retry_after_seconds or 0)
+            break
         except Exception as exc:
             checkwx_errors.append(f"{','.join(station_chunk)}: {type(exc).__name__}: {exc}")
             continue
@@ -630,6 +632,7 @@ def fetch_current_reports_with_fallback(config: dict[str, Any], station_ids: lis
         "primary": "checkwx",
         "checkwx_report_count": len(returned_icaos),
         "checkwx_errors": checkwx_errors,
+        "checkwx_retry_after_seconds": checkwx_retry_after_seconds,
         "checkwx_endpoints": checkwx_endpoints,
         "awc_fallback_requested_icaos": missing_before_fallback,
         "awc_fallback_report_count": len(awc_returned),
@@ -852,8 +855,14 @@ def run_loop(config: dict[str, Any]) -> None:
     failure_started: datetime | None = None
     while True:
         try:
-            scan_once(config)
+            scan_summary = scan_once(config)
             failure_started = None
+            checkwx_backoff = int(scan_summary.get("data_sources", {}).get("checkwx_retry_after_seconds", 0) or 0)
+            if checkwx_backoff:
+                backoff = max(config["rate_limit_backoff_seconds"], checkwx_backoff)
+                print(f"[CheckWX 限流退避] 已由 AWC 补齐本轮缺口；等待 {backoff} 秒后再尝试 CheckWX。", file=sys.stderr)
+                time.sleep(backoff)
+                continue
         except KeyboardInterrupt:
             print("\n扫描器已停止。")
             lock_handle.close()

@@ -141,6 +141,7 @@ class MetarObserverTests(unittest.TestCase):
         self.assertEqual(fallback.call_args.args[0], ["ZSPD"])
         self.assertEqual(summary["missing_after_fallback"], [])
         self.assertEqual(len(summary["checkwx_errors"]), 1)
+        self.assertEqual(summary["checkwx_retry_after_seconds"], 120)
         self.assertEqual(reports[0]["_source_kind"], "awc_fallback")
 
     def test_fetch_checkwx_rejects_invalid_response_shape(self) -> None:
