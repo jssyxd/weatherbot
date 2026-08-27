@@ -104,11 +104,12 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
         if not isinstance(outcomes, list) or not isinstance(token_ids, list) or len(outcomes) != len(token_ids):
             continue
         no_token = next((str(token_ids[index]) for index, outcome in enumerate(outcomes) if outcome == "No"), None)
-        if not no_token:
+        yes_token = next((str(token_ids[index]) for index, outcome in enumerate(outcomes) if outcome == "Yes"), None)
+        if not no_token or not yes_token:
             continue
         buckets.append({
             "bucket_id": str(market.get("id")), "label": outcome_text, "lo": lo, "hi": hi,
-            "market_id": str(market.get("id")), "no_token_id": no_token,
+            "market_id": str(market.get("id")), "yes_token_id": yes_token, "no_token_id": no_token,
         })
     if not buckets:
         return []

@@ -23,6 +23,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from edge_engine import (
     append_jsonl,
@@ -36,7 +37,22 @@ from edge_engine import (
 from market_adapter import refresh_market_rules
 from paper_execution import simulate_paper_fak
 from tree2_execution import simulate as simulate_tree2
+from clob_market_data import CLOBDataError, CLOBMarketData
 from audit_store import AuditStore
+from tree5_strategy import (
+    due_exit_token_ids,
+    due_taf_cities,
+    due_time_closure_token_ids,
+    ensure_tree5_state,
+    evaluate_time_closure,
+    invalidate_entries_from_observation,
+    plan_due_exit_faks,
+    plan_taf_entries,
+    planned_entry_token_ids,
+    record_taf_reports,
+    record_temperature,
+    tree5_day_key,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE_DIR / "config.json"
@@ -45,6 +61,7 @@ CHECKWX_API_KEY_ENV_DEFAULT = "CHECKWX_API_KEY"
 MIN_SCAN_INTERVAL_SECONDS = 60
 CHECKWX_MAX_ICAOS_PER_REQUEST = 25
 SUPPORTED_TYPES = {"METAR", "SPECI"}
+TREE5_DEFAULT_EXIT_RETRY_SECONDS = (0, 5, 20, 60, 120)
 
 
 class CheckWXRateLimitError(RuntimeError):
@@ -176,6 +193,19 @@ def load_config(config_path: Path) -> dict[str, Any]:
     local_book_max_age = float(config.get("local_book_max_age_seconds", 3))
     if local_book_max_age <= 0:
         raise ValueError("local_book_max_age_seconds 必须大于 0")
+    tree5_taf_hour = int(config.get("tree5_taf_fetch_local_hour", 1))
+    if tree5_taf_hour != 1:
+        raise ValueError("tree5_taf_fetch_local_hour 必须为当地 01:00")
+    tree5_entry_discount = float(config.get("tree5_entry_price_discount", 0.05))
+    if not 0 <= tree5_entry_discount < 1:
+        raise ValueError("tree5_entry_price_discount 必须介于 0（含）和 1（不含）")
+    exit_retry_seconds = tuple(int(value) for value in config.get("tree5_exit_retry_seconds", TREE5_DEFAULT_EXIT_RETRY_SECONDS))
+    exit_slippage = tuple(float(value) for value in config.get("tree5_exit_slippage", (0.10, 0.20, 0.35, 0.60, 0.90)))
+    if exit_retry_seconds != TREE5_DEFAULT_EXIT_RETRY_SECONDS or len(exit_slippage) != len(exit_retry_seconds) or any(not 0 <= value < 1 for value in exit_slippage):
+        raise ValueError("tree5 退出追价必须为 0/5/20/60/120 秒，且折价须介于 0（含）和 1（不含）")
+    closure_interval = int(config.get("tree5_closure_check_seconds", 60))
+    if closure_interval < 60:
+        raise ValueError("tree5_closure_check_seconds 不得小于 60")
     return {
         "scan_interval_seconds": interval,
         "rate_limit_backoff_seconds": rate_limit_backoff,
@@ -196,6 +226,22 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "max_slippage": max_slippage,
         "local_book_max_age_seconds": local_book_max_age,
         "market_ws_enabled": bool(config.get("market_ws_enabled", False)),
+        "tree5_enabled": bool(config.get("tree5_enabled", False)),
+        "tree5_taf_fetch_local_hour": tree5_taf_hour,
+        "tree5_taf_retry_seconds": int(config.get("tree5_taf_retry_seconds", 900)),
+        "tree5_entry_price_discount": tree5_entry_discount,
+        "tree5_exit_retry_seconds": exit_retry_seconds,
+        "tree5_exit_slippage": exit_slippage,
+        "tree5_exit_min_price": float(config.get("tree5_exit_min_price", 0.01)),
+        "tree5_closure_check_seconds": closure_interval,
+        "tree5_high_closure_start_hour": int(config.get("tree5_high_closure_start_hour", 13)),
+        "tree5_high_closure_end_hour": int(config.get("tree5_high_closure_end_hour", 17)),
+        "tree5_low_closure_start_hour": int(config.get("tree5_low_closure_start_hour", 1)),
+        "tree5_low_closure_end_hour": int(config.get("tree5_low_closure_end_hour", 5)),
+        "tree5_closure_shortfall_native": float(config.get("tree5_closure_shortfall_native", 1.0)),
+        "tree5_closure_trend_move_native": float(config.get("tree5_closure_trend_move_native", 0.5)),
+        "tree5_closure_price_decline": float(config.get("tree5_closure_price_decline", 0.20)),
+        "tree5_action_dir": BASE_DIR / str(config.get("tree5_action_dir", "data/tree5_actions")),
         "state_path": BASE_DIR / str(config.get("state_path", "data/state.json")),
         "event_dir": BASE_DIR / str(config.get("event_dir", "data/observations")),
         "signal_dir": BASE_DIR / str(config.get("signal_dir", "data/signals")),
@@ -279,6 +325,82 @@ def fetch_checkwx_reports(
     if not all(isinstance(item, dict) for item in result["data"]):
         raise RuntimeError("CheckWX 短格式响应异常：data 必须是对象数组")
     return result["data"], url
+
+
+def fetch_checkwx_taf_reports(station_ids: list[str], api_key_env: str) -> tuple[list[dict[str, Any]], str]:
+    """Fetch current short TAFs using header authentication and no key in the URL."""
+    if not station_ids or len(station_ids) > CHECKWX_MAX_ICAOS_PER_REQUEST:
+        raise ValueError(f"每次 CheckWX TAF 请求必须包含 1 至 {CHECKWX_MAX_ICAOS_PER_REQUEST} 个 ICAO")
+    safe_icaos = urllib.parse.quote(",".join(str(item).upper().strip() for item in station_ids), safe=",")
+    url = f"{CHECKWX_BASE_URL}/taf/{safe_icaos}/short"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "weatherbot-tree5/5.0 (+https://github.com/jssyxd/weatherbot)",
+            "X-API-Key": _checkwx_api_key(api_key_env),
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            detail = "CheckWX 拒绝了 API 密钥（HTTP 401）"
+        elif exc.code == 403:
+            detail = "CheckWX 拒绝访问 TAF 端点（HTTP 403）；当前订阅可能不包含 TAF 权限"
+        elif exc.code == 429:
+            retry_after: int | None = None
+            raw_retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+            try:
+                retry_after = max(MIN_SCAN_INTERVAL_SECONDS, int(raw_retry_after)) if raw_retry_after is not None else None
+            except (TypeError, ValueError):
+                retry_after = None
+            raise CheckWXRateLimitError(retry_after) from exc
+        else:
+            detail = f"CheckWX TAF 请求失败（HTTP {exc.code}）"
+        raise RuntimeError(detail) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"CheckWX TAF 网络请求失败: {exc.reason}") from exc
+    try:
+        result = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("CheckWX TAF 返回了不可解析的 JSON") from exc
+    if not isinstance(result, dict) or not isinstance(result.get("results"), int) or not isinstance(result.get("data"), list):
+        raise RuntimeError("CheckWX TAF 返回格式异常：预期为含 results 整数与 data 数组的对象")
+    if result["results"] != len(result["data"]) or not all(isinstance(item, dict) for item in result["data"]):
+        raise RuntimeError("CheckWX TAF 返回格式异常：results 与 data 不一致或 data 含非对象")
+    return result["data"], url
+
+
+def fetch_tree5_books(token_ids: set[str]) -> tuple[dict[str, Any], str | None]:
+    """Read only the targeted CLOB books needed for an entry/exit decision."""
+    if not token_ids:
+        return {}, None
+    try:
+        return CLOBMarketData(max_snapshot_age_seconds=3.0).fetch_books(sorted(token_ids)), None
+    except CLOBDataError as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+
+
+def append_tree5_actions(config: dict[str, Any], actions: list[dict[str, Any]]) -> Path | None:
+    """Persist every planned Tree5 action both as JSONL and append-only audit rows."""
+    if not actions:
+        return None
+    created_at = iso_now()
+    path = append_jsonl(config["tree5_action_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", actions)
+    audit_store = AuditStore(config["audit_db_path"])
+    try:
+        for action in actions:
+            audit_store.append(
+                created_at_utc=created_at,
+                event_type=str(action.get("action_type") or "tree5_action"),
+                correlation_id=str(action.get("entry_key") or action.get("forecast_key") or action.get("city_id") or ""),
+                mode=config["mode"], token_id=str(action.get("token_id") or "") or None, payload=action,
+            )
+    finally:
+        audit_store.close()
+    return path
 
 
 def report_key(report: dict[str, Any]) -> str:
@@ -522,6 +644,79 @@ def format_event(event: dict[str, Any]) -> str:
     return f"[新{event['report_type']}] {event['airport_icao']} {event['report_time_utc']}{age_text}\n  {event['raw_metar']}"
 
 
+def process_tree5_taf_entries(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], market_rules: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
+    """Fetch one TAF per city-local-day and plan the associated GTC entry intent."""
+    if not config.get("tree5_enabled", False):
+        return []
+    ensure_tree5_state(state)
+    due = due_taf_cities(state, cities, now, config)
+    actions: list[dict[str, Any]] = []
+    if due:
+        reports: list[dict[str, Any]] = []
+        endpoints: list[str] = []
+        try:
+            for station_chunk in chunks([city["icao"] for city in due], config["stations_per_request"]):
+                records, endpoint = fetch_checkwx_taf_reports(station_chunk, config["checkwx_api_key_env"])
+                reports.extend(records)
+                endpoints.append(endpoint)
+        except Exception as exc:
+            tree = ensure_tree5_state(state)
+            for city in due:
+                key = tree5_day_key(city, now.astimezone(ZoneInfo(city["timezone"])).date().isoformat())
+                tree["taf_fetches"][key] = {
+                    "status": "failed_fetch", "city_id": city["city_id"], "icao": city["icao"],
+                    "market_local_date": key.rsplit("|", 1)[-1], "last_attempt_utc": iso_now(),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            return [{"action_type": "tree5_taf_fetch", "status": "failed_fetch", "due_city_count": len(due), "error": f"{type(exc).__name__}: {exc}"}]
+        due_by_icao = {city["icao"]: city for city in due}
+        actions.extend(record_taf_reports(state, reports, due_by_icao, now, ";".join(endpoints)))
+    # A successful TAF fetch and a tradable book need not arrive in the same
+    # scan. Re-evaluate unplanned forecasts each minute, never re-fetching TAF
+    # until the local date rolls over or a bounded retry is due.
+    tokens = planned_entry_token_ids(state, cities, market_rules)
+    books, book_error = fetch_tree5_books(tokens)
+    if book_error:
+        actions.append({"action_type": "tree5_book_fetch", "status": "failed_fetch", "token_count": len(tokens), "error": book_error})
+    actions.extend(plan_taf_entries(state, cities, market_rules, books, now, config))
+    return actions
+
+
+def tree5_maintenance_once(config: dict[str, Any]) -> dict[str, Any]:
+    """Perform due 5/20/60/120-second exit attempts and minute closure checks.
+
+    This function is intentionally independent of the METAR poll so a fresh
+    invalidation can be retried on the requested short cadence.  It only reads
+    public books and persists `planned_observe_only` actions.
+    """
+    if not config.get("tree5_enabled", False):
+        return {"enabled": False, "actions": 0}
+    now = utc_now()
+    state = load_state(config["state_path"])
+    ensure_tree5_state(state)
+    cities = load_contract_cities(config["contract_cities_path"])
+    closure_tokens = due_time_closure_token_ids(state, cities, now, config)
+    tokens = due_exit_token_ids(state, now) | closure_tokens
+    books, book_error = fetch_tree5_books(tokens)
+    actions: list[dict[str, Any]] = []
+    if book_error:
+        actions.append({"action_type": "tree5_book_fetch", "status": "failed_fetch", "token_count": len(tokens), "error": book_error})
+    if closure_tokens:
+        actions.extend(evaluate_time_closure(state, cities, books, now, config))
+    # evaluate_time_closure may start an exit chase at t=0; plan it in this same tick.
+    exit_tokens = due_exit_token_ids(state, now)
+    missing = exit_tokens - set(books)
+    if missing:
+        extra_books, extra_error = fetch_tree5_books(missing)
+        books.update(extra_books)
+        if extra_error:
+            actions.append({"action_type": "tree5_book_fetch", "status": "failed_fetch", "token_count": len(missing), "error": extra_error})
+    actions.extend(plan_due_exit_faks(state, books, now, config))
+    atomic_json_write(config["state_path"], state)
+    action_file = append_tree5_actions(config, actions)
+    return {"enabled": True, "actions": len(actions), "action_file": str(action_file) if action_file else None}
+
+
 def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     fetched_at = iso_now()
     state = load_state(config["state_path"])
@@ -530,6 +725,8 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     warmup_summary = warm_up_current_local_days(config, state, cities)
     # Process published observations with the last known good market rules first.
     market_rules = state.get("market_rules") or load_market_rules(config["market_rules_path"])
+    scan_time = parse_time(fetched_at) or utc_now()
+    tree5_actions = process_tree5_taf_entries(config, state, cities, market_rules, scan_time)
     station_names = {icao: city["name"] for icao, city in cities.items()}
     station_ids = list(station_names)
     all_reports: list[dict[str, Any]] = []
@@ -560,6 +757,16 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
             continue
         report_time = parse_time(event.get("report_time_utc"))
         local_date = local_market_date(report_time, city) if report_time else None
+        # Tree5's exit proof is the current report crossing the held bucket's
+        # boundary.  It does not depend on the premium historical warm-up path.
+        if config.get("tree5_enabled", False) and report_time is not None and local_date is not None:
+            native_temperature = observed_temperature_native(event, city)
+            if native_temperature is not None:
+                observed_native, _precision = native_temperature
+                record_temperature(state, city, report_time, observed_native, event.get("event_id"))
+                tree5_actions.extend(
+                    invalidate_entries_from_observation(state, city, local_date, scan_time, observed_temperature=observed_native)
+                )
         if local_date is None or not _warmup_is_complete(state, city, local_date):
             signals.append({
                 "signal_type": "no_signal", "reason": "daily_extrema_untrusted_warmup_incomplete",
@@ -579,6 +786,14 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
             state, event, city, market_rules, config["max_report_age_seconds"],
         ):
             signals.append(enrich_execution(signal, config["mode"], state))
+    # If this METAR batch invalidated a confirmed position, schedule the first
+    # FAK in the same scan; later 5/20/60/120-second attempts use maintenance.
+    if config.get("tree5_enabled", False):
+        exit_tokens = due_exit_token_ids(state, scan_time)
+        exit_books, exit_book_error = fetch_tree5_books(exit_tokens)
+        if exit_book_error:
+            tree5_actions.append({"action_type": "tree5_book_fetch", "status": "failed_fetch", "token_count": len(exit_tokens), "error": exit_book_error})
+        tree5_actions.extend(plan_due_exit_faks(state, exit_books, scan_time, config))
     # Refresh market rules only after this round's time-sensitive observations.
     refresh_summary = refresh_market_rules_if_due(state, config, cities)
     state["last_successful_scan_utc"] = iso_now()
@@ -587,6 +802,7 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     health = write_health_snapshot(config, state, cities)
     event_file = append_jsonl(config["event_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", new_events)
     signal_file = append_jsonl(config["signal_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", signals)
+    tree5_action_file = append_tree5_actions(config, tree5_actions)
     audit_store = AuditStore(config["audit_db_path"])
     try:
         for signal in signals:
@@ -618,6 +834,8 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
         "health_status": health["status"],
         "event_file": str(event_file) if event_file else None,
         "signal_file": str(signal_file) if signal_file else None,
+        "tree5_actions": len(tree5_actions),
+        "tree5_action_file": str(tree5_action_file) if tree5_action_file else None,
         "mode": config["mode"],
     }
 
@@ -652,10 +870,14 @@ def acquire_single_instance_lock(state_path: Path):
 def run_loop(config: dict[str, Any]) -> None:
     interval = config["scan_interval_seconds"]
     lock_handle = acquire_single_instance_lock(config["state_path"])
-    print(f"候选边缘扫描器已启动：每 {interval} 秒拉取已发布 METAR/SPECI；默认仅 paper 意图，绝不提交真实订单。")
+    print(
+        f"候选边缘扫描器已启动：每 {interval} 秒拉取 METAR/SPECI；"
+        "Tree5 退出维护每秒检查一次，但所有动作仅写审计意图，绝不提交真实订单。"
+    )
     # Startup: IANA local-day warm-up first, then fresh market rules.
     startup_state = load_state(config["state_path"])
     startup_state["execution_engine"] = config.get("execution_engine", "legacy")
+    ensure_tree5_state(startup_state)
     startup_cities = load_contract_cities(config["contract_cities_path"])
     startup_warmup = warm_up_current_local_days(config, startup_state, startup_cities)
     startup_rules = refresh_market_rules_if_due(startup_state, config, startup_cities)
@@ -663,10 +885,17 @@ def run_loop(config: dict[str, Any]) -> None:
     print(f"[启动 IANA warm-up] {startup_warmup}")
     print(f"[启动市场规则] {startup_rules or {'status': 'cached'}}")
     failure_started: datetime | None = None
+    next_scan_epoch = time.time()
     while True:
         try:
-            scan_once(config)
-            failure_started = None
+            now_epoch = time.time()
+            if now_epoch >= next_scan_epoch:
+                scan_once(config)
+                failure_started = None
+                next_scan_epoch = time.time() + interval
+            elif config.get("tree5_enabled", False):
+                tree5_maintenance_once(config)
+            time.sleep(min(1.0, max(0.05, next_scan_epoch - time.time())))
         except KeyboardInterrupt:
             print("\n扫描器已停止。")
             lock_handle.close()
@@ -675,16 +904,16 @@ def run_loop(config: dict[str, Any]) -> None:
             write_failure_health(config, exc)
             failure_started = failure_started or utc_now()
             backoff = max(config["rate_limit_backoff_seconds"], exc.retry_after_seconds or 0)
-            print(f"[CheckWX 限流退避] {exc}；等待 {backoff} 秒后重试。", file=sys.stderr)
-            time.sleep(backoff)
-            continue
+            next_scan_epoch = time.time() + backoff
+            print(f"[CheckWX 限流退避] {exc}；下次气象请求将在 {backoff} 秒后重试；Tree5 退出维护仍继续。", file=sys.stderr)
         except Exception as exc:
             write_failure_health(config, exc)
             failure_started = failure_started or utc_now()
             elapsed = (utc_now() - failure_started).total_seconds()
             status = "[扫描暂停：连续失败达到阈值]" if elapsed >= config["failure_pause_after_seconds"] else "[扫描失败]"
             print(f"{status} {type(exc).__name__}: {exc}", file=sys.stderr)
-        sleep_to_next_interval(interval)
+            # Do not busy-loop after a local failure; preserve pending exit checks.
+            next_scan_epoch = max(next_scan_epoch, time.time() + min(interval, 5))
 
 
 def build_health_snapshot(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], last_error: str | None = None) -> dict[str, Any]:

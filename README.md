@@ -1,69 +1,73 @@
-# METAR/SPECI Dead-Bucket Observer（tree4）
+# weatherbot — tree5
 
-**tree4** 在 tree3 的本地盘口、纸面 FAK 与严格失败关闭边界之上，已将航空实况唯一切换为 **CheckWX Aviation Weather API v2**。实时数据路径使用 `GET /v2/metar/{icao-list}/short`，在请求头中传递 `X-API-Key`；不再请求 AviationWeather.gov / AWC，也不解析其专有 JSON 字段。CheckWX 的短格式仅提供 ICAO、原始报文与 `observed` UTC 时刻，因此 tree4 从原始 METAR/SPECI 正文确定性解析温度，并在存在 RMK `T` 精确温度组时优先使用 0.1°C 精度。[1] [2]
+**tree5** 在 Tree4 的 CheckWX METAR/SPECI 观察器和 Polymarket 市场规则解析之上，新增了一个**默认仅观察、可重放、失败关闭**的 TAF 温度桶策略状态机。它按每个合同城市的 IANA 时区管理当地自然日，在当地 01:00 后取得一次当日 TAF 的 `TX` / `TN` 极值组，将预测最高温、最低温映射至相应温度桶，并生成固定 **5 shares** 的买入意图。该实现不加载钱包、不读取私钥、不生成 CLOB 认证头、不向 Polymarket 提交或取消订单。
 
-> **策略边界没有改变。** METAR/SPECI 只是候选观测，不是结算源；本仓库没有钱包加载、私钥读取、真实订单提交或撤单能力。`live` 模式仍只写入阻断审计记录，绝不交易。
+> **交易安全边界：**本分支记录的是订单意图，不是成交或持仓。任何真实下单、撤单和卖出都必须先完成账户仓位对账；若缺少可信的交易所订单 ID、已成交数量或当前可卖持仓，Tree5 必须失败关闭，绝不猜测仓位。
 
-| 项目 | tree4 行为 |
+| 模块 | Tree5 行为 |
 |---|---|
-| 当前实况请求 | `GET https://api.checkwx.com/v2/metar/{最多25个ICAO}/short`，使用 `X-API-Key` 请求头。 |
-| 温度口径 | 优先 `RMK T[01][TTT][DDHH]` 的 0.1°C；否则确定性解析正文 `M?DD/M?DD` 整数摄氏度。 |
-| 时间口径 | 用 CheckWX `observed` UTC 归属机场 IANA 当地自然日；`fetched_at` 仅用于 `observed` 至本地抓取的绝对新鲜度门。 |
-| 批量与扫描 | 每次最多 25 个 ICAO；按 tree4 的运行要求默认每 60 秒全量扫描。CheckWX 文档仍建议缓存 METAR/TAF 至少 15 分钟，因此需通过运行日志持续监控 429 与实际首见收益。[1] |
-| 暖机 | 启动/当地日切换时使用 `/v2/metar/{icao-list}/previous/{2..50}/short` 重新构建当天极值；若历史接口权限、响应或当前日数据不足，则保持失败关闭，不产生候选。 |
-| 非目标数据 | 不使用 TAF、ECMWF、任何预测输入、Station、BOT、G-AIRMET 或 URL 查询参数密钥模式。 |
+| TAF 获取 | 每城市 IANA 当地 **01:00** 后调用一次 `GET /v2/taf/{ICAOs}/short`，经 `X-API-Key` 请求头认证；失败按 900 秒间隔重试。没有覆盖当地当日的 `TX` / `TN` 则不产生入场。 |
+| TAF 解析 | 只解析标准 `TX[ M ]DD/DDHHZ` 与 `TN[ M ]DD/DDHHZ` 温度极值组，按温度实际预报时刻归属当地日期，再转换为合约单位 C/F。不会从普通 TAF 温度段臆测日极值。 |
+| 预测入场 | 选取唯一包含预测值的桶，对 **YES token** 的可执行 `best_ask` 取快照，并向下取整至 `tick_size` 后下浮 **5%**；订单意图为 5 shares、`BUY`、`GTC`。 |
+| 实况证伪 | 每条新的 METAR/SPECI/COR 温度都会检查现有 TAF 入场。高温桶仅在观测温度 `>= bucket.hi`、低温桶仅在观测温度 `< bucket.lo` 时才被证明为不可能。仅“高于 TAF 点预测但仍在同一桶”不会错误止损。 |
+| 快速退出 | 一旦桶被证明不可能，计划取消原 GTC（前提是有已对账的外部订单 ID），随后仅对已对账持仓生成 `SELL YES` 的 FAK 意图。退出在第 0、5、20、60、120 秒读取新 `best_bid`，以 **10%、20%、35%、60%、90%** 的保护性下浮报价；FAK 的未成交余量会自动取消。 |
+| 时间闭合 | 高温在当地 13:00–17:00、低温在 01:00–05:00 每分钟复核。仅当“至少 1 个本地温度单位未触及桶”“最近 3 条观测出现至少 0.5 单位反转”“YES `best_bid` 较入场 ask 下跌至少 20%”三项同时成立，才给出概率性取消/退出意图。 |
+| 审计 | 每个 TAF、入场、取消、FAK 追价和时间闭合判断同时写入 `data/tree5_actions/*.jsonl` 与 SQLite 的 append-only 审计表。 |
 
-## 安装与安全配置
+## 订单类型的必要区分
 
-项目保持 Python 标准库的 CheckWX 请求实现；既有订单签名测试依赖仅在运行完整测试集时需要安装。先由示例配置创建本地配置，再将 API 密钥只注入启动进程环境。`config.json`、`.env` 和 `data/` 已被忽略，真实密钥绝不可写入仓库、配置 JSON、请求 URL、审计记录或截图。[1]
+**FAK 与 GTC 不能合并为同一笔订单。**GTC 是挂在簿上直至成交或撤销的限价单；FAK 则只立即吃掉可用流动性并自动取消剩余数量。Tree5 因而使用“**入场 GTC，已证伪后退出 FAK**”的两阶段设计。[3]
+
+对于退出，所谓“对盘口价下浮”是**最低可接受价格的保护线**，而不是强制以该价格成交。若当前最优 bid 仍有深度，卖出 FAK 会先在更优 bid 成交；较大的下浮幅度只是允许它继续扫到更深的 bid，从而提高快速出手概率。每次 FAK 前都必须重新对账实际剩余持仓，以避免部分成交后再次卖出超过持仓的数量。[3] [4]
+
+## 安装与观察模式
 
 ```bash
-git clone --branch tree4 https://github.com/jssyxd/weatherbot.git
+git clone --branch tree5 https://github.com/jssyxd/weatherbot.git
 cd weatherbot
 cp config.example.json config.json
 export CHECKWX_API_KEY='在此设置你的密钥'
 python3 metar_observer.py status
-python3 metar_observer.py once
 python3 metar_observer.py run
 ```
 
-| 配置项 | 默认值 | 含义 |
-|---|---:|---|
-| `checkwx_api_key_env` | `CHECKWX_API_KEY` | 保存密钥的环境变量名，而非密钥本身。 |
-| `scan_interval_seconds` | `60` | CheckWX METAR 全量轮询间隔；不得低于 60 秒。 |
-| `rate_limit_backoff_seconds` | `60` | 收到 HTTP 429 后的最小退避时间；若服务端提供更长 `Retry-After`，优先采用更长值。 |
-| `stations_per_request` | `25` | 当前 METAR 批量 ICAO 数；不得超过接口上限。 |
-| `checkwx_previous_limit` | `50` | 每站暖机历史数量，支持范围为 2–50。 |
-| `max_report_age_seconds` | `900` | `observed` 到本次抓取的最大可接受龄期。 |
-| `warmup_stations_per_request` | `25` | 暖机历史请求分块大小。 |
-| `warmup_retry_seconds` | `900` | 暖机失败重试节奏。 |
+`config.example.json` 默认 `tree5_enabled=false` 且 `mode=observe`。先以 `tree5_enabled=true`、`mode=observe` 持续观察至少数周，复核 TAF 的 `issued`、`forecast_time_utc`、本地日归属、盘口快照、计划订单与实际可交易流动性。供应商文档要求 METAR/TAF 至少缓存 15 分钟；因此 60 秒 METAR 扫描主要用于记录报文可用性，不能据此预先假设上游会在观测后秒级更新。[1]
 
-## 历史暖机权限与失败关闭
+## 持续运行方式
 
-CheckWX 文档将历史 METAR 端点归类为高级端点；该端点需要相应的订阅权限。[2] 在这次 tree4 实施的受控实测中，当前密钥可以成功返回 `/v2/metar/KLAX/short`，但 `/v2/metar/KLAX/previous/50/short` 返回 HTTP 403，并提示需要 premium API plan。因此当前代码会继续采集和审计实时短格式 METAR，但**不会把未完成暖机的当天数据推进到候选信号状态机**。这是刻意的安全设计，避免在当天既有极值未知时错误判定温度桶已经失效。
+下表给出两种可行的运行方案。两者都应将 `CHECKWX_API_KEY` 和未来的 CLOB 认证材料保存在进程环境或受管密钥服务中，而不是写进仓库或 `config.json`。
 
-若要完整启用 tree4 的候选逻辑，需让所用 CheckWX 订阅具有历史 METAR 权限；随后无需改动代码，只需以该环境变量重启观察器。任何 401、403、429、非 JSON 响应、`results` 与 `data` 数量不一致，或当前当地日没有可用历史报文，都会记录为退化状态并保持不动作。
+| 方式 | 适合场景 | 取舍 | 成本 | 配置复杂度 |
+|---|---|---|---|---|
+| 托管的持续后台服务 | 希望浏览器关闭后仍每秒处理已触发退出、每分钟扫描 METAR | 省运维，适合目前 49 城与少量活跃退出；需另行配置受管密钥和持仓对账适配器 | 按托管资源用量 | 中等 |
+| 自有持续在线 Linux 主机 | 已有稳定的运行主机、需要系统级进程管理和自定义网络控制 | 控制力高，可用系统服务守护；机器、网络、密钥与监控由使用者负责 | 使用现有主机的边际成本 | 较高 |
 
-## 时效性验证而非预设结论
+本仓库不会在默认沙箱中作为持续交易服务运行；这类会话环境可能休眠，不能承诺 5 秒、20 秒的退出时点。
 
-切换 CheckWX 的目的是检验其数据可用时间是否早于旧免费来源；这并不是已被本仓库证明的结论。tree4 按运行要求每 60 秒扫描一次，并会在每个审计事件中保留 `report_time_utc`、`fetched_at_utc` 和 `checkwx_report_age_seconds`，以同一 ICAO、相同 `raw_metar` 对比首见时间。CheckWX 文档仍建议 METAR/TAF 至少缓存 15 分钟；因此 429、响应龄期与实际首见收益必须被持续审计，不能仅以扫描频率宣称更快。[1]
+## 真实执行尚未启用
 
-建议持续运行至少数周，特别覆盖整点 METAR、SPECI、机场当地午夜、夏令时切换和网络异常场景。只有在样本量、机场集合、轮询节奏及“首见”的定义一致时，才应判断 CheckWX 是否在目标机场上更早可用。
+Tree5 已完整实现**信号与订单生命周期决策**，但有意未实现真实执行器。要启用真实交易，后续还需在单独、安全审查过的适配器中实现下列能力：
+
+1. 从安全密钥存储读取钱包签名材料及 CLOB L2 凭证；
+2. 在每个提交、撤单和重试前拉取并对账开放订单、成交和可卖 YES 持仓；
+3. 将计划 GTC/FAK 订单签名、提交、取消，并将交易所返回的 `order_id`、实际 `size_matched` 写入 `confirmed_positions`；
+4. 对网络错误和不确定响应采用“查询后决定”，而不是盲目重发；
+5. 在第一次真实资金动作前明确确认目标市场、最大数量、价格底线和损失后果。
+
+CLOB 的订单价格必须遵守市场 `tick_size`，且数量必须满足 `min_order_size`；卖单的 maker amount 是 shares，taker amount 是价格乘以 shares。[3]
 
 ## 测试
 
 ```bash
-sudo pip3 install -r requirements.txt
+sudo pip3 install eth-account
 python3 -m unittest discover -s tests -v
 ```
 
-当前测试覆盖 CheckWX 请求头鉴权、密钥不进入 URL、短格式 JSON 契约、25 ICAO 上限、60 秒扫描门、HTTP 429 的 `Retry-After` 退避、历史暖机失败关闭、IANA 当地日、正文和 RMK 温度解析、华氏精度保护、本地订单簿以及纸面 FAK 风控边界。它们不调用真实 API，也不会发出订单。
-
-## tree3 保留边界
-
-tree3 的本地 WebSocket 盘口、完整 ask 深度、固定 5 shares FAK 纸面估算、审计账本、价格保护与 `live` 阻断仍保持原状。tree4 只替换了航空实况供应商与与之绑定的配置、标准化、暖机、审计字段和测试；它不将 `midpoint`、成交价或 bid 误作可买入的 NO ask，也不新增任何真实执行路径。
+Tree5 专项测试覆盖：当地 01:00 幂等调度、TAF `TX`/`TN` 与 IANA 日期映射、5% 快照入场、同桶内 TAF 突破不退出、桶边界实况证伪、0/5/20/60/120 秒 FAK 追价，以及高温/低温的时间闭合三重条件。完整测试集涵盖 84 项测试且不调用真实 API、不提交订单。
 
 ## References
 
 [1]: https://www.checkwxapi.com/documentation/introduction "CheckWX Introduction"
-[2]: https://www.checkwxapi.com/documentation/metar "CheckWX METAR endpoints"
+[2]: https://www.checkwxapi.com/documentation/taf "CheckWX TAF API"
+[3]: https://docs.polymarket.com/trading/place-orders "Polymarket Place Orders"
+[4]: https://docs.polymarket.com/trading/manage-orders "Polymarket Manage Orders"
