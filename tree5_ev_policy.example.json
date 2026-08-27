@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0",
+  "mode": "paper_only",
+  "orders_submitted": 0,
+  "taf_market_alignment": {
+    "enabled": true,
+    "lookback_window_seconds": 7200,
+    "minimum_snapshot_count": 45,
+    "minimum_coverage_ratio": "0.75",
+    "maximum_final_snapshot_age_seconds": 240,
+    "minimum_absolute_price_lead": "0.05",
+    "minimum_relative_price_lead": "0.20",
+    "zero_runner_up_minimum_leader_price": "0.20"
+  },
+  "net_expected_value": {
+    "enabled": true,
+    "target_shares": "5",
+    "minimum_oos_sample_count": 100,
+    "require_positive_lower_confidence_bound": true,
+    "require_calibrated_probability_lower_bound": true,
+    "require_post_signal_l2": true,
+    "maximum_post_signal_entry_delay_seconds": 5,
+    "latency_slippage_reserve_usdc": "0.02"
+  },
+  "entry_price_profiles": [
+    {"id": "best_ask", "kind": "best_ask", "maximum_price": "0.95"},
+    {"id": "best_ask_plus_one_tick", "kind": "best_ask_plus_ticks", "ticks": 1, "maximum_price": "0.95"}
+  ],
+  "risk_reversal": {
+    "minimum_absolute_price_lead": "0.05",
+    "minimum_relative_price_lead": "0.30",
+    "minimum_snapshot_count": 45,
+    "require_complete_market_coverage": true,
+    "allow_real_execution": false,
+    "required_actions": ["paper_stop_new_entries", "paper_cancel_candidate", "paper_exit_candidate", "paper_route_comparison_required"]
+  }
+}
