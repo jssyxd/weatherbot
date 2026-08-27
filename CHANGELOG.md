@@ -8,7 +8,8 @@
 |---|---|---|
 | 策略规则 | 新增 `docs/tree5_ev_model.md`，将“最新 TAF 与市场最高共识一致且领先第二桶”形式化为 t0 可见版本、全桶可执行 bid 排名、20% 相对领先与 5 个百分点绝对领先的纸面门。 | 文档化完成；阈值必须按日期滚动的前瞻样本验证。 |
 | 净期望 | 新增 `tree5_ev_policy.example.json`，要求使用 `p_lower`、L2 ask VWAP、费用、预期退出成本与时延储备来计算 EV 下界；缺任一输入即阻断。 | 仅预注册配置；后续单元/回放测试不得用日后信息填充。 |
-| 纸面风险 | 规划将 `FACT_INVALIDATED`、`CONSENSUS_REVERSAL` 和 `TIME_CLOSURE_AND_CONSENSUS_REVERSAL` 分开建模；旧仓退出、NO/完整对和新 YES 入场为独立决策。 | 后续状态机只生成 `PAPER_*` 候选，绝不创建真实订单。 |
+| 净期望评估器 | 新增 `tree5_ev_model.py` 与 7 项测试：按 t0 前全桶 L2 验证 TAF 桶第一名、20% 相对领先与 5 个百分点绝对领先；再用 post-t0 ask 走簿、留出样本概率下界、填单率和成本计算 EV 下界。 | 已完成 5 分钟/49 轮、每轮 94 项测试的隔离验证；不访问网络或交易接口。 |
+| 纸面风险 | 新增 `tree5_risk_state.py` 与 7 项测试：将 `FACT_INVALIDATED`、`CONSENSUS_REVERSAL` 和 `TIME_CLOSURE_AND_CONSENSUS_REVERSAL` 按优先级分开建模；旧仓退出、NO/完整对和新 YES 入场为独立决策。 | 状态机只生成 `PAPER_STOP_NEW_ENTRIES`、`PAPER_CANCEL_CANDIDATE`、`PAPER_EXIT_CANDIDATE`、`PAPER_ROUTE_COMPARISON_REQUIRED` 和独立新仓候选，绝不创建真实订单。 |
 | 执行边界 | 新增 `scripts/soak_test.sh`，连续运行本地测试以验证回归稳定性。 | 已完成基线 5 分钟/49 轮，87 项既有测试均通过。 |
 | 未实施 | 真实 FAK/GTC、撤单、卖出、NO/merge、账户/用户流对账、凭证加载。 | 保持未实现；如未来需要，必须在独立模块、独立审计和明确确认后再处理。 |
 
