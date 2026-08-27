@@ -10,15 +10,16 @@
   "market_ws_enabled": true,
 
   "checkwx_api_key_env": "CHECKWX_API_KEY",
-  "scan_interval_seconds": 900,
-  "rate_limit_backoff_seconds": 900,
+  "scan_interval_seconds": 120,
+  "rate_limit_backoff_seconds": 120,
   "stations_per_request": 25,
-  "checkwx_previous_limit": 50,
+  "awc_warmup_hours": 48,
+  "awc_fallback_hours": 2,
   "max_report_age_seconds": 900,
   "failure_pause_after_seconds": 1800,
 
-  "warmup_stations_per_request": 25,
-  "warmup_retry_seconds": 900,
+  "warmup_retry_seconds": 120,
+  "warmup_max_stations_per_cycle": 8,
   "market_rules_max_age_seconds": 900,
 
   "tail_consensus_enabled": true,

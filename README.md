@@ -8,8 +8,10 @@
 
 | 项目 | tree6yes 的规则 |
 | --- | --- |
-| 天气 API 频率 | CheckWX METAR/SPECI 每 **900 秒（15 分钟）**完整扫描一次。任何低于 900 秒的配置都会被拒绝。 |
+| 天气 API 频率 | CheckWX METAR/SPECI 每 **120 秒（2 分钟）**完整扫描一次。任何低于 120 秒的配置都会被拒绝。 |
 | 市场结构频率 | Gamma 合约结构每 15 分钟或城市当地日切换时刷新，用于获得当日温度桶和对应 `yes_token_id`。 |
+| 首次暖机 | 每个待暖机 ICAO 从 AWC 拉取过去 48 小时的**已发布** METAR/SPECI，再按 IANA 当地日重建高低温基线；不请求 CheckWX 的付费 `previous` 端点。每个两分钟周期最多暖机 8 城，未尝试城市优先，避免超时站阻塞其余城市。 |
+| 主源灾备 | CheckWX 当前请求异常，或成功响应未包含某个目标 ICAO 时，仅为该 ICAO 从 AWC 查询近 2 小时已发布观测；所有来源单独审计。 |
 | 盘口数据 | 保留 Polymarket **公共**市场数据流，接收订单簿快照和变动，不轮询订单簿。 |
 | 高温尾盘 | 仅在城市当地时间 **12:00–17:00** 考虑高温合约。 |
 | 低温尾盘 | 仅在城市当地时间 **01:00–05:00** 考虑低温合约。 |
@@ -24,7 +26,7 @@ Polymarket 的显示价格是 bid/ask 中点或最近成交价，未必是可交
 
 ## 延迟边界
 
-15 分钟的 CheckWX 拉取和“实测温度发生越界的瞬间即确认”不能同时做到。没有天气推送源时，实测温度越界只能在下一轮成功扫描、报文新鲜且当天历史暖机完成时得到确认，延迟接近一个扫描周期。公共市场数据流可以近实时提示盘口下跌，但**盘口信号不是实测温度证据**，因此已按确认要求限制为 85¢ 仅预警。[2]
+2 分钟的 CheckWX 拉取和“实测温度发生越界的瞬间即确认”不能同时做到。没有天气推送源时，实测温度越界只能在下一轮成功扫描、报文新鲜且当天历史暖机完成时得到确认，通常延迟接近一个扫描周期。公共市场数据流可以近实时提示盘口下跌，但**盘口信号不是实测温度证据**，因此已按确认要求限制为 85¢ 仅预警。[2]
 
 ## 安装与配置
 
@@ -36,14 +38,17 @@ python3 -m pip install -r requirements.txt
 export CHECKWX_API_KEY='仅在启动环境中设置，不要写入 config.json'
 ```
 
-`CHECKWX_API_KEY` 只从进程环境变量读取，绝不应写入 Git、`config.json`、请求 URL、审计记录或截图。CheckWX 历史 METAR 暖机接口可能需要额外订阅权限；若暖机失败、当前本地日数据不足、订单簿缺失/过期、价格或深度不达标，策略保持失败关闭，不产生纸面入场、退出或换手。
+`CHECKWX_API_KEY` 只从进程环境变量读取，绝不应写入 Git、`config.json`、请求 URL、审计记录或截图。首次暖机不再使用需要额外订阅权限的 CheckWX 历史接口，而是使用 AWC 的已发布 METAR/SPECI 数据。若 AWC 不可达、返回 204/异常格式、当前本地日无有效观测、订单簿缺失/过期或价格/深度不达标，策略保持失败关闭，不产生纸面入场、退出或换手。
 
 关键配置均已写入 `config.example.json`：
 
 ```json
 {
   "execution_engine": "tree6yes",
-  "scan_interval_seconds": 900,
+  "scan_interval_seconds": 120,
+  "awc_warmup_hours": 48,
+  "awc_fallback_hours": 2,
+  "warmup_max_stations_per_cycle": 8,
   "market_rules_max_age_seconds": 900,
   "tail_consensus_stability_seconds": 1800,
   "tail_consensus_stable_min_price": "0.90",
@@ -63,7 +68,7 @@ export CHECKWX_API_KEY='仅在启动环境中设置，不要写入 config.json'
 # 一次性天气/市场结构扫描；因没有常驻盘口流，任何需要盘口的动作都会失败关闭。
 python3 metar_observer.py once
 
-# 方案 A：15 分钟天气与结构扫描 + 常驻公共盘口流 + 85¢即时仅预警。
+# 方案 A：2 分钟 CheckWX 扫描 + 常驻公共盘口流 + 85¢即时仅预警。
 python3 metar_observer.py run
 
 # 查看本地状态，不请求天气或市场数据。
@@ -82,7 +87,7 @@ python3 metar_observer.py status
 python3 -m unittest discover -s tests -v
 ```
 
-新增测试覆盖 15 分钟最低轮询间隔、YES token 映射、30 分钟稳定门、92¢/98¢ 边界、加一跳限价上限、多个共识桶失败关闭、85¢ 仅预警、温度确认后“卖旧 YES + 买新 YES 三倍”、一次换手上限，以及公共市场数据流字段兼容性。
+新增测试覆盖 2 分钟最低轮询间隔、AWC 已发布 METAR/SPECI 的历史暖机、CheckWX 缺站的 AWC 灾备回退、YES token 映射、30 分钟稳定门、92¢/98¢ 边界、加一跳限价上限、多个共识桶失败关闭、85¢ 仅预警、温度确认后“卖旧 YES + 买新 YES 三倍”、一次换手上限，以及公共市场数据流字段兼容性。
 
 ## 参考资料
 
@@ -91,3 +96,5 @@ python3 -m unittest discover -s tests -v
 [2] [Polymarket：实时市场数据](https://docs.polymarket.com/market-data/realtime-data)
 
 [3] [CheckWX API 文档](https://www.checkwxapi.com/documentation/introduction)
+
+[4] [AviationWeather.gov Data API](https://aviationweather.gov/data/api/)

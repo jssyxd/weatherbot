@@ -5,6 +5,7 @@ wallet, or sends an order. Parsed rules are inputs to the local paper signal eng
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import re
 import urllib.error
@@ -13,6 +14,8 @@ from datetime import date
 from typing import Any
 
 GAMMA_EVENT_ENDPOINT = "https://gamma-api.polymarket.com/events/slug/"
+GAMMA_REQUEST_TIMEOUT_SECONDS = 5
+GAMMA_MAX_CONCURRENT_REQUESTS = 8
 MONTHS = {month.casefold(): index for index, month in enumerate(("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"), start=1)}
 QUESTION_RE = re.compile(r"^Will the (highest|lowest) temperature in .+? be (.+?) on ([A-Za-z]+) (\d+)\?$")
 RANGE_RE = re.compile(r"^between (-?\d+(?:\.\d+)?)-(-?\d+(?:\.\d+)?)°([CF])$")
@@ -30,7 +33,7 @@ def event_slug(market_city_slug: str, local_date: str, direction: str) -> str:
 def _fetch_json(url: str) -> dict[str, Any]:
     request = urllib.request.Request(url, headers={"User-Agent": "weatherbot-market-adapter/1.1 (+https://github.com/jssyxd/weatherbot)"})
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=GAMMA_REQUEST_TIMEOUT_SECONDS) as response:
             payload = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -126,22 +129,28 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
 
 
 def refresh_market_rules(cities: dict[str, dict[str, Any]], local_dates: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Refresh public market metadata with bounded concurrency and short timeout."""
     rules: list[dict[str, Any]] = []
     failures: dict[str, str] = {}
-    for city in cities.values():
-        local_date = local_dates[city["icao"]]
-        for direction in ("high", "low"):
-            slug = event_slug(str(city.get("market_city_slug") or city["city_id"]), local_date, direction)
-            try:
-                event = _fetch_json(GAMMA_EVENT_ENDPOINT + slug)
-                if not event:
-                    failures[f"{city['city_id']}|{local_date}|{direction}"] = "event_not_found"
-                    continue
-                parsed = parse_event_rules(event, city, local_date, direction)
-                if not parsed:
-                    failures[f"{city['city_id']}|{local_date}|{direction}"] = "no_trade_ready_parsed_rules"
-                    continue
+    requests = [(city, local_dates[city["icao"]], direction) for city in cities.values() for direction in ("high", "low")]
+    def fetch_one(city: dict[str, Any], local_date: str, direction: str) -> tuple[str, list[dict[str, Any]], str | None]:
+        key = f"{city['city_id']}|{local_date}|{direction}"
+        slug = event_slug(str(city.get("market_city_slug") or city["city_id"]), local_date, direction)
+        try:
+            event = _fetch_json(GAMMA_EVENT_ENDPOINT + slug)
+            if not event:
+                return key, [], "event_not_found"
+            parsed = parse_event_rules(event, city, local_date, direction)
+            return key, parsed, None if parsed else "no_trade_ready_parsed_rules"
+        except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            return key, [], f"market_discovery_failed:{type(exc).__name__}"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(GAMMA_MAX_CONCURRENT_REQUESTS, len(requests))) as pool:
+        futures = [pool.submit(fetch_one, city, local_date, direction) for city, local_date, direction in requests]
+        for future in concurrent.futures.as_completed(futures):
+            key, parsed, failure = future.result()
+            if failure:
+                failures[key] = failure
+            else:
                 rules.extend(parsed)
-            except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                failures[f"{city['city_id']}|{local_date}|{direction}"] = f"market_discovery_failed:{type(exc).__name__}"
+    rules.sort(key=lambda rule: (str(rule.get("city_id")), str(rule.get("market_local_date")), str(rule.get("direction"))))
     return rules, failures

@@ -87,13 +87,15 @@ class Tree6YesRuntime:
         with self._state_lock:
             snapshots = self.stream.snapshots(max_age_seconds=self.config["local_book_max_age_seconds"]) if self.stream else {}
             result = self.observer.scan_once(self.config, snapshots)
-            self._refresh_stream_tokens()
+            if self.config.get("market_ws_enabled", True):
+                self._refresh_stream_tokens()
             return result
 
     def run(self) -> None:
         interval = self.config["scan_interval_seconds"]
         lock_handle = self.observer.acquire_single_instance_lock(self.config["state_path"])
-        print(f"tree6yes 已启动：CheckWX/Gamma 每 {interval} 秒扫描；YES 盘口通过公共数据流实时保护；仅纸面执行。")
+        protection = "YES 盘口通过公共数据流实时保护" if self.config.get("market_ws_enabled", True) else "公共盘口流已为受控测试禁用"
+        print(f"tree6yes 已启动：CheckWX/Gamma 每 {interval} 秒扫描；{protection}；仅纸面执行。")
         try:
             while not self._stopping.is_set():
                 try:

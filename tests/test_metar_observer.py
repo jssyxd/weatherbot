@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -85,7 +86,20 @@ class MetarObserverTests(unittest.TestCase):
         self.assertEqual(request.get_header("X-api-key"), "test-only-key")
         self.assertNotIn("test-only-key", request.full_url)
 
-    def test_fetch_checkwx_rejects_invalid_response_shape(self) -> None:
+    def test_fetch_awc_reports_normalizes_published_metar_json(self) -> None:
+        payload = json.dumps([{
+            "icaoId": "KJFK", "metarType": "METAR", "rawOb": "KJFK 271300Z 18008KT 10SM 25/21 A3006",
+            "reportTime": "2026-08-27T13:00:00.000Z",
+        }]) + "\n200"
+        with patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=payload, stderr="")) as mocked:
+            records, endpoint = observer.fetch_awc_reports("KJFK", hours=48, purpose="warmup")
+        self.assertEqual(records, [{"icao": "KJFK", "raw_text": "METAR KJFK 271300Z 18008KT 10SM 25/21 A3006", "observed": "2026-08-27T13:00:00Z"}])
+        self.assertIn("ids=KJFK", endpoint)
+        self.assertIn("hours=48", endpoint)
+        command = mocked.call_args.args[0]
+        self.assertNotIn("X-api-key", " ".join(command))
+
+    def test_checkwx_rejects_invalid_response_shape(self) -> None:
         response = FakeHTTPResponse({"results": 1, "data": []})
         with patch.dict("os.environ", {"TREE4_TEST_CHECKWX_KEY": "test-only-key"}, clear=False):
             with patch("urllib.request.urlopen", return_value=response):
@@ -115,17 +129,17 @@ class MetarObserverTests(unittest.TestCase):
         stations = observer.normalize_stations([{"icao": "zspd", "name": "Shanghai Pudong"}, "ZSPD", "RCTP"])
         self.assertEqual(stations, [{"icao": "ZSPD", "name": "Shanghai Pudong"}, {"icao": "RCTP", "name": "RCTP"}])
 
-    def test_interval_below_fifteen_minutes_is_rejected(self) -> None:
+    def test_interval_below_two_minutes_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 899, "stations": ["ZSPD"]}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 119, "stations": ["ZSPD"]}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 
     def test_checkwx_batch_size_above_25_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"stations_per_request": 26, "scan_interval_seconds": 900}), encoding="utf-8")
+            config_path.write_text(json.dumps({"stations_per_request": 26, "scan_interval_seconds": 120}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 
@@ -151,7 +165,7 @@ class MetarObserverTests(unittest.TestCase):
         self.assertEqual(state["daily_warmup"][key]["status"], "complete")
         self.assertEqual(state["daily_extrema"][key]["warmup_latest_report_time_utc"], "2026-08-22T15:59:00Z")
 
-    def test_warmup_fetches_only_icao_codes_still_due(self) -> None:
+    def test_awc_warmup_fetches_only_icao_codes_still_due(self) -> None:
         shanghai = self.cities["ZSPD"]
         los_angeles = self.cities["KLAX"]
         fixed_now = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
@@ -162,18 +176,27 @@ class MetarObserverTests(unittest.TestCase):
                 }
             }
         }
-        config = {
-            "warmup_retry_seconds": 60,
-            "warmup_stations_per_request": 25,
-            "checkwx_api_key_env": "TREE4_TEST_CHECKWX_KEY",
-            "checkwx_previous_limit": 50,
-        }
+        config = {"warmup_retry_seconds": 120, "awc_warmup_hours": 48}
         with patch("metar_observer.utc_now", return_value=fixed_now):
-            with patch("metar_observer.fetch_checkwx_reports", return_value=([], "https://checkwx.test/history")) as mocked:
+            with patch("metar_observer.fetch_awc_history_for_stations", return_value=([], {"KLAX": "https://awc.test/metar"}, {})) as mocked:
                 observer.warm_up_current_local_days(state=state, config=config, cities={"ZSPD": shanghai, "KLAX": los_angeles})
         self.assertEqual(mocked.call_count, 1)
         self.assertEqual(mocked.call_args.args[0], ["KLAX"])
-        self.assertEqual(mocked.call_args.kwargs["previous_limit"], 50)
+        self.assertEqual(mocked.call_args.kwargs["hours"], 48)
+        self.assertEqual(mocked.call_args.kwargs["purpose"], "warmup")
+
+    def test_current_scan_uses_awc_only_for_missing_checkwx_city(self) -> None:
+        config = {"stations_per_request": 25, "checkwx_api_key_env": "TREE4_TEST_CHECKWX_KEY", "awc_fallback_hours": 2}
+        checkwx = [{"icao": "ZSPD", "raw_text": "METAR ZSPD 221200Z 00000KT 28/24 Q1005", "observed": "2026-08-22T12:00:00Z"}]
+        awc = [{"icao": "KLAX", "raw_text": "METAR KLAX 221200Z 00000KT 20/10 Q1010", "observed": "2026-08-22T12:00:00Z"}]
+        with patch("metar_observer.fetch_checkwx_reports", return_value=(checkwx, "https://checkwx.test/current")) as primary, \
+             patch("metar_observer.fetch_awc_reports", return_value=(awc, "https://awc.test/metar")) as fallback:
+            records, summary = observer.fetch_current_reports_with_awc_fallback(config, ["ZSPD", "KLAX"])
+        self.assertEqual(primary.call_count, 1)
+        self.assertEqual(fallback.call_args.args[0], ["KLAX"])
+        self.assertEqual(fallback.call_args.kwargs["hours"], 2)
+        self.assertEqual({record[1] for record in records}, {"CheckWX Aviation Weather API v2", "AviationWeather.gov Data API (fallback)"})
+        self.assertEqual(summary["awc_fallback_city_count"], 1)
 
     def test_warmup_fails_closed_when_current_iana_day_has_no_report(self) -> None:
         city = self.cities["ZSPD"]
@@ -186,6 +209,20 @@ class MetarObserverTests(unittest.TestCase):
         self.assertFalse(observer._warmup_is_complete(state, city, "2026-08-23"))
         self.assertEqual(state["daily_warmup"]["shanghai|2026-08-23"]["status"], "failed_no_current_local_day_reports")
 
+    def test_market_rules_failure_marks_current_direction_as_resolved_until_refresh(self) -> None:
+        city = self.cities["ZSPD"]
+        fixed_now = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+        local_date = "2026-08-22"
+        state = {
+            "market_rules": [],
+            "market_failures": {
+                f"{city['city_id']}|{local_date}|high": "event_not_found",
+                f"{city['city_id']}|{local_date}|low": "event_not_found",
+            },
+        }
+        with patch("metar_observer.utc_now", return_value=fixed_now):
+            self.assertTrue(observer.market_rules_cover_local_days(state, {"ZSPD": city}))
+
     def test_health_snapshot_is_degraded_when_iana_warmup_is_missing(self) -> None:
         city = self.cities["ZSPD"]
         config = {"scan_interval_seconds": 60, "market_rules_max_age_seconds": 1800}
@@ -195,13 +232,13 @@ class MetarObserverTests(unittest.TestCase):
         self.assertEqual(snapshot["critical_path"], "deterministic_iana_state_machine_only")
         self.assertEqual(snapshot["untrusted_warmup_count"], 1)
 
-    def test_fifteen_minute_scan_interval_is_accepted(self) -> None:
+    def test_two_minute_scan_interval_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 900, "stations": ["ZSPD"]}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 120, "stations": ["ZSPD"]}), encoding="utf-8")
             loaded = observer.load_config(config_path)
-            self.assertEqual(loaded["scan_interval_seconds"], 900)
-            self.assertEqual(loaded["rate_limit_backoff_seconds"], 900)
+            self.assertEqual(loaded["scan_interval_seconds"], 120)
+            self.assertEqual(loaded["rate_limit_backoff_seconds"], 120)
             self.assertEqual(loaded["stations_per_request"], 25)
 
     def test_single_instance_lock_is_exclusive(self) -> None:
@@ -214,10 +251,10 @@ class MetarObserverTests(unittest.TestCase):
             finally:
                 first.close()
 
-    def test_checkwx_previous_limit_must_be_supported_range(self) -> None:
+    def test_awc_warmup_hours_must_be_supported_range(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 60, "checkwx_previous_limit": 51}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 120, "awc_warmup_hours": 73}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 
