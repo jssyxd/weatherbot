@@ -85,6 +85,64 @@ class MetarObserverTests(unittest.TestCase):
         self.assertEqual(request.get_header("X-api-key"), "test-only-key")
         self.assertNotIn("test-only-key", request.full_url)
 
+    def test_fetch_awc_maps_official_json_to_canonical_report(self) -> None:
+        response = FakeHTTPResponse([
+            {
+                "icaoId": "KJFK", "metarType": "METAR", "rawOb": "METAR KJFK 221200Z 18007KT 10SM 24/20 A3000",
+                "reportTime": "2026-08-22T12:00:00Z", "obsTime": 1787400000, "temp": 24.4,
+            }
+        ])
+        with patch("urllib.request.urlopen", return_value=response) as mocked:
+            records, endpoint = observer.fetch_awc_reports(["kjfk"], 30)
+        self.assertEqual(records[0]["icao"], "KJFK")
+        self.assertEqual(records[0]["_source_kind"], "awc_fallback")
+        self.assertEqual(records[0]["temperature_c"], 24.4)
+        self.assertIn("ids=KJFK", endpoint)
+        self.assertIn("format=json", endpoint)
+        self.assertIn("hours=30", endpoint)
+        self.assertIsNone(mocked.call_args.args[0].get_header("X-api-key"))
+
+    def test_fetch_awc_latest_only_keeps_newest_report_per_icao(self) -> None:
+        response = FakeHTTPResponse([
+            {"icaoId": "KJFK", "metarType": "METAR", "rawOb": "METAR KJFK 221100Z 18007KT 10SM 23/20 A3000", "reportTime": "2026-08-22T11:00:00Z"},
+            {"icaoId": "KJFK", "metarType": "METAR", "rawOb": "METAR KJFK 221200Z 18007KT 10SM 24/20 A3000", "reportTime": "2026-08-22T12:00:00Z"},
+        ])
+        with patch("urllib.request.urlopen", return_value=response):
+            records, _ = observer.fetch_awc_reports(["KJFK"], 2, latest_only=True)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["raw_text"].split()[2], "221200Z")
+
+    def test_awc_result_cap_fails_closed_to_prevent_history_truncation(self) -> None:
+        item = {"icaoId": "KJFK", "metarType": "METAR", "rawOb": "METAR KJFK 221200Z 18007KT 10SM 24/20 A3000", "reportTime": "2026-08-22T12:00:00Z"}
+        with patch("urllib.request.urlopen", return_value=FakeHTTPResponse([item] * observer.AWC_MAX_RESULTS_PER_QUERY)):
+            with self.assertRaisesRegex(RuntimeError, "静默截断"):
+                observer.fetch_awc_reports(["KJFK"], 30)
+
+    def test_checkwx_missing_icao_uses_awc_fallback_only_for_gap(self) -> None:
+        checkwx = [{"icao": "ZSPD", "raw_text": "METAR ZSPD 221200Z 12007MPS 9999 28/26 Q1005", "observed": "2026-08-22T12:00:00Z"}]
+        awc = [{"icao": "KLAX", "raw_text": "METAR KLAX 221200Z 00000KT 10SM 22/18 A2990", "observed": "2026-08-22T12:00:00Z", "_source": "AviationWeather.gov Data API", "_source_kind": "awc_fallback", "_source_endpoint": "https://aviationweather.gov/api/data/metar"}]
+        config = {"stations_per_request": 25, "checkwx_api_key_env": "TREE4_TEST_CHECKWX_KEY", "awc_stations_per_request": 10, "awc_fallback_history_hours": 2}
+        with patch("metar_observer.fetch_checkwx_reports", return_value=(checkwx, "https://api.checkwx.com/v2/metar/ZSPD,KLAX/short")) as primary:
+            with patch("metar_observer.fetch_awc_reports", return_value=(awc, "https://aviationweather.gov/api/data/metar")) as fallback:
+                reports, summary = observer.fetch_current_reports_with_fallback(config, ["ZSPD", "KLAX"])
+        self.assertEqual(primary.call_args.args[0], ["ZSPD", "KLAX"])
+        self.assertEqual(fallback.call_args.args[0], ["KLAX"])
+        self.assertEqual(summary["checkwx_report_count"], 1)
+        self.assertEqual(summary["awc_fallback_requested_icaos"], ["KLAX"])
+        self.assertEqual(summary["missing_after_fallback"], [])
+        self.assertEqual({report["_source_kind"] for report in reports}, {"checkwx", "awc_fallback"})
+
+    def test_checkwx_429_uses_awc_for_that_rounds_missing_icaos(self) -> None:
+        awc = [{"icao": "ZSPD", "raw_text": "METAR ZSPD 221200Z 12007MPS 9999 28/26 Q1005", "observed": "2026-08-22T12:00:00Z", "_source": "AviationWeather.gov Data API", "_source_kind": "awc_fallback", "_source_endpoint": "https://aviationweather.gov/api/data/metar"}]
+        config = {"stations_per_request": 25, "checkwx_api_key_env": "TREE4_TEST_CHECKWX_KEY", "awc_stations_per_request": 1, "awc_fallback_history_hours": 2}
+        with patch("metar_observer.fetch_checkwx_reports", side_effect=observer.CheckWXRateLimitError(120)):
+            with patch("metar_observer.fetch_awc_reports", return_value=(awc, "https://aviationweather.gov/api/data/metar")) as fallback:
+                reports, summary = observer.fetch_current_reports_with_fallback(config, ["ZSPD"])
+        self.assertEqual(fallback.call_args.args[0], ["ZSPD"])
+        self.assertEqual(summary["missing_after_fallback"], [])
+        self.assertEqual(len(summary["checkwx_errors"]), 1)
+        self.assertEqual(reports[0]["_source_kind"], "awc_fallback")
+
     def test_fetch_checkwx_rejects_invalid_response_shape(self) -> None:
         response = FakeHTTPResponse({"results": 1, "data": []})
         with patch.dict("os.environ", {"TREE4_TEST_CHECKWX_KEY": "test-only-key"}, clear=False):
@@ -125,7 +183,7 @@ class MetarObserverTests(unittest.TestCase):
     def test_checkwx_batch_size_above_25_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"stations_per_request": 26, "scan_interval_seconds": 60}), encoding="utf-8")
+            config_path.write_text(json.dumps({"stations_per_request": 26, "scan_interval_seconds": 120}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 
@@ -165,15 +223,34 @@ class MetarObserverTests(unittest.TestCase):
         config = {
             "warmup_retry_seconds": 60,
             "warmup_stations_per_request": 25,
-            "checkwx_api_key_env": "TREE4_TEST_CHECKWX_KEY",
-            "checkwx_previous_limit": 50,
+            "warmup_source": "awc",
+            "awc_stations_per_request": 1,
+            "awc_warmup_history_hours": 30,
         }
         with patch("metar_observer.utc_now", return_value=fixed_now):
-            with patch("metar_observer.fetch_checkwx_reports", return_value=([], "https://checkwx.test/history")) as mocked:
+            with patch("metar_observer.fetch_awc_reports", return_value=([], "https://aviationweather.gov/api/data/metar")) as mocked:
                 observer.warm_up_current_local_days(state=state, config=config, cities={"ZSPD": shanghai, "KLAX": los_angeles})
         self.assertEqual(mocked.call_count, 1)
         self.assertEqual(mocked.call_args.args[0], ["KLAX"])
-        self.assertEqual(mocked.call_args.kwargs["previous_limit"], 50)
+        self.assertEqual(mocked.call_args.args[1], 30.0)
+
+    def test_default_warmup_uses_awc_without_checkwx_previous(self) -> None:
+        city = self.cities["ZSPD"]
+        fixed_now = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+        awc_reports = [{
+            "icao": "ZSPD", "raw_text": "METAR ZSPD 220400Z 00000KT 9999 28/26 Q1005",
+            "observed": "2026-08-22T04:00:00Z", "_source": "AviationWeather.gov Data API",
+            "_source_kind": "awc_fallback", "_source_endpoint": "https://aviationweather.gov/api/data/metar",
+        }]
+        config = {"warmup_retry_seconds": 60, "warmup_stations_per_request": 25, "awc_stations_per_request": 1}
+        with patch("metar_observer.utc_now", return_value=fixed_now):
+            with patch("metar_observer.fetch_checkwx_reports") as checkwx:
+                with patch("metar_observer.fetch_awc_reports", return_value=(awc_reports, "https://aviationweather.gov/api/data/metar")) as awc:
+                    summary = observer.warm_up_current_local_days(state={}, config=config, cities={"ZSPD": city})
+        checkwx.assert_not_called()
+        self.assertEqual(awc.call_args.args[0], ["ZSPD"])
+        self.assertEqual(summary["warmup_source"], "awc")
+        self.assertEqual(summary["complete"], 1)
 
     def test_warmup_fails_closed_when_current_iana_day_has_no_report(self) -> None:
         city = self.cities["ZSPD"]
@@ -195,13 +272,14 @@ class MetarObserverTests(unittest.TestCase):
         self.assertEqual(snapshot["critical_path"], "deterministic_iana_state_machine_only")
         self.assertEqual(snapshot["untrusted_warmup_count"], 1)
 
-    def test_one_minute_scan_interval_is_accepted(self) -> None:
+    def test_two_minute_scan_interval_is_accepted_with_awc_warmup_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 60, "stations": ["ZSPD"]}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 120, "stations": ["ZSPD"]}), encoding="utf-8")
             loaded = observer.load_config(config_path)
-            self.assertEqual(loaded["scan_interval_seconds"], 60)
-            self.assertEqual(loaded["rate_limit_backoff_seconds"], 60)
+            self.assertEqual(loaded["scan_interval_seconds"], 120)
+            self.assertEqual(loaded["rate_limit_backoff_seconds"], 120)
+            self.assertEqual(loaded["warmup_source"], "awc")
             self.assertEqual(loaded["stations_per_request"], 25)
 
     def test_single_instance_lock_is_exclusive(self) -> None:
@@ -217,7 +295,7 @@ class MetarObserverTests(unittest.TestCase):
     def test_checkwx_previous_limit_must_be_supported_range(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 60, "checkwx_previous_limit": 51}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 120, "checkwx_previous_limit": 51}), encoding="utf-8")
             with self.assertRaises(ValueError):
                 observer.load_config(config_path)
 

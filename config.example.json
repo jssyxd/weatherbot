@@ -10,15 +10,18 @@
   "market_ws_enabled": true,
 
   "checkwx_api_key_env": "CHECKWX_API_KEY",
-  "scan_interval_seconds": 60,
-  "rate_limit_backoff_seconds": 60,
+  "scan_interval_seconds": 120,
+  "rate_limit_backoff_seconds": 120,
   "stations_per_request": 25,
   "checkwx_previous_limit": 50,
   "max_report_age_seconds": 900,
   "failure_pause_after_seconds": 1800,
-
-  "warmup_stations_per_request": 25,
   "warmup_retry_seconds": 900,
+  "warmup_stations_per_request": 25,
+  "warmup_source": "awc",
+  "awc_warmup_history_hours": 30,
+  "awc_fallback_history_hours": 2,
+  "awc_stations_per_request": 1,
   "market_rules_max_age_seconds": 1800,
 
   "contract_cities_path": "config/contract_cities.json",
