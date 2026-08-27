@@ -7,6 +7,8 @@
 | 模块 | Tree5 行为 |
 |---|---|
 | TAF 获取 | 每城市 IANA 当地 **01:00** 后调用一次 `GET /v2/taf/{ICAOs}/short`，经 `X-API-Key` 请求头认证；失败按 900 秒间隔重试。没有覆盖当地当日的 `TX` / `TN` 则不产生入场。 |
+| 实时气象主源 | CheckWX `METAR/SPECI short` 每 **120 秒**轮询一次，降低 49 城主源请求频率。只有 CheckWX 请求失败或成功响应中遗漏某站时，才对该站以 AviationWeather.gov 最近 2 小时的已发布 METAR 做灾备补齐；每条报文保留实际来源与端点审计。 |
+| 本地日 warm-up | `auto` 模式优先请求 CheckWX `previous` 历史报文；某城市权限不足、网络失败或缺少其当前 IANA 当日观测时，**仅对该城市**回退 AviationWeather.gov 的 48 小时原始 METAR 历史。两源均无有效已发布观测时，该城保持失败关闭、不得产生候选。 |
 | TAF 解析 | 只解析标准 `TX[ M ]DD/DDHHZ` 与 `TN[ M ]DD/DDHHZ` 温度极值组，按温度实际预报时刻归属当地日期，再转换为合约单位 C/F。不会从普通 TAF 温度段臆测日极值。 |
 | 预测入场 | 选取唯一包含预测值的桶，对 **YES token** 的可执行 `best_ask` 取快照，并向下取整至 `tick_size` 后下浮 **5%**；订单意图为 5 shares、`BUY`、`GTC`。 |
 | 实况证伪 | 每条新的 METAR/SPECI/COR 温度都会检查现有 TAF 入场。高温桶仅在观测温度 `>= bucket.hi`、低温桶仅在观测温度 `< bucket.lo` 时才被证明为不可能。仅“高于 TAF 点预测但仍在同一桶”不会错误止损。 |
@@ -31,7 +33,7 @@ python3 metar_observer.py status
 python3 metar_observer.py run
 ```
 
-`config.example.json` 默认 `tree5_enabled=false` 且 `mode=observe`。先以 `tree5_enabled=true`、`mode=observe` 持续观察至少数周，复核 TAF 的 `issued`、`forecast_time_utc`、本地日归属、盘口快照、计划订单与实际可交易流动性。供应商文档要求 METAR/TAF 至少缓存 15 分钟；因此 60 秒 METAR 扫描主要用于记录报文可用性，不能据此预先假设上游会在观测后秒级更新。[1]
+`config.example.json` 默认 `tree5_enabled=false` 且 `mode=observe`。先以 `tree5_enabled=true`、`mode=observe` 持续观察至少数周，复核 TAF 的 `issued`、`forecast_time_utc`、本地日归属、盘口快照、计划订单与实际可交易流动性。CheckWX 主源扫描周期为 **120 秒**，不能据此预先假设上游会在观测后秒级更新。AviationWeather.gov 的 Data API 支持 METAR 历史查询，但要求请求范围和频率受到控制；本实现只在首次/未完成 warm-up 的按城历史补齐，以及 CheckWX 实时缺报站点时，才发起受限的灾备请求。[1] [5]
 
 ## 持续运行方式
 
@@ -39,7 +41,7 @@ python3 metar_observer.py run
 
 | 方式 | 适合场景 | 取舍 | 成本 | 配置复杂度 |
 |---|---|---|---|---|
-| 托管的持续后台服务 | 希望浏览器关闭后仍每秒处理已触发退出、每分钟扫描 METAR | 省运维，适合目前 49 城与少量活跃退出；需另行配置受管密钥和持仓对账适配器 | 按托管资源用量 | 中等 |
+| 托管的持续后台服务 | 希望浏览器关闭后仍每秒处理已触发退出、每两分钟扫描 METAR | 省运维，适合目前 49 城与少量活跃退出；需另行配置受管密钥和持仓对账适配器 | 按托管资源用量 | 中等 |
 | 自有持续在线 Linux 主机 | 已有稳定的运行主机、需要系统级进程管理和自定义网络控制 | 控制力高，可用系统服务守护；机器、网络、密钥与监控由使用者负责 | 使用现有主机的边际成本 | 较高 |
 
 本仓库不会在默认沙箱中作为持续交易服务运行；这类会话环境可能休眠，不能承诺 5 秒、20 秒的退出时点。
@@ -63,7 +65,7 @@ sudo pip3 install eth-account
 python3 -m unittest discover -s tests -v
 ```
 
-Tree5 专项测试覆盖：当地 01:00 幂等调度、TAF `TX`/`TN` 与 IANA 日期映射、5% 快照入场、同桶内 TAF 突破不退出、桶边界实况证伪、0/5/20/60/120 秒 FAK 追价，以及高温/低温的时间闭合三重条件。完整测试集涵盖 84 项测试且不调用真实 API、不提交订单。
+Tree5 专项测试覆盖：当地 01:00 幂等调度、TAF `TX`/`TN` 与 IANA 日期映射、5% 快照入场、同桶内 TAF 突破不退出、桶边界实况证伪、0/5/20/60/120 秒 FAK 追价，以及高温/低温的时间闭合三重条件。warm-up 测试覆盖 120 秒扫描下限、AviationWeather 原始报文归一化和仅对 CheckWX 缺报城市执行灾备回退。市场元数据刷新采用 3 秒单请求和 30 秒总时限，网络波动时显式标记未完成市场而不阻塞观测循环。当前完整回归集为 87 项；测试不调用真实 API、不提交订单。
 
 ## References
 
@@ -71,3 +73,4 @@ Tree5 专项测试覆盖：当地 01:00 幂等调度、TAF `TX`/`TN` 与 IANA �
 [2]: https://www.checkwxapi.com/documentation/taf "CheckWX TAF API"
 [3]: https://docs.polymarket.com/trading/place-orders "Polymarket Place Orders"
 [4]: https://docs.polymarket.com/trading/manage-orders "Polymarket Manage Orders"
+[5]: https://aviationweather.gov/data/api/ "Aviation Weather Center Data API"

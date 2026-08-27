@@ -9,6 +9,7 @@ import json
 import re
 import urllib.error
 import urllib.request
+import time
 from datetime import date
 from typing import Any
 
@@ -27,10 +28,10 @@ def event_slug(market_city_slug: str, local_date: str, direction: str) -> str:
     return f"{direction_word}-temperature-in-{market_city_slug}-on-{parsed.strftime('%B').lower()}-{parsed.day}-{parsed.year}"
 
 
-def _fetch_json(url: str) -> dict[str, Any]:
+def _fetch_json(url: str, timeout_seconds: float = 5.0) -> dict[str, Any]:
     request = urllib.request.Request(url, headers={"User-Agent": "weatherbot-market-adapter/1.1 (+https://github.com/jssyxd/weatherbot)"})
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -123,23 +124,35 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
     }]
 
 
-def refresh_market_rules(cities: dict[str, dict[str, Any]], local_dates: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, str]]:
+def refresh_market_rules(cities: dict[str, dict[str, Any]], local_dates: dict[str, str], timeout_seconds: float = 5.0, total_deadline_seconds: float = 60.0) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Fetch public Gamma metadata under strict per-request and total deadlines.
+
+    A failed remote market-data endpoint must not prevent weather observation or
+    warm-up progress. Remaining city/direction pairs are explicitly marked as
+    deadline failures so callers remain fail-closed instead of treating partial
+    market rules as complete.
+    """
     rules: list[dict[str, Any]] = []
     failures: dict[str, str] = {}
+    started = time.monotonic()
     for city in cities.values():
         local_date = local_dates[city["icao"]]
         for direction in ("high", "low"):
+            key = f"{city['city_id']}|{local_date}|{direction}"
+            if time.monotonic() - started >= total_deadline_seconds:
+                failures[key] = "market_discovery_deadline_exceeded"
+                continue
             slug = event_slug(str(city.get("market_city_slug") or city["city_id"]), local_date, direction)
             try:
-                event = _fetch_json(GAMMA_EVENT_ENDPOINT + slug)
+                event = _fetch_json(GAMMA_EVENT_ENDPOINT + slug, timeout_seconds=timeout_seconds)
                 if not event:
-                    failures[f"{city['city_id']}|{local_date}|{direction}"] = "event_not_found"
+                    failures[key] = "event_not_found"
                     continue
                 parsed = parse_event_rules(event, city, local_date, direction)
                 if not parsed:
-                    failures[f"{city['city_id']}|{local_date}|{direction}"] = "no_trade_ready_parsed_rules"
+                    failures[key] = "no_trade_ready_parsed_rules"
                     continue
                 rules.extend(parsed)
             except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                failures[f"{city['city_id']}|{local_date}|{direction}"] = f"market_discovery_failed:{type(exc).__name__}"
+                failures[key] = f"market_discovery_failed:{type(exc).__name__}"
     return rules, failures

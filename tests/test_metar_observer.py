@@ -102,6 +102,58 @@ class MetarObserverTests(unittest.TestCase):
                     observer.fetch_checkwx_reports(["ZSPD"], "TREE4_TEST_CHECKWX_KEY")
         self.assertEqual(raised.exception.retry_after_seconds, 120)
 
+    def test_aviationweather_history_normalizes_raw_observation(self) -> None:
+        response = FakeHTTPResponse([
+            {"icaoId": "ZSPD", "rawOb": "METAR ZSPD 221200Z 00000KT 9999 28/24 Q1005", "obsTime": "2026-08-22T12:00:00Z"}
+        ])
+        with patch("aviationweather_warmup.urllib.request.urlopen", return_value=response) as mocked:
+            from aviationweather_warmup import fetch_aviationweather_history
+            records, endpoint = fetch_aviationweather_history(["ZSPD"], hours=48)
+        self.assertEqual(records[0]["icao"], "ZSPD")
+        self.assertTrue(records[0]["raw_text"].startswith("METAR ZSPD"))
+        self.assertEqual(records[0]["observed"], "2026-08-22T12:00:00Z")
+        self.assertIn("hours=48", endpoint)
+        self.assertEqual(mocked.call_args.args[0].get_header("User-agent"), "weatherbot-tree5/5.1 (warmup; contact=repository-issues)")
+
+    def test_warmup_auto_falls_back_only_for_checkwx_missing_city(self) -> None:
+        shanghai = self.cities["ZSPD"]
+        los_angeles = self.cities["KLAX"]
+        fixed_now = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+        config = {
+            "warmup_retry_seconds": 60, "warmup_stations_per_request": 25, "checkwx_api_key_env": "TREE4_TEST_CHECKWX_KEY",
+            "checkwx_previous_limit": 50, "warmup_source": "auto", "aviationweather_warmup_hours": 48,
+            "aviationweather_warmup_stations_per_request": 8,
+        }
+        primary = [{"icao": "ZSPD", "raw_text": "METAR ZSPD 220400Z 00000KT 9999 28/24 Q1005", "observed": "2026-08-22T04:00:00Z"}]
+        fallback = [{"icao": "KLAX", "raw_text": "METAR KLAX 221100Z 00000KT 10SM 20/12 A2992", "observed": "2026-08-22T11:00:00Z"}]
+        state: dict = {}
+        with patch("metar_observer.utc_now", return_value=fixed_now):
+            with patch("metar_observer.fetch_checkwx_reports", return_value=(primary, "https://checkwx.test/previous")) as primary_mock:
+                with patch("metar_observer.fetch_aviationweather_history", return_value=(fallback, "https://aviationweather.test/history")) as fallback_mock:
+                    summary = observer.warm_up_current_local_days(config, state, {"ZSPD": shanghai, "KLAX": los_angeles})
+        self.assertEqual(summary["complete"], 2)
+        self.assertEqual(summary["fallback_city_count"], 1)
+        self.assertEqual(primary_mock.call_count, 1)
+        self.assertEqual(fallback_mock.call_args.args[0], ["KLAX"])
+        self.assertEqual(state["daily_warmup"]["shanghai|2026-08-22"]["warmup_source"], "checkwx_previous")
+        self.assertEqual(state["daily_warmup"]["los-angeles|2026-08-22"]["warmup_source"], "aviationweather")
+
+    def test_realtime_fallback_only_requests_checkwx_missing_city(self) -> None:
+        config = {
+            "stations_per_request": 25, "checkwx_api_key_env": "TREE4_TEST_CHECKWX_KEY",
+            "aviationweather_realtime_fallback_enabled": True, "aviationweather_realtime_fallback_hours": 2,
+            "aviationweather_realtime_fallback_stations_per_request": 8,
+        }
+        primary = [{"icao": "ZSPD", "raw_text": "METAR ZSPD 221200Z 00000KT 9999 28/24 Q1005", "observed": "2026-08-22T12:00:00Z"}]
+        fallback = [{"icao": "KLAX", "raw_text": "METAR KLAX 221200Z 00000KT 10SM 20/12 A2992", "observed": "2026-08-22T12:00:00Z"}]
+        with patch("metar_observer.fetch_checkwx_reports", return_value=(primary, "https://checkwx.test/short")):
+            with patch("metar_observer.fetch_aviationweather_history", return_value=(fallback, "https://aviationweather.test/realtime")) as fallback_mock:
+                result = observer.fetch_realtime_weather_reports(config, ["ZSPD", "KLAX"])
+        self.assertEqual(result["fallback_icaos"], ["KLAX"])
+        self.assertEqual(result["fallback_success_icaos"], ["KLAX"])
+        self.assertEqual(fallback_mock.call_args.args[0], ["KLAX"])
+        self.assertEqual({item["source"] for item in result["reports"]}, {"CheckWX Aviation Weather API v2", "AviationWeather.gov Data API (CheckWX fallback)"})
+
     def test_checkwx_key_must_exist_in_environment(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "未设置 CheckWX API 密钥环境变量"):
             observer.fetch_checkwx_reports(["ZSPD"], "TREE4_MISSING_CHECKWX_API_KEY")
@@ -167,6 +219,7 @@ class MetarObserverTests(unittest.TestCase):
             "warmup_stations_per_request": 25,
             "checkwx_api_key_env": "TREE4_TEST_CHECKWX_KEY",
             "checkwx_previous_limit": 50,
+            "warmup_source": "checkwx",
         }
         with patch("metar_observer.utc_now", return_value=fixed_now):
             with patch("metar_observer.fetch_checkwx_reports", return_value=([], "https://checkwx.test/history")) as mocked:
@@ -195,13 +248,13 @@ class MetarObserverTests(unittest.TestCase):
         self.assertEqual(snapshot["critical_path"], "deterministic_iana_state_machine_only")
         self.assertEqual(snapshot["untrusted_warmup_count"], 1)
 
-    def test_one_minute_scan_interval_is_accepted(self) -> None:
+    def test_two_minute_scan_interval_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
-            config_path.write_text(json.dumps({"scan_interval_seconds": 60, "stations": ["ZSPD"]}), encoding="utf-8")
+            config_path.write_text(json.dumps({"scan_interval_seconds": 120, "stations": ["ZSPD"]}), encoding="utf-8")
             loaded = observer.load_config(config_path)
-            self.assertEqual(loaded["scan_interval_seconds"], 60)
-            self.assertEqual(loaded["rate_limit_backoff_seconds"], 60)
+            self.assertEqual(loaded["scan_interval_seconds"], 120)
+            self.assertEqual(loaded["rate_limit_backoff_seconds"], 120)
             self.assertEqual(loaded["stations_per_request"], 25)
 
     def test_single_instance_lock_is_exclusive(self) -> None:
