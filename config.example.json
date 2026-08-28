@@ -3,12 +3,11 @@
   "execution_engine": "legacy",
   "execution_order_type": "FAK",
   "target_order_shares": "5",
-  "min_execution_price": "0.05",
+  "min_execution_price": "0.40",
   "max_execution_price": "0.98",
   "max_slippage": "0.10",
   "local_book_max_age_seconds": 3,
-  "market_ws_enabled": false,
-
+  "market_ws_enabled": true,
   "checkwx_api_key_env": "CHECKWX_API_KEY",
   "scan_interval_seconds": 120,
   "rate_limit_backoff_seconds": 120,
@@ -23,7 +22,6 @@
   "awc_fallback_history_hours": 2,
   "awc_stations_per_request": 1,
   "market_rules_max_age_seconds": 1800,
-
   "contract_cities_path": "config/contract_cities.json",
   "market_rules_path": "data/market_rules.json",
   "state_path": "data/state.json",
