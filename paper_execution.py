@@ -16,8 +16,8 @@ from typing import Any
 
 CLOB_BOOK_ENDPOINT = "https://clob.polymarket.com/book"
 CLOB_FEE_RATE_ENDPOINT = "https://clob.polymarket.com/fee-rate"
-MIN_PRICE_EXCLUSIVE = Decimal("0.05")
-MAX_PRICE_EXCLUSIVE = Decimal("0.95")
+MIN_PRICE_INCLUSIVE = Decimal("0.40")
+MAX_PRICE_INCLUSIVE = Decimal("0.98")
 # Per-user spec: every paper order is a FIXED quantity of 5 shares (the
 # exchange minimum order size). No USDC-tier sizing: a $1-$3 intent often
 # cannot reach min_order_size=5 at ask >= 0.20, so those orders were being
@@ -75,10 +75,10 @@ def _floor_size(value: Decimal) -> Decimal:
 def _strict_price_cap(tick_size: Decimal) -> Decimal:
     if tick_size <= 0:
         raise RuntimeError("CLOB tick_size 必须大于零")
-    quotient = (MAX_PRICE_EXCLUSIVE / tick_size).to_integral_value(rounding=ROUND_DOWN)
-    cap = (quotient - 1) * tick_size if quotient * tick_size == MAX_PRICE_EXCLUSIVE else quotient * tick_size
-    if cap <= MIN_PRICE_EXCLUSIVE:
-        raise RuntimeError("CLOB tick_size 无法构造严格小于 0.95 的可交易价格")
+    quotient = (MAX_PRICE_INCLUSIVE / tick_size).to_integral_value(rounding=ROUND_DOWN)
+    cap = quotient * tick_size
+    if cap <= MIN_PRICE_INCLUSIVE:
+        raise RuntimeError("CLOB tick_size 无法构造不超过 0.98 的可交易价格")
     return cap
 
 
@@ -122,10 +122,10 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
         if not levels:
             return _rejected("paper_fill_rejected_invalid_book", "订单簿 ask 档位不可解析。", book_endpoint=book_endpoint, fee_endpoint=fee_endpoint)
         best_ask = levels[0]["price"]
-        if not MIN_PRICE_EXCLUSIVE < best_ask < MAX_PRICE_EXCLUSIVE:
+        if not MIN_PRICE_INCLUSIVE <= best_ask <= MAX_PRICE_INCLUSIVE:
             return _rejected(
                 "paper_fill_rejected_best_ask_outside_gate",
-                "最优 ask 不在严格价格门槛 (0.05, 0.95) 内。",
+                "最优 ask 不在包含端点的价格门槛 [0.40, 0.98] 内。",
                 best_ask=float(best_ask), book_endpoint=book_endpoint, fee_endpoint=fee_endpoint,
             )
         remaining_city_budget = CITY_DAY_MAX_TOTAL_DEBIT - already_spent
@@ -145,7 +145,7 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
             price, size = level["price"], level["size"]
             if price > price_cap:
                 break
-            if not MIN_PRICE_EXCLUSIVE < price < MAX_PRICE_EXCLUSIVE or size <= 0:
+            if not MIN_PRICE_INCLUSIVE <= price <= MAX_PRICE_INCLUSIVE or size <= 0:
                 continue
             per_share_fee = fee_rate * price * (Decimal("1") - price)
             per_share_total = price + per_share_fee
@@ -185,7 +185,7 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
             "order_type": "FAK", "side": "BUY_NO", "no_token_id": no_token_id,
             "book_endpoint": book_endpoint, "fee_endpoint": fee_endpoint, "book_timestamp": book.get("timestamp"),
             "book_hash": book.get("hash"), "tick_size": float(tick_size), "min_order_size": float(min_order_size),
-            "base_fee_bps": float(_decimal(fee["base_fee"], "base_fee")), "price_cap_exclusive": float(MAX_PRICE_EXCLUSIVE),
+            "base_fee_bps": float(_decimal(fee["base_fee"], "base_fee")), "price_cap_inclusive": float(MAX_PRICE_INCLUSIVE),
             "effective_fak_limit_price": float(price_cap), "target_shares": float(target_shares),
             "principal_usdc": float(principal), "estimated_fee_usdc": float(fees), "total_debit_usdc": float(total_debit),
             "average_price": float(principal / filled_shares), "estimated_shares": float(filled_shares),
