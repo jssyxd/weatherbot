@@ -1,9 +1,9 @@
 {
-  "mode": "observe",
-  "execution_engine": "tree3",
+  "mode": "paper",
+  "execution_engine": "legacy",
   "execution_order_type": "FAK",
   "target_order_shares": "5",
-  "min_execution_price": "0.05",
+  "min_execution_price": "0.40",
   "max_execution_price": "0.98",
   "max_slippage": "0.10",
   "local_book_max_age_seconds": 3,
