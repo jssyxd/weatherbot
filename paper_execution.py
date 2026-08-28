@@ -16,7 +16,7 @@ from typing import Any
 
 CLOB_BOOK_ENDPOINT = "https://clob.polymarket.com/book"
 CLOB_FEE_RATE_ENDPOINT = "https://clob.polymarket.com/fee-rate"
-MIN_PRICE_INCLUSIVE = Decimal("0.05")
+MIN_PRICE_INCLUSIVE = Decimal("0.40")
 MAX_PRICE_INCLUSIVE = Decimal("0.98")
 # Per-user spec: every paper order is a FIXED quantity of 5 shares (the
 # exchange minimum order size). No USDC-tier sizing: a $1-$3 intent often
@@ -125,7 +125,7 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
         if not MIN_PRICE_INCLUSIVE <= best_ask <= MAX_PRICE_INCLUSIVE:
             return _rejected(
                 "paper_fill_rejected_best_ask_outside_gate",
-                "最优 ask 不在包含端点的价格门槛 [0.05, 0.98] 内。",
+                "最优 ask 不在包含端点的价格门槛 [0.40, 0.98] 内。",
                 best_ask=float(best_ask), book_endpoint=book_endpoint, fee_endpoint=fee_endpoint,
             )
         remaining_city_budget = CITY_DAY_MAX_TOTAL_DEBIT - already_spent
