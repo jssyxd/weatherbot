@@ -1,6 +1,6 @@
 {
-  "mode": "observe",
-  "execution_engine": "tree2",
+  "mode": "paper",
+  "execution_engine": "legacy",
   "scan_interval_seconds": 120,
   "history_hours": 2,
   "stations_per_request": 49,
@@ -16,5 +16,12 @@
   "event_dir": "data/observations",
   "signal_dir": "data/signals",
   "health_path": "data/health.json",
-  "audit_db_path": "data/audit.sqlite3"
+  "audit_db_path": "data/audit.sqlite3",
+  "min_execution_price": "0.40",
+  "max_execution_price": "0.98",
+  "market_ws_enabled": true,
+  "local_book_max_age_seconds": 3,
+  "execution_order_type": "FAK",
+  "target_order_shares": "5",
+  "max_slippage": "0.10"
 }
