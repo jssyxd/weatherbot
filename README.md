@@ -13,7 +13,17 @@
 | 时间口径 | 用各已发布报告的 `observed` UTC 归属机场 IANA 当地自然日；`fetched_at` 仅用于 `observed` 至本地抓取的绝对新鲜度门。 |
 | 批量与扫描 | CheckWX 每次最多 25 个 ICAO；按 tree4 的运行要求默认每 120 秒全量扫描。CheckWX 文档仍建议缓存 METAR/TAF 至少 15 分钟，因此需通过运行日志持续监控 429 与实际首见收益。[1] |
 | 暖机 | 启动/当地日切换时默认以 AWC `hours=30` 重新构建当天极值；若 AWC 不可达、响应无效或当前当地日数据不足，则保持失败关闭，不产生候选。 |
+| 纸面执行默认 | `mode=paper` 且 `execution_engine=legacy`：候选信号走 `simulate_paper_fak` 纸面成交估算，**不**要求本地 WebSocket 盘口。 |
 | 非目标数据 | 不使用 TAF、ECMWF、任何预测输入、Station、BOT、G-AIRMET 或 URL 查询参数密钥模式。 |
+
+## Changelog
+
+### grok20260828
+
+- **执行引擎默认改为可纸面成交**：`config.example.json` 中 `execution_engine` 由 `tree3` 改为 `legacy`，`mode` 由 `observe` 改为 `paper`，`market_ws_enabled` 改为 `false`。
+- **原因**：`tree3` 在主循环未附着本地 WebSocket 盘口时固定返回 `LOCAL_BOOK_PATH_NOT_ATTACHED`，候选无法产生纸面成交估算；`legacy` 使用既有 `simulate_paper_fak`，在暖机完成且 `market_rules` 新鲜时即可写出纸面执行结果。
+- **可选**：若已挂好本地盘口并需要 tree3 深度/盘口路径，可在本地 `config.json` 将 `execution_engine` 改回 `tree3` 并设置 `market_ws_enabled=true`。
+- **未改动**：CheckWX/AWC 数据路径、暖机失败关闭、`market_rules_stale` 拦截、`live` 无真实下单边界均保持原样。
 
 ## 安装与安全配置
 
@@ -31,6 +41,8 @@ python3 metar_observer.py run
 
 | 配置项 | 默认值 | 含义 |
 |---|---:|---|
+| `mode` | `paper` | 运行模式：`observe` / `paper` / `live`（`live` 仅审计阻断，不下单）。 |
+| `execution_engine` | `legacy` | 纸面执行引擎：`legacy`（默认，FAK 纸面估算）/ `tree2` / `tree3`（需本地 WebSocket 盘口，否则 `LOCAL_BOOK_PATH_NOT_ATTACHED`）。 |
 | `checkwx_api_key_env` | `CHECKWX_API_KEY` | 保存密钥的环境变量名，而非密钥本身。 |
 | `scan_interval_seconds` | `120` | CheckWX METAR 全量轮询间隔；不得低于 60 秒。 |
 | `rate_limit_backoff_seconds` | `120` | 收到 CheckWX HTTP 429 后的最小退避时间；若服务端提供更长 `Retry-After`，优先采用更长值。 |
@@ -67,7 +79,7 @@ python3 -m unittest discover -s tests -v
 
 ## tree3 保留边界
 
-tree3 的本地 WebSocket 盘口、完整 ask 深度、固定 5 shares FAK 纸面估算、审计账本、价格保护与 `live` 阻断仍保持原状。tree4 只替换了航空实况供应商与与之绑定的配置、标准化、暖机、审计字段和测试；它不将 `midpoint`、成交价或 bid 误作可买入的 NO ask，也不新增任何真实执行路径。
+`execution_engine=tree3` 时仍要求本地 WebSocket 盘口；主循环未附着真实行情时 fail-closed（`LOCAL_BOOK_PATH_NOT_ATTACHED`）。tree3 的完整 ask 深度、固定 5 shares FAK 纸面估算、审计账本、价格保护与 `live` 阻断能力仍保留在代码中，可在本地配置中显式启用。tree4 默认使用 `legacy` 纸面路径，只替换了航空实况供应商与与之绑定的配置、标准化、暖机、审计字段和测试；它不将 `midpoint`、成交价或 bid 误作可买入的 NO ask，也不新增任何真实执行路径。
 
 ## References
 

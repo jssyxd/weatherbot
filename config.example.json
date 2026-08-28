@@ -1,13 +1,13 @@
 {
-  "mode": "observe",
-  "execution_engine": "tree3",
+  "mode": "paper",
+  "execution_engine": "legacy",
   "execution_order_type": "FAK",
   "target_order_shares": "5",
   "min_execution_price": "0.05",
   "max_execution_price": "0.98",
   "max_slippage": "0.10",
   "local_book_max_age_seconds": 3,
-  "market_ws_enabled": true,
+  "market_ws_enabled": false,
 
   "checkwx_api_key_env": "CHECKWX_API_KEY",
   "scan_interval_seconds": 120,
