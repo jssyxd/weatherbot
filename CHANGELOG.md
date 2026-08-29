@@ -6,6 +6,8 @@
 
 | 类别 | 改动 | 状态与验证要求 |
 |---|---|---|
+| 订单执行重构 | 新增 `execution/` 包：`order_intent.py`（OrderIntent + OrderStatus + Fill）、`risk_gate.py`（独立风控）、`paper_executor.py`（`match_l2` 按真实 L2 深度逐档撮合，partial fill + FAK 剩余取消显式 + 深度加权均价）。tree12 的 `tree12_paper_fill` 改为走 `match_l2`，不再“按 best_ask 单档整单假成交”。 | 新增 `tests/test_execution_paper.py`（full/partial/zero/FOK/avg-price + risk gate）；本地重跑验证：新代码 35 笔成交、已用 160.92/1000 USDC，旧假成交已被替换。 |
+| 审计 | 3 名独立 `omp` 审计员（herdr 组织）+ 主审计报告：`docs/audit-a-order-execution.md`、`docs/audit-b-websocket-orderbook.md`、`docs/audit-c-risk-state-consistency.md`，PRD 见 `docs/PRD.md`。 | 一致结论：tree12 纸面成交原先不可信、WS 层未接线、无统一 OrderIntent/RiskGate/PnL。 |
 | 策略 | 新增 `tree12_allno_strategy.py`：49 城、high/low 双向、目标 5 股 NO 布局；入场时间窗 `> 当地 00:00 − 24h`、TAF 规避、非共识前 2、`0.85 ≤ best_ask ≤ 0.95`（含端点）；hybrid 限价与 SELL NO FAK 出场阶梯。 | 默认 paper / observe-only；真实成交需外部持仓对账。 |
 | 入场价格带 | `best_ask` 门槛由 `> 0.85` 改为 `[0.85, 0.95]` 闭区间；`hybrid_limit_price` 保护在同一区间内。 | 新增 `test_ask_range_inclusive_085_to_095`、`test_ask_above_095_blocked`；买入盈亏比不再被 >0.95 的薄利 NO 稀释。 |
 | TAF 独立 | tree12 拥有自己的 `state.tree12.taf_fetches` / `taf_forecasts`，本地实现 `TAF_EXTREME_RE`、`parse_taf_extremes_for_local_day`、`due_tree12_taf_cities`、`record_tree12_taf_reports`；`tree12_allno_strategy.py` 不再 import `tree5_strategy`。 | 新增 `tests/test_tree12_allno_strategy.py` 中 `test_tree12_taf_is_self_contained`、`test_taf_parse_maps_local_day`。 |
