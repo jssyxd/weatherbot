@@ -410,9 +410,12 @@ def refresh_market_rules_if_due(state: dict[str, Any], config: dict[str, Any], c
         state["market_rules"] = rules
         state["market_failures"] = failures
         state["market_rules_refreshed_at_utc"] = iso_now()
+        state["last_market_refresh_error"] = None
+        state["last_market_refresh_failed_at"] = None
         return {"market_rules": len(rules), "market_failures": len(failures)}
     except Exception as exc:
         state["last_market_refresh_error"] = f"{type(exc).__name__}: {exc}"
+        state["last_market_refresh_failed_at"] = iso_now()
         return {"market_refresh_error": state["last_market_refresh_error"]}
 
 

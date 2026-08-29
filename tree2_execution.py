@@ -13,7 +13,7 @@ from typing import Any, Iterable
 from clob_market_data import CLOBDataError, CLOBMarketData, BookSnapshot
 from execution_policy import decide_buy_no
 
-TARGET_ORDER_SHARES = Decimal("5")
+TARGET_ORDER_SHARES = Decimal("1")
 CITY_DAY_MAX_TOTAL_DEBIT = Decimal("20.00")
 MIN_PRICE_EXCLUSIVE = Decimal("0.05")
 MAX_PRICE_EXCLUSIVE = Decimal("0.95")
@@ -58,7 +58,7 @@ def _price_quantum(tick_size: Decimal | None) -> Decimal:
     return tick_size
 
 
-def build_fixed_five_fak(
+def build_fak_intent(
     snapshot: BookSnapshot,
     fee_payload: dict[str, Any],
     *,
@@ -143,8 +143,8 @@ def simulate(signal: dict[str, Any], state: dict[str, Any], market_data: CLOBMar
     if remaining <= 0:
         return {**result, "status": "paper_fill_rejected_city_day_cap", "decision_code": "CITY_DAY_CAP"}
 
-    intent = build_fixed_five_fak(snapshot, fee_payload)
-    if intent.executable_shares < min_order_size:
+    intent = build_fak_intent(snapshot, fee_payload)
+    if intent.executable_shares < Decimal("1"):
         return {**result, "status": "paper_fill_rejected_below_min_order_size", "intent": intent.as_dict()}
     total = intent.principal_usdc + intent.estimated_fee_usdc
     if total > remaining:
