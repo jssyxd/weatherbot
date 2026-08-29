@@ -189,10 +189,13 @@ def load_config(config_path: Path) -> dict[str, Any]:
     if order_type not in {"FAK", "FOK"}:
         raise ValueError("execution_order_type 只能为 FAK 或 FOK")
     target_order_shares = str(config.get("target_order_shares", "5"))
-    if target_order_shares != "5":
-        raise ValueError("当前 tree3 只允许固定 5 shares")
-    min_execution_price = float(config.get("min_execution_price", 0.05))
-    max_execution_price = float(config.get("max_execution_price", 0.98))
+    try:
+        if float(target_order_shares) < 1:
+            raise ValueError("target_order_shares 必须 >= 1")
+    except (TypeError, ValueError) as e:
+        raise ValueError("target_order_shares 必须是 >=1 的数字") from e
+    min_execution_price = float(config.get("min_execution_price", 0.40))
+    max_execution_price = float(config.get("max_execution_price", 0.99))
     max_slippage = float(config.get("max_slippage", 0.10))
     if not 0 <= min_execution_price <= max_execution_price <= 1:
         raise ValueError("执行价格门必须满足 0 <= min <= max <= 1")
