@@ -4,7 +4,7 @@
   "execution_order_type": "FAK",
   "target_order_shares": "5",
   "min_execution_price": "0.40",
-  "max_execution_price": "0.98",
+  "max_execution_price": "0.99",
   "max_slippage": "0.10",
   "local_book_max_age_seconds": 3,
   "market_ws_enabled": true,
@@ -26,12 +26,24 @@
   "market_rules_max_age_seconds": 1800,
   "market_metadata_timeout_seconds": 3,
   "market_refresh_deadline_seconds": 30,
-  "tree5_enabled": false,
+  "tree5_enabled": true,
   "tree5_taf_fetch_local_hour": 1,
   "tree5_taf_retry_seconds": 900,
   "tree5_entry_price_discount": 0.05,
-  "tree5_exit_retry_seconds": [0, 5, 20, 60, 120],
-  "tree5_exit_slippage": [0.10, 0.20, 0.35, 0.60, 0.90],
+  "tree5_exit_retry_seconds": [
+    0,
+    5,
+    20,
+    60,
+    120
+  ],
+  "tree5_exit_slippage": [
+    0.1,
+    0.2,
+    0.35,
+    0.6,
+    0.9
+  ],
   "tree5_exit_min_price": 0.01,
   "tree5_closure_check_seconds": 60,
   "tree5_high_closure_start_hour": 13,
@@ -40,7 +52,7 @@
   "tree5_low_closure_end_hour": 5,
   "tree5_closure_shortfall_native": 1.0,
   "tree5_closure_trend_move_native": 0.5,
-  "tree5_closure_price_decline": 0.20,
+  "tree5_closure_price_decline": 0.2,
   "contract_cities_path": "config/contract_cities.json",
   "market_rules_path": "data/market_rules.json",
   "state_path": "data/state.json",
@@ -48,5 +60,6 @@
   "signal_dir": "data/signals",
   "tree5_action_dir": "data/tree5_actions",
   "health_path": "data/health.json",
-  "audit_db_path": "data/audit.sqlite3"
+  "audit_db_path": "data/audit.sqlite3",
+  "tree12_enabled": true
 }

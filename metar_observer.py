@@ -40,6 +40,11 @@ from tree2_execution import simulate as simulate_tree2
 from clob_market_data import CLOBDataError, CLOBMarketData
 from audit_store import AuditStore
 from aviationweather_warmup import AWC_MAX_ICAOS_PER_REQUEST, AviationWeatherError, fetch_aviationweather_history
+from tree12_allno_strategy import (
+    collect_tree12_book_token_ids,
+    ensure_tree12_state,
+    run_tree12_cycle,
+)
 from tree5_strategy import (
     due_exit_token_ids,
     due_taf_cities,
@@ -257,6 +262,11 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "local_book_max_age_seconds": local_book_max_age,
         "market_ws_enabled": bool(config.get("market_ws_enabled", False)),
         "tree5_enabled": bool(config.get("tree5_enabled", False)),
+        "tree12_enabled": bool(config.get("tree12_enabled", False)),
+        "tree12_action_dir": BASE_DIR / str(config.get("tree12_action_dir", "data/tree12_actions")),
+        "tree12_exit_retry_seconds": tuple(int(v) for v in config.get("tree12_exit_retry_seconds", (0, 5, 20, 60, 120))),
+        "tree12_exit_slippage": tuple(float(v) for v in config.get("tree12_exit_slippage", (0.10, 0.20, 0.35, 0.60, 0.90))),
+        "tree12_exit_min_price": float(config.get("tree12_exit_min_price", 0.01)),
         "tree5_taf_fetch_local_hour": tree5_taf_hour,
         "tree5_taf_retry_seconds": int(config.get("tree5_taf_retry_seconds", 900)),
         "tree5_entry_price_discount": tree5_entry_discount,
@@ -498,6 +508,29 @@ def append_tree5_actions(config: dict[str, Any], actions: list[dict[str, Any]]) 
     finally:
         audit_store.close()
     return path
+
+
+
+def append_tree12_actions(config: dict[str, Any], actions: list[dict[str, Any]]) -> Path | None:
+    """Persist tree12 intents to jsonl + audit sqlite (observe-only)."""
+    if not actions:
+        return None
+    path = append_jsonl(config["tree12_action_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", actions)
+    audit_store = AuditStore(config["audit_db_path"])
+    try:
+        for action in actions:
+            audit_store.append(
+                created_at_utc=iso_now(),
+                event_type=str(action.get("action_type") or "tree12_action"),
+                correlation_id=str(action.get("key") or action.get("token_id") or ""),
+                mode=str(config.get("mode") or "paper"),
+                token_id=str(action.get("token_id") or "") or None,
+                payload=action,
+            )
+    finally:
+        audit_store.close()
+    return path
+
 
 
 def report_key(report: dict[str, Any]) -> str:
@@ -892,6 +925,51 @@ def tree5_maintenance_once(config: dict[str, Any]) -> dict[str, Any]:
     return {"enabled": True, "actions": len(actions), "action_file": str(action_file) if action_file else None}
 
 
+
+def process_tree12_cycle(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], market_rules: list[dict[str, Any]], now: datetime, observations_by_city: dict[str, float] | None = None) -> list[dict[str, Any]]:
+    """Plan tree12 NO entries/exits after METAR batch; paper intents only."""
+    if not config.get("tree12_enabled", False):
+        return []
+    ensure_tree12_state(state)
+    # Ensure TAF cache is warm when tree5 TAF path is also enabled
+    tokens = collect_tree12_book_token_ids(state, market_rules, cities, now)
+    books, book_error = fetch_tree5_books(tokens)
+    actions: list[dict[str, Any]] = []
+    if book_error:
+        actions.append({"action_type": "tree12_book_fetch", "status": "failed_fetch", "token_count": len(tokens), "error": book_error})
+    actions.extend(
+        run_tree12_cycle(
+            state,
+            cities,
+            market_rules,
+            books,
+            now,
+            config,
+            observations_by_city=observations_by_city,
+        )
+    )
+    return actions
+
+
+def tree12_maintenance_once(config: dict[str, Any]) -> dict[str, Any]:
+    """Short-cadence FAK exit ladder for tree12 (independent of METAR poll)."""
+    if not config.get("tree12_enabled", False):
+        return {"enabled": False, "actions": 0}
+    from tree12_allno_strategy import due_tree12_exit_token_ids, plan_tree12_due_exit_faks
+    now = utc_now()
+    state = load_state(config["state_path"])
+    ensure_tree12_state(state)
+    tokens = due_tree12_exit_token_ids(state, now)
+    books, book_error = fetch_tree5_books(tokens)
+    actions: list[dict[str, Any]] = []
+    if book_error:
+        actions.append({"action_type": "tree12_book_fetch", "status": "failed_fetch", "token_count": len(tokens), "error": book_error})
+    actions.extend(plan_tree12_due_exit_faks(state, books, now, config))
+    atomic_json_write(config["state_path"], state)
+    action_file = append_tree12_actions(config, actions)
+    return {"enabled": True, "actions": len(actions), "action_file": str(action_file) if action_file else None}
+
+
 def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     fetched_at = iso_now()
     state = load_state(config["state_path"])
@@ -972,6 +1050,18 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
         if exit_book_error:
             tree5_actions.append({"action_type": "tree5_book_fetch", "status": "failed_fetch", "token_count": len(exit_tokens), "error": exit_book_error})
         tree5_actions.extend(plan_due_exit_faks(state, exit_books, scan_time, config))
+    # tree12-allno: early NO layout + METAR/TAF exits (paper intents)
+    observations_by_city: dict[str, float] = {}
+    for event in new_events:
+        city = cities.get(event.get("airport_icao") or "")
+        if not city:
+            continue
+        native_temperature = observed_temperature_native(event, city)
+        if native_temperature is None:
+            continue
+        observed_native, _precision = native_temperature
+        observations_by_city[city["city_id"]] = float(observed_native)
+    tree12_actions = process_tree12_cycle(config, state, cities, market_rules, scan_time, observations_by_city)
     # Refresh market rules only after this round's time-sensitive observations.
     refresh_summary = refresh_market_rules_if_due(state, config, cities)
     state["last_successful_scan_utc"] = iso_now()
@@ -981,6 +1071,7 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     event_file = append_jsonl(config["event_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", new_events)
     signal_file = append_jsonl(config["signal_dir"] / f"{utc_now().strftime('%Y-%m-%d')}.jsonl", signals)
     tree5_action_file = append_tree5_actions(config, tree5_actions)
+    tree12_action_file = append_tree12_actions(config, tree12_actions)
     audit_store = AuditStore(config["audit_db_path"])
     try:
         for signal in signals:
@@ -1073,6 +1164,7 @@ def run_loop(config: dict[str, Any]) -> None:
                 next_scan_epoch = time.time() + interval
             elif config.get("tree5_enabled", False):
                 tree5_maintenance_once(config)
+                tree12_maintenance_once(config)
             time.sleep(min(1.0, max(0.05, next_scan_epoch - time.time())))
         except KeyboardInterrupt:
             print("\n扫描器已停止。")
