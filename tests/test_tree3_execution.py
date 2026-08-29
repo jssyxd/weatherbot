@@ -21,10 +21,10 @@ class Tree3ExecutionTests(unittest.TestCase):
 
     def test_local_fak_uses_ws_snapshot_and_wide_cap(self) -> None:
         local = self.stream.snapshot("no-1", max_age_seconds=3, now=100.0)
-        result = simulate_local_fak(self.signal, local, {"base_fee": 0}, max_price=Decimal("0.98"), now=100.0)
+        result = simulate_local_fak(self.signal, local, {"base_fee": 0}, max_price=Decimal("0.99"), now=100.0)
         self.assertEqual(result["status"], "paper_fill_estimate")
         self.assertEqual(result["execution_source"], "websocket_local")
-        self.assertEqual(Decimal(result["intent"]["executable_shares"]), Decimal("5"))
+        self.assertEqual(Decimal(result["intent"]["executable_shares"]), Decimal("1"))
 
     def test_fok_rejects_partial_depth(self) -> None:
         self.stream.handle_message({"type": "book", "payload": {
@@ -33,19 +33,19 @@ class Tree3ExecutionTests(unittest.TestCase):
             "asks": [{"price": "0.96", "size": "4.99"}], "bids": []
         }})
         local = self.stream.snapshot("no-1", max_age_seconds=3, now=100.0)
-        result = build_execution_intent(self.signal, local, {"base_fee": 0}, order_type="FOK", max_price=Decimal("0.98"))
+        result = build_execution_intent(self.signal, local, {"base_fee": 0}, order_type="FOK", max_price=Decimal("0.99"))
         self.assertEqual(result["status"], "paper_fill_rejected_fok_insufficient_depth")
         self.assertEqual(result["order_type"], "FOK")
 
     def test_price_gate_includes_both_endpoints(self) -> None:
-        for price in ("0.05", "0.98"):
+        for price in ("0.40", "0.99"):
             self.stream.handle_message({"type": "book", "payload": {
                 "market": "m", "tokenId": "no-1", "timestamp": "100002", "hash": price,
                 "minOrderSize": "5", "tickSize": "0.01", "negRisk": False,
                 "asks": [{"price": price, "size": "5"}], "bids": []
             }})
             local = self.stream.snapshot("no-1", max_age_seconds=3, now=100.0)
-            result = simulate_local_fak(self.signal, local, {"base_fee": 0}, max_price=Decimal("0.98"), now=100.0)
+            result = simulate_local_fak(self.signal, local, {"base_fee": 0}, max_price=Decimal("0.99"), now=100.0)
             self.assertEqual(result["status"], "paper_fill_estimate", msg=price)
 
     def test_stale_local_book_fails_closed(self) -> None:

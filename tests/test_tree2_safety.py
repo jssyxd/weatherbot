@@ -16,7 +16,7 @@ class Tree2SafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.raw_book = {
             "asset_id": "no-1", "market": "market-1", "timestamp": "123",
-            "hash": "hash-1", "min_order_size": "5", "tick_size": "0.01",
+            "hash": "hash-1", "min_order_size": "1", "tick_size": "0.01",
             "asks": [{"price": "0.10", "size": "5"}],
             "bids": [{"price": "0.09", "size": "10"}],
         }
@@ -43,7 +43,7 @@ class Tree2SafetyTests(unittest.TestCase):
         summary = data.executable_summary("no-1")
         decision = decide_buy_no(
             mode="paper", token_id="no-1", book_summary=summary,
-            target_shares=Decimal("5"), min_order_size=Decimal("5"),
+            target_shares=Decimal("1"), min_order_size=Decimal("1"),
         )
         self.assertEqual(summary["status"], "EMPTY_ASK")
         self.assertFalse(decision.allowed)
@@ -54,7 +54,7 @@ class Tree2SafetyTests(unittest.TestCase):
         data.snapshot_from_raw("no-1", self.raw_book)
         decision = decide_buy_no(
             mode="live", token_id="no-1", book_summary=data.executable_summary("no-1"),
-            target_shares=Decimal("5"), min_order_size=Decimal("5"),
+            target_shares=Decimal("1"), min_order_size=Decimal("1"),
         )
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.code, "LIVE_EXECUTOR_DISABLED")
@@ -65,7 +65,7 @@ class Tree2SafetyTests(unittest.TestCase):
         time.sleep(0.02)
         decision = decide_buy_no(
             mode="paper", token_id="no-1", book_summary=data.executable_summary("no-1"),
-            target_shares=Decimal("5"), min_order_size=Decimal("5"),
+            target_shares=Decimal("1"), min_order_size=Decimal("1"),
         )
         self.assertEqual(decision.code, "STALE_OR_MISSING_BOOK")
 
