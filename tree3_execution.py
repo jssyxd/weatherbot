@@ -7,7 +7,7 @@ from typing import Any
 
 from clob_market_data import BookSnapshot
 from local_order_book import LocalBookSnapshot
-from tree2_execution import build_fixed_five_fak, TARGET_ORDER_SHARES, MAX_EXECUTION_PRICE
+from tree2_execution import build_fak_intent, TARGET_ORDER_SHARES, MAX_EXECUTION_PRICE
 
 DEFAULT_MAX_SLIPPAGE = Decimal("0.10")
 
@@ -36,13 +36,11 @@ def simulate_local_fak(signal: dict[str, Any], local: LocalBookSnapshot | None, 
     snapshot = _book_from_local(local)
     effective_max_price = min(max_price, local.best_ask + max_slippage) if local.best_ask is not None else max_price
     try:
-        intent = build_fixed_five_fak(snapshot, fee_payload, target_shares=TARGET_ORDER_SHARES, max_price=effective_max_price)
+        intent = build_fak_intent(snapshot, fee_payload, target_shares=TARGET_ORDER_SHARES, max_price=effective_max_price)
     except Exception as exc:
         return {**base, "status": "paper_fill_unavailable", "decision_code": type(exc).__name__, "message": str(exc), "book_version": local.version}
-    if intent.executable_shares < snapshot.min_order_size:
+    if intent.executable_shares < Decimal("1"):
         return {**base, "status": "paper_fill_rejected_below_min_order_size", "decision_code": "DEPTH_LT_MIN_ORDER", "book_version": local.version, "effective_max_price": str(effective_max_price), "intent": intent.as_dict()}
-    if intent.executable_shares < TARGET_ORDER_SHARES:
-        return {**base, "status": "paper_fill_partial_fak", "decision_code": "PARTIAL_FILL_REMAINDER_CANCELLED", "book_version": local.version, "effective_max_price": str(effective_max_price), "intent": intent.as_dict()}
     return {**base, "status": "paper_fill_estimate", "decision_code": "FAK_FULL_TARGET", "book_version": local.version, "book_hash": local.book_hash, "effective_max_price": str(effective_max_price), "intent": intent.as_dict()}
 
 
