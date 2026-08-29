@@ -160,6 +160,12 @@ def load_config(config_path: Path) -> dict[str, Any]:
     warmup_source = str(config.get("warmup_source", "auto")).lower().strip()
     if warmup_source not in WARMUP_SOURCES:
         raise ValueError(f"warmup_source 只能为 {'、'.join(sorted(WARMUP_SOURCES))}")
+    awc_warmup_hours = float(config.get("awc_warmup_history_hours", 30))
+    if not 1 <= awc_warmup_hours <= 48:
+        raise ValueError("awc_warmup_history_hours 必须介于 1 和 48")
+    awc_fallback_hours = float(config.get("awc_fallback_history_hours", 2))
+    if not 1 <= awc_fallback_hours <= 48:
+        raise ValueError("awc_fallback_history_hours 必须介于 1 和 48")
     warmup_min_obs = int(config.get("warmup_min_obs", DEFAULT_WARMUP_MIN_OBS))
     if warmup_min_obs < 1:
         raise ValueError("warmup_min_obs 不得小于 1")
@@ -207,6 +213,8 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "warmup_retry_seconds": warmup_retry,
         "warmup_stations_per_request": warmup_chunk_size,
         "warmup_source": warmup_source,
+        "awc_warmup_history_hours": awc_warmup_hours,
+        "awc_fallback_history_hours": awc_fallback_hours,
         "warmup_min_obs": warmup_min_obs,
         "warmup_high_gate_local_hour": warmup_high_gate,
         "warmup_low_gate_local_hour": warmup_low_gate,
@@ -391,7 +399,7 @@ def fetch_warmup_history(config: dict[str, Any], cities: list[dict[str, Any]]) -
             elif candidate == "noaa":
                 endpoints = []
                 for station_chunk in chunks(station_ids, CHECKWX_MAX_ICAOS_PER_REQUEST):
-                    chunk_reports, chunk_endpoint = fetch_noaa_warmup_reports(station_chunk)
+                    chunk_reports, chunk_endpoint = fetch_noaa_warmup_reports(station_chunk, hours=int(config.get("awc_warmup_history_hours", 30)))
                     reports.extend(chunk_reports)
                     endpoints.append(chunk_endpoint)
                 endpoint = ";".join(endpoints)

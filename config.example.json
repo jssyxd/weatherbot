@@ -24,6 +24,10 @@
   "warmup_high_gate_local_hour": 12,
   "warmup_low_gate_local_hour": 6,
   "market_rules_max_age_seconds": 1800,
+  "market_ws_enabled": true,
+  "awc_warmup_history_hours": 30,
+  "awc_fallback_history_hours": 2,
+  "awc_stations_per_request": 25,
 
   "contract_cities_path": "config/contract_cities.json",
   "market_rules_path": "data/market_rules.json",
