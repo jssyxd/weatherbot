@@ -25,7 +25,7 @@ class Tree3MarketStreamTests(unittest.TestCase):
     def raw_book(self, asks=None, bids=None):
         return {
             "event_type": "book", "market": "market-1", "asset_id": "no-1", "timestamp": "100000",
-            "hash": "h1", "min_order_size": "5", "tick_size": "0.01", "neg_risk": True,
+            "hash": "h1", "min_order_size": "1", "tick_size": "0.01", "neg_risk": True,
             "asks": asks if asks is not None else [{"price": "0.10", "size": "5"}],
             "bids": bids if bids is not None else [{"price": "0.09", "size": "5"}],
         }

@@ -41,7 +41,7 @@ def signal() -> dict:
 def snapshot(bucket: str, timestamp_seconds: int, bid: str, ask: str, bid_shares: str = "20", ask_shares: str = "20") -> dict:
     return {
         "ready": True, "received_monotonic_ns": timestamp_seconds * NS, "market_rule_id": "rule-high",
-        "bucket_id": bucket, "token_id": f"token-{bucket}", "tick_size": "0.01", "min_order_size": "5",
+        "bucket_id": bucket, "token_id": f"token-{bucket}", "tick_size": "0.01", "min_order_size": "1",
         "book_hash": f"hash-{bucket}-{timestamp_seconds}",
         "bids": [{"price": bid, "size": bid_shares}], "asks": [{"price": ask, "size": ask_shares}],
     }

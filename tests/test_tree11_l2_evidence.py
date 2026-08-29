@@ -16,7 +16,7 @@ class Tree11L2EvidenceTests(unittest.TestCase):
     def test_index_and_snapshot_preserve_identity_and_l2(self) -> None:
         index = yes_bucket_index(self.rules())
         book = LocalOrderBook("yes-31", clock=lambda: 1.0)
-        snapshot = book.apply_book({"asset_id": "yes-31", "market": "market", "timestamp": "1", "hash": "h", "tick_size": "0.01", "min_order_size": "5", "bids": [{"price": "0.20", "size": "10"}], "asks": [{"price": "0.22", "size": "8"}]})
+        snapshot = book.apply_book({"asset_id": "yes-31", "market": "market", "timestamp": "1", "hash": "h", "tick_size": "0.01", "min_order_size": "1", "bids": [{"price": "0.20", "size": "10"}], "asks": [{"price": "0.22", "size": "8"}]})
         evidence = snapshot_evidence(snapshot, received_monotonic_ns=123, token_index=index, received_at_utc="2026-08-27T00:00:00Z", source_session_id="session")
         self.assertEqual(evidence["market_rule_id"], "high-rule")
         self.assertEqual(evidence["bucket_id"], "h31")
@@ -36,7 +36,7 @@ class Tree11L2EvidenceTests(unittest.TestCase):
 
     def test_monotonic_time_is_mandatory(self) -> None:
         book = LocalOrderBook("yes-31", clock=lambda: 1.0)
-        snapshot = book.apply_book({"asset_id": "yes-31", "bids": [], "asks": [], "tick_size": "0.01", "min_order_size": "5"})
+        snapshot = book.apply_book({"asset_id": "yes-31", "bids": [], "asks": [], "tick_size": "0.01", "min_order_size": "1"})
         with self.assertRaisesRegex(L2EvidenceError, "received_monotonic_ns_required"):
             snapshot_evidence(snapshot, received_monotonic_ns=0, token_index=yes_bucket_index(self.rules()))
 
