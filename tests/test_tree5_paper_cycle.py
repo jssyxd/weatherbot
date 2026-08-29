@@ -11,7 +11,7 @@ POLICY = json.loads((Path(__file__).resolve().parents[1] / "tree5_ev_policy.exam
 
 
 def snapshot(bucket: str, token: str, second: int, bid: str, ask: str) -> dict:
-    return {"ready": True, "received_monotonic_ns": second * NS, "market_id": "shanghai-high", "bucket_id": bucket, "token_id": token, "tick_size": "0.01", "min_order_size": "5", "book_hash": f"{bucket}-{second}", "bids": [{"price": bid, "size": "100"}], "asks": [{"price": ask, "size": "10"}]}
+    return {"ready": True, "received_monotonic_ns": second * NS, "market_id": "shanghai-high", "bucket_id": bucket, "token_id": token, "tick_size": "0.01", "min_order_size": "1", "book_hash": f"{bucket}-{second}", "bids": [{"price": bid, "size": "100"}], "asks": [{"price": ask, "size": "10"}]}
 
 
 def cycle(*, leader_bid: str = "0.72", runner_bid: str = "0.60") -> dict:

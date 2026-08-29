@@ -39,7 +39,7 @@ class Tree5StrategyTests(unittest.TestCase):
 
     @staticmethod
     def book(ask=None, bid=None):
-        return {"best_ask": ask, "best_bid": bid, "tick_size": "0.01", "min_order_size": "5", "source": "test"}
+        return {"best_ask": ask, "best_bid": bid, "tick_size": "0.01", "min_order_size": "1", "source": "test"}
 
     @staticmethod
     def config():

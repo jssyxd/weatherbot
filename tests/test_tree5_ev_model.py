@@ -13,7 +13,7 @@ POLICY = json.loads((Path(__file__).resolve().parents[1] / "tree5_ev_policy.exam
 def snapshot(bucket: str, token: str, timestamp_seconds: int, bid: str, ask: str, bid_size: str = "100", ask_size: str = "10") -> dict:
     return {
         "ready": True, "received_monotonic_ns": timestamp_seconds * NS, "market_id": "shanghai-high-2026-08-27",
-        "bucket_id": bucket, "token_id": token, "tick_size": "0.01", "min_order_size": "5",
+        "bucket_id": bucket, "token_id": token, "tick_size": "0.01", "min_order_size": "1",
         "book_hash": f"{bucket}-{timestamp_seconds}", "bids": [{"price": bid, "size": bid_size}], "asks": [{"price": ask, "size": ask_size}],
     }
 
