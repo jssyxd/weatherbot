@@ -23,6 +23,8 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from decimal import Decimal
+import uuid
 
 from edge_engine import (
     append_jsonl,
@@ -34,8 +36,8 @@ from edge_engine import (
     observed_temperature_native,
 )
 from market_adapter import refresh_market_rules
-from paper_execution import simulate_paper_fak
-from tree2_execution import simulate as simulate_tree2
+from execution import OrderIntent, OrderRecord, OrderState, PaperExecutor, RiskGate
+from clob_market_data import CLOBDataError, CLOBMarketData
 from audit_store import AuditStore
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -662,23 +664,83 @@ def refresh_market_rules_if_due(state: dict[str, Any], config: dict[str, Any], c
         return {"market_refresh_error": state["last_market_refresh_error"]}
 
 
+# --- unified execution layer (paper FAK against fresh L2 book; live fail-closed) ---
+TARGET_ORDER_SHARES = Decimal("1")   # paper order size (user decision: keep 1 share)
+MAX_EXECUTION_PRICE = Decimal("0.98")
+MIN_EXECUTION_PRICE = Decimal("0.40")
+MAX_SLIPPAGE = Decimal("0.10")
+MAX_BOOK_AGE_SECONDS = 3.0
+CITY_DAY_MAX_TOTAL_DEBIT = Decimal("20.00")  # per city-local-day paper spend cap
+
+_market_data = CLOBMarketData()
+_risk_gate = RiskGate(
+    min_price=MIN_EXECUTION_PRICE,
+    max_price=MAX_EXECUTION_PRICE,
+    max_slippage=MAX_SLIPPAGE,
+    max_book_age_seconds=MAX_BOOK_AGE_SECONDS,
+    min_order_size=Decimal("1"),
+    max_order_size=Decimal("100"),
+)
+_paper_executor = PaperExecutor(min_price=MIN_EXECUTION_PRICE)
+
+
 def enrich_execution(signal: dict[str, Any], mode: str, state: dict[str, Any]) -> dict[str, Any]:
     """Attach a read-only paper-fill estimate or a live safety block; never submit an order."""
     if signal.get("signal_type") != "candidate_no_signal":
         return signal
     result = dict(signal)
-    if mode in {"paper", "observe"}:
-        if state.get("execution_engine") == "tree3":
-            result["execution"] = {"mode": "paper", "status": "tree3_local_book_required", "decision_code": "LOCAL_BOOK_PATH_NOT_ATTACHED", "message": "tree3 已要求 WebSocket 本地盘口；主循环尚未自动连接真实行情时 fail-closed。"}
-        else:
-            result["execution"] = simulate_tree2(signal, state) if state.get("execution_engine") == "tree2" else simulate_paper_fak(signal, state)
-    else:
+    if mode not in {"paper", "observe"}:
         result["execution"] = {
             "mode": "live",
             "status": "blocked_no_live_executor",
+            "decision_code": "LIVE_EXECUTOR_DISABLED",
             "message": "此版本不包含钱包、签名或订单提交器；live 模式只产生阻断审计记录。",
         }
+        return result
+    result["execution"] = _paper_execution(signal, mode, state)
     return result
+
+
+def _paper_execution(signal: dict[str, Any], mode: str, state: dict[str, Any]) -> dict[str, Any]:
+    no_token_id = str(signal.get("bucket", {}).get("no_token_id") or "")
+    if not no_token_id:
+        return {"mode": "paper", "status": "paper_fill_rejected_missing_no_token", "decision_code": "MISSING_NO_TOKEN"}
+    city_day_key = f"{signal.get('city_id')}|{signal.get('market_local_date')}"
+    ledger = state.setdefault("paper_city_day_total_debit", {})
+    already_spent = Decimal(str(ledger.get(city_day_key, 0.0)))
+    remaining_budget = CITY_DAY_MAX_TOTAL_DEBIT - already_spent
+    if remaining_budget <= 0:
+        return {"mode": "paper", "status": "paper_fill_rejected_city_day_cap", "decision_code": "INSUFFICIENT_BALANCE",
+                "message": "该城市当地日含费用总现金余量已用尽。"}
+    intent = OrderIntent(
+        order_id=f"paper-{uuid.uuid4().hex[:12]}",
+        token_id=no_token_id,
+        side="BUY_NO",
+        price=MAX_EXECUTION_PRICE,
+        quantity=TARGET_ORDER_SHARES,
+        order_type="FAK",
+        strategy=str(signal.get("signal_type", "edge_engine")),
+        signal_reason=str(signal.get("reason") or "dead_bucket_no_signal"),
+        created_at=iso_now(),
+    )
+    try:
+        book = _market_data.fetch_books([no_token_id]).get(no_token_id)
+        fee_raw = _market_data.fetch_fee_rate(no_token_id)
+        fee_rate = Decimal(str(fee_raw.get("base_fee"))) / Decimal("10000")
+    except CLOBDataError as exc:
+        return {"mode": "paper", "status": "paper_fill_unavailable", "decision_code": "CLOB_ERROR", "message": str(exc)}
+    decision = _risk_gate.evaluate(intent, book, mode=mode, available_balance_usdc=remaining_budget)
+    if not decision.allowed:
+        record = OrderRecord(
+            intent=intent, state=OrderState.RISK_REJECTED, reject_reason=decision.code,
+            book_timestamp=decision.book_timestamp, book_age_seconds=decision.book_age_seconds, book_hash=decision.book_hash,
+        )
+        return {"mode": "paper", "status": "paper_risk_rejected", "decision_code": decision.code, "order": record.as_dict()}
+    record = _paper_executor.execute(intent, book, fee_rate)
+    if record.filled_shares > 0 and record.average_fill_price is not None:
+        debit = record.filled_shares * record.average_fill_price
+        ledger[city_day_key] = float(already_spent + debit)
+    return {"mode": "paper", "status": f"paper_{record.state.value.lower()}", "decision_code": record.state.value, "order": record.as_dict()}
 
 
 def format_event(event: dict[str, Any]) -> str:
@@ -791,6 +853,21 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
                 token_id=str(signal.get("bucket", {}).get("no_token_id") or "") or None,
                 payload={"signal": signal, "execution": execution},
             )
+            # enforce risk_ledger: only a paper fill (filled_size > 0) changes
+            # position and debits the city-day ledger (closes audit B-M3).
+            order = execution.get("order") or {}
+            try:
+                filled = Decimal(str(order.get("filled_size") or "0"))
+            except Exception:
+                filled = Decimal("0")
+            if filled > 0:
+                avg = Decimal(str(order.get("average_fill_price") or "0"))
+                token_id = str(signal.get("bucket", {}).get("no_token_id") or "")
+                debit_key = f"debit|{signal.get('city_id')}|{signal.get('market_local_date')}"
+                pos_key = f"position|{token_id}|BUY_NO"
+                audit_store.set_ledger(debit_key, str(Decimal(audit_store.get_ledger(debit_key)) + filled * avg), iso_now())
+                audit_store.set_ledger(pos_key, str(Decimal(audit_store.get_ledger(pos_key)) + filled), iso_now())
+
     finally:
         audit_store.close()
     for event in new_events:
