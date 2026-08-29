@@ -131,16 +131,20 @@ class Tree12AllNoTests(unittest.TestCase):
         state = {"paper_initial_capital_usdc": 1000.0, "paper_total_debit_usdc": 0.0,
                  "tree12": {"working_orders": {"k1": {"key": "k1", "status": "working_gtc_buy_no", "remaining_shares": "5",
                     "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high", "bucket_id": "b32",
-                    "token_id": "no-32", "lo": 32, "hi": 33}}, "positions": {}, "exit_chases": {}, "ws_ask_samples": {}}}
+                    "token_id": "no-32", "lo": 32, "hi": 33, "limit_price": "0.90"}}, "positions": {}, "exit_chases": {}, "ws_ask_samples": {}}}
         now = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
-        result = tree12_paper_fill(state, "k1", Decimal("5"), Decimal("0.90"), now)
+        book = {"best_ask": "0.90", "asks": [{"price": "0.90", "size": "3"}, {"price": "0.91", "size": "2"}]}
+        result = tree12_paper_fill(state, "k1", Decimal("5"), book, now)
         self.assertEqual(result["status"], "paper_filled")
+        # limit=0.90 只吃 0.90 档 3 股（0.91 越限），剩余 2 股留在 GTC 挂单。
+        self.assertEqual(result["filled"], "3")
+        self.assertEqual(state["tree12"]["working_orders"]["k1"]["remaining_shares"], "2")
         self.assertGreater(float(state["paper_total_debit_usdc"]), 0)
-        # Exhaust capital: a second 5-share fill at 0.90 should be blocked.
+        # Exhaust capital: a second fill should be blocked.
         state["paper_total_debit_usdc"] = 999.0
         state["tree12"]["working_orders"]["k2"] = {"key": "k2", "status": "working_gtc_buy_no", "remaining_shares": "5",
-            "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high", "bucket_id": "b33", "token_id": "no-33", "lo": 33, "hi": 34}
-        blocked = tree12_paper_fill(state, "k2", Decimal("5"), Decimal("0.90"), now)
+            "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high", "bucket_id": "b33", "token_id": "no-33", "lo": 33, "hi": 34, "limit_price": "0.90"}
+        blocked = tree12_paper_fill(state, "k2", Decimal("5"), book, now)
         self.assertEqual(blocked["status"], "blocked_insufficient_capital")
         self.assertEqual(state["tree12"]["working_orders"]["k2"]["status"], "blocked_insufficient_capital")
 

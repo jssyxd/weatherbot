@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from edge_engine import celsius_to_native, local_market_date, parse_utc
 from paper_capital import remaining_capital_usdc, reserve
+from execution.paper_executor import match_l2
 
 TREE12_TARGET_SHARES = Decimal("5")
 TREE12_MIN_NO_ASK = Decimal("0.85")
@@ -661,7 +662,7 @@ def plan_tree12_entries(
                     tree["working_orders"][key] = order
                     actions.append({"action_type": "tree12_submit_entry", "status": "planned_observe_only", **order})
                     if paper_mode:
-                        actions.append(tree12_paper_fill(state, key, need, ask, now_utc))
+                        actions.append(tree12_paper_fill(state, key, need, books_by_token.get(token), now_utc))
     tree["last_scan_utc"] = _iso(now_utc)
     return actions
 
@@ -805,33 +806,39 @@ def tree12_paper_fill(
     state: dict[str, Any],
     key: str,
     shares: Decimal,
-    fill_price: Decimal,
+    book: Any,
     now_utc: datetime,
 ) -> dict[str, Any]:
-    """Simulate a tree12 NO GTC fill against its hybrid limit (paper only).
+    """Simulate a tree12 NO GTC fill against real L2 ask depth (paper only).
 
-    A GTC buy rests when the best ask is above its limit; it only fills when
-    the ask is at or below the limit (which, for the hybrid limit, means the
-    ask has reached the 6h-WS-VWAP anchor). Cash is reserved from the shared
-    1000-USDC paper account.
+    The hybrid limit is the ceiling; fills walk the actual visible ask levels
+    (price-time priority), so a thin book produces a partial fill and the
+    remainder stays as a resting GTC order instead of inventing a full fill.
+    Cash is reserved from the shared 1000-USDC paper account.
     """
     tree = ensure_tree12_state(state)
     order = tree["working_orders"].get(key)
     if not isinstance(order, dict) or order.get("status") != "working_gtc_buy_no":
         return {"action_type": "tree12_paper_fill", "status": "no_working_order", "key": key}
     shares = _dec(shares, "0") or ZERO
-    fill_price = _dec(fill_price) or ZERO
     limit_price = _dec(order.get("limit_price"))
-    if shares <= ZERO or fill_price <= ZERO:
+    best_ask = best_ask_of(book)
+    if shares <= ZERO or limit_price is None or limit_price <= ZERO:
         return {"action_type": "tree12_paper_fill", "status": "invalid_fill", "key": key}
-    if limit_price is not None and fill_price > limit_price:
+    if best_ask is None or best_ask > limit_price:
         return {
             "action_type": "tree12_paper_fill", "status": "resting_above_limit", "key": key,
-            "token_id": order.get("token_id"), "limit_price": str(limit_price), "best_ask": str(fill_price),
+            "token_id": order.get("token_id"), "limit_price": str(limit_price),
+            "best_ask": str(best_ask) if best_ask is not None else None,
         }
-    principal = shares * fill_price
-    estimated_fee = shares * TREE12_PAPER_FEE_RATE * fill_price * (Decimal("1") - fill_price)
-    total_debit = principal + estimated_fee
+    match = match_l2(book=book, side="BUY", quantity=shares, limit_price=limit_price, order_type="GTC")
+    filled = match.filled_size
+    if filled <= ZERO:
+        return {"action_type": "tree12_paper_fill", "status": "resting_no_depth", "key": key,
+                "token_id": order.get("token_id"), "limit_price": str(limit_price)}
+    avg = match.avg_price or best_ask
+    estimated_fee = filled * TREE12_PAPER_FEE_RATE * avg * (Decimal("1") - avg)
+    total_debit = match.filled_notional + estimated_fee
     if reserve(state, total_debit) is None:
         order["status"] = "blocked_insufficient_capital"
         order["updated_at_utc"] = _iso(now_utc)
@@ -841,9 +848,10 @@ def tree12_paper_fill(
             "token_id": order.get("token_id"), "required_debit_usdc": str(total_debit),
             "remaining_capital_usdc": str(remaining_capital_usdc(state)),
         }
-    result = paper_fill_working_order(state, key, shares, fill_price, now_utc)
+    result = paper_fill_working_order(state, key, filled, avg, now_utc)
     result["action_type"] = "tree12_paper_fill"
-    result["principal_usdc"] = str(principal)
+    result["match"] = match.as_dict()
+    result["principal_usdc"] = str(match.filled_notional)
     result["estimated_fee_usdc"] = str(estimated_fee)
     result["total_debit_usdc"] = str(total_debit)
     result["remaining_capital_usdc"] = str(remaining_capital_usdc(state))
