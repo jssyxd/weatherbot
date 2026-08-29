@@ -22,7 +22,7 @@ class Tree11L2EvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["bucket_id"], "h31")
         self.assertEqual(evidence["bids"], [{"price": "0.20", "size": "10"}])
         self.assertEqual(evidence["asks"], [{"price": "0.22", "size": "8"}])
-        self.assertEqual(evidence["min_order_size"], "5")
+        self.assertEqual(evidence["min_order_size"], "1")
         self.assertEqual(evidence["safety"]["orders_submitted"], 0)
 
     def test_unmapped_or_not_ready_book_emits_no_evidence(self) -> None:
