@@ -42,8 +42,11 @@ from audit_store import AuditStore
 from aviationweather_warmup import AWC_MAX_ICAOS_PER_REQUEST, AviationWeatherError, fetch_aviationweather_history
 from tree12_allno_strategy import (
     collect_tree12_book_token_ids,
+    due_tree12_taf_cities,
     ensure_tree12_state,
+    record_tree12_taf_reports,
     run_tree12_cycle,
+    tree12_day_key,
 )
 from tree5_strategy import (
     due_exit_token_ids,
@@ -215,6 +218,8 @@ def load_config(config_path: Path) -> dict[str, Any]:
     max_slippage = float(config.get("max_slippage", 0.10))
     if not 0 <= min_execution_price <= max_execution_price <= 1:
         raise ValueError("执行价格门必须满足 0 <= min <= max <= 1")
+    if max_execution_price > 0.98:
+        raise ValueError("max_execution_price 不得大于 0.98（CLOB 可交易价格上限）")
     if max_slippage < 0:
         raise ValueError("max_slippage 不得为负")
     local_book_max_age = float(config.get("local_book_max_age_seconds", 3))
@@ -223,6 +228,12 @@ def load_config(config_path: Path) -> dict[str, Any]:
     tree5_taf_hour = int(config.get("tree5_taf_fetch_local_hour", 1))
     if tree5_taf_hour != 1:
         raise ValueError("tree5_taf_fetch_local_hour 必须为当地 01:00")
+    tree12_taf_hour = int(config.get("tree12_taf_fetch_local_hour", 1))
+    if tree12_taf_hour != 1:
+        raise ValueError("tree12_taf_fetch_local_hour 必须为当地 01:00")
+    tree12_taf_retry_seconds = int(config.get("tree12_taf_retry_seconds", 900))
+    if tree12_taf_retry_seconds < 60:
+        raise ValueError("tree12_taf_retry_seconds 不得小于 60")
     tree5_entry_discount = float(config.get("tree5_entry_price_discount", 0.05))
     if not 0 <= tree5_entry_discount < 1:
         raise ValueError("tree5_entry_price_discount 必须介于 0（含）和 1（不含）")
@@ -267,6 +278,8 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "tree12_exit_retry_seconds": tuple(int(v) for v in config.get("tree12_exit_retry_seconds", (0, 5, 20, 60, 120))),
         "tree12_exit_slippage": tuple(float(v) for v in config.get("tree12_exit_slippage", (0.10, 0.20, 0.35, 0.60, 0.90))),
         "tree12_exit_min_price": float(config.get("tree12_exit_min_price", 0.01)),
+        "tree12_taf_fetch_local_hour": tree12_taf_hour,
+        "tree12_taf_retry_seconds": tree12_taf_retry_seconds,
         "tree5_taf_fetch_local_hour": tree5_taf_hour,
         "tree5_taf_retry_seconds": int(config.get("tree5_taf_retry_seconds", 900)),
         "tree5_entry_price_discount": tree5_entry_discount,
@@ -926,12 +939,46 @@ def tree5_maintenance_once(config: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def process_tree12_taf_entries(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
+    """Fetch one TAF per city-local-day for tree12 independently of tree5.
+
+    tree12 owns its own ``state.tree12.taf_fetches`` / ``taf_forecasts`` and
+    never reads tree5 TAF cache. Missing TX/TN is explicit and blocks the TAF
+    filter rather than silently trading.
+    """
+    if not config.get("tree12_enabled", False):
+        return []
+    ensure_tree12_state(state)
+    due = due_tree12_taf_cities(state, cities, now, config)
+    if not due:
+        return []
+    reports: list[dict[str, Any]] = []
+    endpoints: list[str] = []
+    try:
+        for station_chunk in chunks([city["icao"] for city in due], config["stations_per_request"]):
+            records, endpoint = fetch_checkwx_taf_reports(station_chunk, config["checkwx_api_key_env"])
+            reports.extend(records)
+            endpoints.append(endpoint)
+    except Exception as exc:
+        tree = ensure_tree12_state(state)
+        for city in due:
+            key = tree12_day_key(city, now.astimezone(ZoneInfo(city["timezone"])).date().isoformat())
+            tree["taf_fetches"][key] = {
+                "status": "failed_fetch", "city_id": city["city_id"], "icao": city["icao"],
+                "market_local_date": key.rsplit("|", 1)[-1], "last_attempt_utc": iso_now(),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return [{"action_type": "tree12_taf_fetch", "status": "failed_fetch", "due_city_count": len(due), "error": f"{type(exc).__name__}: {exc}"}]
+    due_by_icao = {city["icao"]: city for city in due}
+    return record_tree12_taf_reports(state, reports, due_by_icao, now, ";".join(endpoints))
+
+
 def process_tree12_cycle(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], market_rules: list[dict[str, Any]], now: datetime, observations_by_city: dict[str, float] | None = None) -> list[dict[str, Any]]:
     """Plan tree12 NO entries/exits after METAR batch; paper intents only."""
     if not config.get("tree12_enabled", False):
         return []
     ensure_tree12_state(state)
-    # Ensure TAF cache is warm when tree5 TAF path is also enabled
+    # tree12 TAF cache is maintained independently by process_tree12_taf_entries.
     tokens = collect_tree12_book_token_ids(state, market_rules, cities, now)
     books, book_error = fetch_tree5_books(tokens)
     actions: list[dict[str, Any]] = []
@@ -1061,7 +1108,8 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
             continue
         observed_native, _precision = native_temperature
         observations_by_city[city["city_id"]] = float(observed_native)
-    tree12_actions = process_tree12_cycle(config, state, cities, market_rules, scan_time, observations_by_city)
+    tree12_actions = process_tree12_taf_entries(config, state, cities, scan_time)
+    tree12_actions.extend(process_tree12_cycle(config, state, cities, market_rules, scan_time, observations_by_city))
     # Refresh market rules only after this round's time-sensitive observations.
     refresh_summary = refresh_market_rules_if_due(state, config, cities)
     state["last_successful_scan_utc"] = iso_now()
@@ -1162,9 +1210,11 @@ def run_loop(config: dict[str, Any]) -> None:
                 scan_once(config)
                 failure_started = None
                 next_scan_epoch = time.time() + interval
-            elif config.get("tree5_enabled", False):
-                tree5_maintenance_once(config)
-                tree12_maintenance_once(config)
+            else:
+                if config.get("tree5_enabled", False):
+                    tree5_maintenance_once(config)
+                if config.get("tree12_enabled", False):
+                    tree12_maintenance_once(config)
             time.sleep(min(1.0, max(0.05, next_scan_epoch - time.time())))
         except KeyboardInterrupt:
             print("\n扫描器已停止。")

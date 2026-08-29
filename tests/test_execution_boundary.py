@@ -57,7 +57,7 @@ class ExecutionBoundaryTests(unittest.TestCase):
 
     def test_intent_is_fixed_five_shares_across_price_bands(self) -> None:
         fee_rate = Decimal(self.fee["base_fee"]) / Decimal("10000")
-        for ask in ("0.10", "0.30", "0.31", "0.60", "0.61", "0.80"):
+        for ask in ("0.40", "0.41", "0.60", "0.61", "0.80", "0.98"):
             state: dict = {}
             tier_book = dict(self.book, asks=[{"price": ask, "size": "200"}])
             with patch("paper_execution.fetch_order_book", return_value=(tier_book, "https://clob.test/book")), \
@@ -72,7 +72,7 @@ class ExecutionBoundaryTests(unittest.TestCase):
 
     def test_paper_fill_rejects_ask_outside_strict_price_gate(self) -> None:
         state: dict = {}
-        for bad_price in ("0.04", "0.99"):
+        for bad_price in ("0.39", "0.99"):
             invalid_book = dict(self.book, asks=[{"price": bad_price, "size": "20"}])
             with patch("paper_execution.fetch_order_book", return_value=(invalid_book, "https://clob.test/book")), \
                  patch("paper_execution.fetch_fee_rate", return_value=(self.fee, "https://clob.test/fee")):

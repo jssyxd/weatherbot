@@ -2,6 +2,20 @@
 
 本仓库采用“**先纸面、可回放、失败关闭，后续再独立审查执行**”的变更原则。任何涉及真实下单、撤单、账户查询、钱包或私钥的能力均不在以下版本范围内。
 
+## tree12-allno — 独立 early-NO 布局（当前分支）
+
+| 类别 | 改动 | 状态与验证要求 |
+|---|---|---|
+| 策略 | 新增 `tree12_allno_strategy.py`：49 城、high/low 双向、目标 5 股 NO 布局；入场时间窗 `> 当地 00:00 − 24h`、TAF 规避、非共识前 2、`best_ask > 0.85`；hybrid 限价与 SELL NO FAK 出场阶梯。 | 默认 paper / observe-only；真实成交需外部持仓对账。 |
+| TAF 独立 | tree12 拥有自己的 `state.tree12.taf_fetches` / `taf_forecasts`，本地实现 `TAF_EXTREME_RE`、`parse_taf_extremes_for_local_day`、`due_tree12_taf_cities`、`record_tree12_taf_reports`；`tree12_allno_strategy.py` 不再 import `tree5_strategy`。 | 新增 `tests/test_tree12_allno_strategy.py` 中 `test_tree12_taf_is_self_contained`、`test_taf_parse_maps_local_day`。 |
+| 调度修复 | `metar_observer.run_loop` 中 `tree12_maintenance_once` 不再嵌套在 `tree5_enabled` 分支内；tree5 与 tree12 各自独立调度维护。 | 配置 `tree12_enabled=true` 且 `tree5_enabled=false` 时，tree12 的 0/5/20/60/120s FAK 阶梯仍可运行。 |
+| 盘口采样语义 | `ws_mid_samples` → `ws_ask_samples`、`ws_vwap_6h` → `ws_ask_vwap_6h`、`record_ws_sample` → `record_ws_ask_sample`；hybrid fair 改为 `mid(6h WS ask VWAP, best_ask)`。 | 消除了“名为 mid 实为 ask”的不一致。 |
+| 纸面成交 | `paper_fill_working_order` 的 `avg_price` 由覆盖改为按成交股数加权平均。 | 多次部分成交时保留真实加权成本。 |
+| 价格带 | `config.example.json` `max_execution_price` 0.99 → 0.98，与 `paper_execution.MAX_PRICE_INCLUSIVE` 一致；`load_config` 新增 `max_execution_price > 0.98` 即报错。 | fail-closed，拒绝无法构造的 CLOB 价格。 |
+| 配置 | 新增 `tree12_taf_fetch_local_hour`（固定 1）、`tree12_taf_retry_seconds`、`tree12_exit_retry_seconds`、`tree12_exit_slippage`、`tree12_exit_min_price`、`tree12_action_dir`。 | `config.example.json` 已同步。 |
+| 测试 | 修正 `test_execution_boundary` 过期价格带用例（0.40–0.98）；新增 tree12 独立 TAF 解析/记录用例。 | 本地 `python3 -m unittest discover -s tests` 全绿（112 tests OK）。 |
+| 未实施 | 真实 FAK/GTC、撤单、卖出、NO/merge、账户/用户流对账、凭证加载。 | 保持未实现；如未来需要，必须在独立模块、独立审计和明确确认后再处理。 |
+
 ## Unreleased — tree5 净期望值与共识风险研究
 
 | 类别 | 改动 | 状态与验证要求 |

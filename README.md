@@ -14,7 +14,7 @@
 
 ## 限价 hybrid
 
-`fair = mid(6h WS VWAP, best_ask)`，`limit = min(fair, best_ask)` 对齐 tick，并保护 `>= 0.85+tick`。
+`fair = mid(6h WS ask VWAP, best_ask)`，`limit = min(fair, best_ask)` 对齐 tick，并保护 `>= 0.85+tick`。
 
 ## 出场
 
@@ -24,9 +24,9 @@
 
 ## 模块
 
-- `tree12_allno_strategy.py` — 策略状态机
-- `metar_observer.py` — 扫描后 `process_tree12_cycle` + 每秒 `tree12_maintenance_once`
-- 复用 tree5 TAF 解析与 book 拉取
+- `tree12_allno_strategy.py` — 策略状态机（自包含：本地实现 TAF TX/TN 解析、桶包含、UTC 工具，不 import tree5 代码）
+- `metar_observer.py` — 扫描后 `process_tree12_taf_entries`（独立抓 TAF）+ `process_tree12_cycle` + 每秒 `tree12_maintenance_once`
+- 复用 tree5 的 CLOB book 拉取（`fetch_tree5_books` 只是公共只读盘口客户端，不含 tree5 策略）
 
 ## 配置
 
@@ -36,7 +36,9 @@
   "tree12_enabled": true,
   "tree5_enabled": true,
   "target_order_shares": "5",
-  "scan_interval_seconds": 120
+  "scan_interval_seconds": 120,
+  "tree12_taf_fetch_local_hour": 1,
+  "tree12_taf_retry_seconds": 900
 }
 ```
 

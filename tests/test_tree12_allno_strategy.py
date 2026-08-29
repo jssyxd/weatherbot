@@ -5,8 +5,9 @@ from decimal import Decimal
 from tree12_allno_strategy import (
     TREE12_MIN_NO_ASK, allow_new_entries, consensus_top2_token_ids,
     hybrid_limit_price, paper_fill_working_order, plan_tree12_entries,
-    plan_tree12_exits_from_metar, position_key, record_ws_sample,
+    plan_tree12_exits_from_metar, position_key, record_ws_ask_sample,
     start_tree12_exit_chase, plan_tree12_due_exit_faks,
+    parse_taf_extremes_for_local_day, record_tree12_taf_reports, ensure_tree12_state,
 )
 
 def city_shanghai():
@@ -27,7 +28,7 @@ class Tree12AllNoTests(unittest.TestCase):
         state = {}
         now = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
         for i in range(10):
-            record_ws_sample(state, "tok", Decimal("0.92"), Decimal("5"), now - timedelta(minutes=i * 10))
+            record_ws_ask_sample(state, "tok", Decimal("0.92"), Decimal("5"), now - timedelta(minutes=i * 10))
         limit = hybrid_limit_price(state, "tok", Decimal("0.96"), Decimal("0.01"), now)
         self.assertGreater(limit, TREE12_MIN_NO_ASK)
         self.assertLessEqual(limit, Decimal("0.96"))
@@ -53,7 +54,7 @@ class Tree12AllNoTests(unittest.TestCase):
     def test_paper_fill(self):
         state = {"tree12": {"working_orders": {"k1": {"key": "k1", "status": "working_gtc_buy_no", "remaining_shares": "5",
                  "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high", "bucket_id": "b32",
-                 "token_id": "no-32", "lo": 32, "hi": 33}}, "positions": {}, "exit_chases": {}, "ws_mid_samples": {}}}
+                 "token_id": "no-32", "lo": 32, "hi": 33}}, "positions": {}, "exit_chases": {}, "ws_ask_samples": {}}}
         now = datetime(2026, 8, 29, tzinfo=timezone.utc)
         paper_fill_working_order(state, "k1", Decimal("2"), Decimal("0.90"), now)
         self.assertEqual(state["tree12"]["positions"]["k1"]["shares"], "2")
@@ -63,12 +64,30 @@ class Tree12AllNoTests(unittest.TestCase):
         key = position_key("shanghai", "2026-09-10", "high", "b32")
         state = {"tree12": {"working_orders": {}, "positions": {key: {"key": key, "city_id": "shanghai",
                  "market_local_date": "2026-09-10", "direction": "high", "bucket_id": "b32", "token_id": "no-32",
-                 "shares": "5", "bucket": {"bucket_id": "b32", "lo": 32, "hi": 33}}}, "exit_chases": {}, "ws_mid_samples": {}}}
+                 "shares": "5", "bucket": {"bucket_id": "b32", "lo": 32, "hi": 33}}}, "exit_chases": {}, "ws_ask_samples": {}}}
         now = datetime(2026, 9, 10, 6, 0, tzinfo=timezone.utc)
         actions = plan_tree12_exits_from_metar(state, city, "2026-09-10", 32.5, now)
         self.assertTrue(any(a.get("action_type") == "tree12_exit" for a in actions))
         faks = plan_tree12_due_exit_faks(state, {"no-32": {"best_bid": "0.20", "tick_size": "0.01"}}, now, {})
         self.assertTrue(any(a.get("action_type") == "tree12_exit_fak" for a in faks))
+
+    def test_tree12_taf_is_self_contained(self):
+        city = city_shanghai()
+        state = {}
+        reports = [{"icao": "ZSPD", "raw_text": "TAF ZSPD 091100Z 0912/1018 TX32/1006Z TN26/0918Z", "issued": "2026-09-09T11:00:00Z"}]
+        actions = record_tree12_taf_reports(state, reports, {"ZSPD": city}, datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc), "test")
+        tree = ensure_tree12_state(state)
+        self.assertIn("shanghai|2026-09-10|high", tree["taf_forecasts"])
+        self.assertEqual(tree["taf_forecasts"]["shanghai|2026-09-10|high"]["value_native"], 32.0)
+        self.assertTrue(any(a.get("action_type") == "tree12_taf_forecast_recorded" for a in actions))
+
+    def test_taf_parse_maps_local_day(self):
+        city = city_shanghai()
+        parsed = parse_taf_extremes_for_local_day(
+            "TAF ZSPD 091100Z 0912/1018 TX32/1006Z TN26/0918Z", "2026-09-09T11:00:00Z", city, "2026-09-10")
+        self.assertIn("high", parsed)
+        self.assertEqual(parsed["high"]["value_native"], 32.0)
+        self.assertEqual(parsed["high"]["direction"], "high")
 
 if __name__ == "__main__":
     unittest.main()

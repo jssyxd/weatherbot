@@ -1,19 +1,18 @@
-"""tree12-allno: early NO-bucket layout with strict filters and position management.
+"""tree12-allno: self-contained early NO-bucket layout with strict filters and position management.
 
 Default is paper / observe-only. Live submission requires reconciled positions.
+This module is a standalone strategy: it does not import tree5 code. TAF parsing,
+bucket containment and UTC helpers are implemented locally.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from tree5_strategy import (
-    bucket_contains,
-    ensure_tree5_state,
-    iso_utc,
-    parse_utc,
-)
+from edge_engine import celsius_to_native, local_market_date, parse_utc
 
 TREE12_TARGET_SHARES = Decimal("5")
 TREE12_MIN_NO_ASK = Decimal("0.85")
@@ -22,11 +21,135 @@ TREE12_WS_VWAP_HOURS = 6
 TREE12_REQUOTE_TICKS = 2
 TREE12_DEFAULT_EXIT_RETRY_SECONDS = (0, 5, 20, 60, 120)
 TREE12_DEFAULT_EXIT_SLIPPAGE = (Decimal("0.10"), Decimal("0.20"), Decimal("0.35"), Decimal("0.60"), Decimal("0.90"))
+TAF_EXTREME_RE = re.compile(r"\b(TX|TN)(M?)(\d{2})/(\d{2})(\d{2})Z\b")
 ZERO = Decimal("0")
 
 
+def iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def bucket_contains(bucket: dict[str, Any], value: float) -> bool:
+    lo, hi = bucket.get("lo"), bucket.get("hi")
+    return (lo is None or value >= float(lo)) and (hi is None or value < float(hi))
+
+
+def _month_shift(year: int, month: int, offset: int) -> tuple[int, int]:
+    absolute = year * 12 + month - 1 + offset
+    return absolute // 12, absolute % 12 + 1
+
+
+def _resolve_taf_day_hour(reference_utc: datetime, day: int, hour: int) -> datetime | None:
+    choices: list[datetime] = []
+    for shift in (-1, 0, 1):
+        year, month = _month_shift(reference_utc.year, reference_utc.month, shift)
+        try:
+            choices.append(datetime(year, month, day, hour, tzinfo=timezone.utc))
+        except ValueError:
+            continue
+    if not choices:
+        return None
+    return min(choices, key=lambda candidate: abs((candidate - reference_utc).total_seconds()))
+
+
+def parse_taf_extremes_for_local_day(raw_taf: Any, issued: Any, city: dict[str, Any], market_local_date: str) -> dict[str, dict[str, Any]]:
+    """Extract TX/TN groups whose forecast time belongs to one IANA market day.
+
+    Returned values are converted to the contract's native C/F unit. This is a
+    local, tree12-owned copy so the strategy never depends on tree5 TAF code.
+    """
+    raw = str(raw_taf or "").upper()
+    issued_utc = parse_utc(issued)
+    if not raw.startswith("TAF") or issued_utc is None:
+        return {}
+    parsed: dict[str, dict[str, Any]] = {}
+    for kind, minus, digits, day, hour in TAF_EXTREME_RE.findall(raw):
+        forecast_at = _resolve_taf_day_hour(issued_utc, int(day), int(hour))
+        if forecast_at is None or local_market_date(forecast_at, city) != market_local_date:
+            continue
+        celsius = float(int(digits))
+        if minus == "M":
+            celsius *= -1.0
+        direction = "high" if kind == "TX" else "low"
+        value_native = celsius_to_native(celsius, city["market_unit"])
+        candidate = {
+            "direction": direction,
+            "value_c": celsius,
+            "value_native": value_native,
+            "market_unit": city["market_unit"],
+            "forecast_time_utc": iso_utc(forecast_at),
+            "issued_utc": iso_utc(issued_utc),
+            "raw_group": f"{kind}{minus}{digits}/{day}{hour}Z",
+        }
+        previous = parsed.get(direction)
+        if previous is None or candidate["forecast_time_utc"] >= previous["forecast_time_utc"]:
+            parsed[direction] = candidate
+    return parsed
+
+
+def tree12_day_key(city: dict[str, Any], market_local_date: str) -> str:
+    return f"{city['city_id']}|{market_local_date}"
+
+
+def due_tree12_taf_cities(state: dict[str, Any], cities: dict[str, dict[str, Any]], now_utc: datetime, config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return cities whose first post-01:00 TAF fetch (or bounded retry) is due."""
+    tree = ensure_tree12_state(state)
+    fetch_hour = int(config.get("tree12_taf_fetch_local_hour", 1))
+    retry_seconds = int(config.get("tree12_taf_retry_seconds", 900))
+    due: list[dict[str, Any]] = []
+    for city in cities.values():
+        local_now = now_utc.astimezone(ZoneInfo(city["timezone"]))
+        if local_now.hour < fetch_hour:
+            continue
+        market_date = local_now.date().isoformat()
+        key = tree12_day_key(city, market_date)
+        prior = tree["taf_fetches"].get(key, {})
+        if prior.get("status") == "complete" and prior.get("market_local_date") == market_date:
+            continue
+        last_attempt = parse_utc(prior.get("last_attempt_utc"))
+        if last_attempt is not None and (now_utc - last_attempt).total_seconds() < retry_seconds:
+            continue
+        due.append(city)
+    return due
+
+
+def record_tree12_taf_reports(state: dict[str, Any], reports: list[dict[str, Any]], cities: dict[str, dict[str, Any]], now_utc: datetime, source_endpoint: str) -> list[dict[str, Any]]:
+    """Persist tree12-owned daily TAF extrema. Missing TX/TN is explicit and does not trade."""
+    tree = ensure_tree12_state(state)
+    by_icao = {str(report.get("icao", "")).upper(): report for report in reports if isinstance(report, dict)}
+    actions: list[dict[str, Any]] = []
+    for city in cities.values():
+        local_date = now_utc.astimezone(ZoneInfo(city["timezone"])).date().isoformat()
+        day_key = tree12_day_key(city, local_date)
+        report = by_icao.get(city["icao"])
+        fetch_record = {
+            "city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
+            "last_attempt_utc": iso_utc(now_utc), "source_endpoint": source_endpoint,
+        }
+        if report is None:
+            tree["taf_fetches"][day_key] = {**fetch_record, "status": "failed_missing_station_taf"}
+            actions.append({"action_type": "tree12_taf_fetch", "status": "failed_missing_station_taf", **fetch_record})
+            continue
+        parsed = parse_taf_extremes_for_local_day(report.get("raw_text"), report.get("issued"), city, local_date)
+        missing = sorted({"high", "low"} - set(parsed))
+        if missing:
+            tree["taf_fetches"][day_key] = {**fetch_record, "status": "failed_missing_local_day_extreme", "missing_directions": missing, "taf_issued_utc": report.get("issued")}
+            actions.append({"action_type": "tree12_taf_fetch", "status": "failed_missing_local_day_extreme", "missing_directions": missing, **fetch_record})
+            continue
+        tree["taf_fetches"][day_key] = {**fetch_record, "status": "complete", "taf_issued_utc": report.get("issued")}
+        for direction, detail in parsed.items():
+            key = f"{day_key}|{direction}"
+            tree["taf_forecasts"][key] = {
+                **detail, "city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
+                "raw_taf": str(report.get("raw_text") or ""), "source_endpoint": source_endpoint,
+                "fetched_at_utc": iso_utc(now_utc),
+            }
+            actions.append({"action_type": "tree12_taf_forecast_recorded", "status": "recorded", "forecast_key": key,
+                            "city_id": city["city_id"], "market_local_date": local_date, **detail})
+    return actions
+
+
 def ensure_tree12_state(state: dict[str, Any]) -> dict[str, Any]:
-    ensure_tree5_state(state)
     tree = state.setdefault("tree12", {})
     if not isinstance(tree, dict):
         raise ValueError("tree12 状态必须为对象")
@@ -34,11 +157,15 @@ def ensure_tree12_state(state: dict[str, Any]) -> dict[str, Any]:
         ("working_orders", {}),
         ("positions", {}),
         ("exit_chases", {}),
-        ("ws_mid_samples", {}),
+        ("ws_ask_samples", {}),
+        ("taf_fetches", {}),
+        ("taf_forecasts", {}),
         ("last_scan_utc", None),
         ("rejects", {}),
     ):
         tree.setdefault(name, default)
+        if name != "last_scan_utc" and not isinstance(tree[name], dict):
+            raise ValueError(f"tree12.{name} 状态必须为对象")
     return tree
 
 
@@ -75,9 +202,9 @@ def position_key(city_id: str, market_local_date: str, direction: str, bucket_id
     return f"{city_id}|{market_local_date}|{direction}|{bucket_id}"
 
 
-def record_ws_sample(state: dict[str, Any], token_id: str, price: Decimal, size: Decimal, now_utc: datetime) -> None:
+def record_ws_ask_sample(state: dict[str, Any], token_id: str, price: Decimal, size: Decimal, now_utc: datetime) -> None:
     tree = ensure_tree12_state(state)
-    samples = tree["ws_mid_samples"].setdefault(str(token_id), [])
+    samples = tree["ws_ask_samples"].setdefault(str(token_id), [])
     samples.append({"ts": _iso(now_utc), "price": str(price), "size": str(size)})
     cutoff = now_utc.astimezone(timezone.utc) - timedelta(hours=TREE12_WS_VWAP_HOURS + 1)
     kept = []
@@ -88,12 +215,12 @@ def record_ws_sample(state: dict[str, Any], token_id: str, price: Decimal, size:
             continue
         if ts >= cutoff:
             kept.append(row)
-    tree["ws_mid_samples"][str(token_id)] = kept[-500:]
+    tree["ws_ask_samples"][str(token_id)] = kept[-500:]
 
 
-def ws_vwap_6h(state: dict[str, Any], token_id: str, now_utc: datetime) -> Decimal | None:
+def ws_ask_vwap_6h(state: dict[str, Any], token_id: str, now_utc: datetime) -> Decimal | None:
     tree = ensure_tree12_state(state)
-    samples = tree["ws_mid_samples"].get(str(token_id)) or []
+    samples = tree["ws_ask_samples"].get(str(token_id)) or []
     cutoff = now_utc.astimezone(timezone.utc) - timedelta(hours=TREE12_WS_VWAP_HOURS)
     num = Decimal("0")
     den = Decimal("0")
@@ -114,7 +241,7 @@ def ws_vwap_6h(state: dict[str, Any], token_id: str, now_utc: datetime) -> Decim
 
 
 def hybrid_limit_price(state: dict[str, Any], token_id: str, best_ask: Decimal, tick: Decimal, now_utc: datetime) -> Decimal:
-    vwap = ws_vwap_6h(state, token_id, now_utc)
+    vwap = ws_ask_vwap_6h(state, token_id, now_utc)
     fair = best_ask if vwap is None else (vwap + best_ask) / Decimal("2")
     limit = min(fair, best_ask)
     floor = TREE12_MIN_NO_ASK + tick
@@ -253,9 +380,9 @@ def taf_forbidden_bucket_ids(
     direction: str,
     rules: list[dict[str, Any]],
 ) -> set[str]:
-    tree5 = ensure_tree5_state(state)
+    tree = ensure_tree12_state(state)
     forbidden: set[str] = set()
-    for forecast in tree5.get("taf_forecasts", {}).values():
+    for forecast in tree.get("taf_forecasts", {}).values():
         if not isinstance(forecast, dict):
             continue
         if (
@@ -468,7 +595,7 @@ def plan_tree12_entries(
                     ask = best_ask_of(books_by_token.get(token))
                     tick = tick_of(books_by_token.get(token))
                     if ask is not None:
-                        record_ws_sample(state, token, ask, Decimal("1"), now_utc)
+                        record_ws_ask_sample(state, token, ask, Decimal("1"), now_utc)
                     pos_shares = _position_shares(tree, key)
                     working = tree["working_orders"].get(key) or {}
                     need = target - pos_shares
@@ -694,9 +821,12 @@ def paper_fill_working_order(
     for field in ("lo", "hi"):
         if order.get(field) is not None:
             pos.setdefault("bucket", {})[field] = order.get(field)
-    prev = _dec(pos.get("shares"), "0") or ZERO
-    pos["shares"] = str(prev + filled)
-    pos["avg_price"] = str(fill_price)
+    prev_shares = _dec(pos.get("shares"), "0") or ZERO
+    prev_avg = _dec(pos.get("avg_price"), "0") or ZERO
+    total_shares = prev_shares + filled
+    weighted_avg = (prev_avg * prev_shares + fill_price * filled) / total_shares
+    pos["shares"] = str(total_shares)
+    pos["avg_price"] = str(weighted_avg)
     pos["updated_at_utc"] = _iso(now_utc)
     return {"status": "paper_filled", "key": key, "filled": str(filled), "position_shares": pos["shares"]}
 

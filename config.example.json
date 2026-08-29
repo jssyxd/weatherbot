@@ -4,7 +4,7 @@
   "execution_order_type": "FAK",
   "target_order_shares": "5",
   "min_execution_price": "0.40",
-  "max_execution_price": "0.99",
+  "max_execution_price": "0.98",
   "max_slippage": "0.10",
   "local_book_max_age_seconds": 3,
   "market_ws_enabled": true,
@@ -61,5 +61,23 @@
   "tree5_action_dir": "data/tree5_actions",
   "health_path": "data/health.json",
   "audit_db_path": "data/audit.sqlite3",
-  "tree12_enabled": true
+  "tree12_enabled": true,
+  "tree12_taf_fetch_local_hour": 1,
+  "tree12_taf_retry_seconds": 900,
+  "tree12_exit_retry_seconds": [
+    0,
+    5,
+    20,
+    60,
+    120
+  ],
+  "tree12_exit_slippage": [
+    0.1,
+    0.2,
+    0.35,
+    0.6,
+    0.9
+  ],
+  "tree12_exit_min_price": 0.01,
+  "tree12_action_dir": "data/tree12_actions"
 }
