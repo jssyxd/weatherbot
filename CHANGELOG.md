@@ -6,6 +6,8 @@
 
 | 类别 | 改动 | 状态与验证要求 |
 |---|---|---|
+| 深度重构（PRD Step 5–10 完成） | 完成 cron agent 遗留的半成品：`execution/market.py`（BookView 归一化盘口）、`execution/order_state.py`（OrderStateMachine，审计 §8）、`execution/paper_executor.py` 的 `match_fak`/`match_gtc` 替换 `match_l2`、`execution/order_intent.py` 的 `Side/OrderType/OrderStatus` str-enum 与 `OrderIntent.new`、`execution/risk_gate.py` 的 `RiskGate` 类、`execution/position.py` 的 Fill 驱动 Position+apply_fill+unrealized_pnl+realized_pnl_for_exit；新增 `adapters/polymarket/orderbook.py`（from_any→BookView）与 `adapters/polymarket/live_executor.py`（薄封装 CLOB 下单器，默认 OFF）。tree2/paper_execution/tree12 各自旧撮合循环已删除，统一委托 `match_fak`/`match_gtc`。 | 177 tests OK；实测出现真实部分成交（2.01 股 + 2.99 股 resting）。 |
+| 观察修复 | ① `RiskGate` BUY 滑点符号修正（`(ask-limit)/ask`，修复 ask 高于限价永不触发 SLIPPAGE_EXCEEDED）；② `audit_store` 的 `idx_audit_order` 索引移到 legacy 迁移之后，修复旧库 `no such column: order_id`。 | 177 tests OK；旧库自动迁移验证通过。 |
 | 订单执行重构 | 新增 `execution/` 包：`order_intent.py`（OrderIntent + OrderStatus + Fill）、`risk_gate.py`（独立风控）、`paper_executor.py`（`match_l2` 按真实 L2 深度逐档撮合，partial fill + FAK 剩余取消显式 + 深度加权均价）。tree12 的 `tree12_paper_fill` 改为走 `match_l2`，不再“按 best_ask 单档整单假成交”。 | 新增 `tests/test_execution_paper.py`（full/partial/zero/FOK/avg-price + risk gate）；本地重跑验证：新代码 35 笔成交、已用 160.92/1000 USDC，旧假成交已被替换。 |
 | 审计 | 3 名独立 `omp` 审计员（herdr 组织）+ 主审计报告：`docs/audit-a-order-execution.md`、`docs/audit-b-websocket-orderbook.md`、`docs/audit-c-risk-state-consistency.md`，PRD 见 `docs/PRD.md`。 | 一致结论：tree12 纸面成交原先不可信、WS 层未接线、无统一 OrderIntent/RiskGate/PnL。 |
 | 策略 | 新增 `tree12_allno_strategy.py`：49 城、high/low 双向、目标 5 股 NO 布局；入场时间窗 `> 当地 00:00 − 24h`、TAF 规避、非共识前 2、`0.85 ≤ best_ask ≤ 0.95`（含端点）；hybrid 限价与 SELL NO FAK 出场阶梯。 | 默认 paper / observe-only；真实成交需外部持仓对账。 |
