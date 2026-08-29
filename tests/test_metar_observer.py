@@ -144,9 +144,10 @@ class MetarObserverTests(unittest.TestCase):
         state: dict = {}
         summary = observer._rebuild_daily_extrema_from_history(
             state, {"ZSPD": city}, reports, "2026-08-22T16:05:00Z", "https://checkwx.test/metar", {"ZSPD": "2026-08-22"},
+            warmup_min_obs=1,
         )
         key = "shanghai|2026-08-22"
-        self.assertEqual(summary, {"complete": 1, "missing_current_local_day_reports": 0})
+        self.assertEqual(summary, {"complete": 1, "missing_current_local_day_reports": 0, "insufficient_obs": 0})
         self.assertEqual(state["daily_extrema"][key]["high"], 30.0)
         self.assertEqual(state["daily_warmup"][key]["status"], "complete")
         self.assertEqual(state["daily_extrema"][key]["warmup_latest_report_time_utc"], "2026-08-22T15:59:00Z")
@@ -167,6 +168,8 @@ class MetarObserverTests(unittest.TestCase):
             "warmup_stations_per_request": 25,
             "checkwx_api_key_env": "TREE4_TEST_CHECKWX_KEY",
             "checkwx_previous_limit": 50,
+            "warmup_source": "checkwx",
+            "warmup_min_obs": 6,
         }
         with patch("metar_observer.utc_now", return_value=fixed_now):
             with patch("metar_observer.fetch_checkwx_reports", return_value=([], "https://checkwx.test/history")) as mocked:
@@ -181,7 +184,7 @@ class MetarObserverTests(unittest.TestCase):
         summary = observer._rebuild_daily_extrema_from_history(
             state, {"ZSPD": city}, [], "2026-08-22T16:05:00Z", "https://checkwx.test/metar", {"ZSPD": "2026-08-23"},
         )
-        self.assertEqual(summary, {"complete": 0, "missing_current_local_day_reports": 1})
+        self.assertEqual(summary, {"complete": 0, "missing_current_local_day_reports": 1, "insufficient_obs": 0})
         self.assertNotIn("shanghai|2026-08-23", state["daily_extrema"])
         self.assertFalse(observer._warmup_is_complete(state, city, "2026-08-23"))
         self.assertEqual(state["daily_warmup"]["shanghai|2026-08-23"]["status"], "failed_no_current_local_day_reports")

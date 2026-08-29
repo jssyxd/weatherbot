@@ -19,6 +19,10 @@
 
   "warmup_stations_per_request": 25,
   "warmup_retry_seconds": 900,
+  "warmup_source": "auto",
+  "warmup_min_obs": 6,
+  "warmup_high_gate_local_hour": 12,
+  "warmup_low_gate_local_hour": 6,
   "market_rules_max_age_seconds": 1800,
 
   "contract_cities_path": "config/contract_cities.json",

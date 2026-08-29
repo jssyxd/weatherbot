@@ -201,6 +201,8 @@ def evaluate_observation(
     city: dict[str, Any],
     market_rules: list[dict[str, Any]],
     max_latency_seconds: int = 900,
+    warmup_high_gate_local_hour: int | None = None,
+    warmup_low_gate_local_hour: int | None = None,
 ) -> list[dict[str, Any]]:
     report_time = parse_utc(event.get("report_time_utc"))
     fetched_at = parse_utc(event.get("fetched_at_utc")) or utc_now()
@@ -244,9 +246,20 @@ def evaluate_observation(
     day["updated_at_utc"] = event.get("fetched_at_utc")
 
     signals: list[dict[str, Any]] = []
+    local_hour = report_time.astimezone(ZoneInfo(city["timezone"])).hour
     for direction, previous, is_new in (("high", previous_high, is_new_high), ("low", previous_low, is_new_low)):
         if not is_new:
             signals.append({"signal_type": "no_signal", "reason": f"not_new_daily_{direction}", "event_id": event.get("event_id"), "local_date": local_date, "city_id": city["city_id"]})
+            continue
+        gate = warmup_high_gate_local_hour if direction == "high" else warmup_low_gate_local_hour
+        if gate is not None and local_hour < gate:
+            # Warm-up history may miss the early local window; keep the extrema
+            # update but refuse candidates until the gated local hour.
+            signals.append({
+                "signal_type": "no_signal", "reason": f"warmup_time_gate_{direction}",
+                "event_id": event.get("event_id"), "local_date": local_date, "city_id": city["city_id"],
+                "direction": direction, "local_hour": local_hour, "gate_local_hour": gate,
+            })
             continue
         rules = market_rules_for(market_rules, city["city_id"], local_date, direction)
         bucket_candidates: list[dict[str, Any]] = []

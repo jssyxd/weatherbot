@@ -16,8 +16,8 @@ from typing import Any
 
 CLOB_BOOK_ENDPOINT = "https://clob.polymarket.com/book"
 CLOB_FEE_RATE_ENDPOINT = "https://clob.polymarket.com/fee-rate"
-MIN_PRICE_INCLUSIVE = Decimal("0.05")
-MAX_PRICE_INCLUSIVE = Decimal("0.98")
+MIN_PRICE_INCLUSIVE = Decimal("0.40")
+MAX_PRICE_INCLUSIVE = Decimal("0.99")
 # Per-user spec: every paper order is a FIXED quantity of 5 shares (the
 # exchange minimum order size). No USDC-tier sizing: a $1-$3 intent often
 # cannot reach min_order_size=5 at ask >= 0.20, so those orders were being
@@ -25,6 +25,9 @@ MAX_PRICE_INCLUSIVE = Decimal("0.98")
 # debit cap (20 USDC) still bounds how many 5-share intents fit per day.
 TARGET_ORDER_SHARES = Decimal("5")
 CITY_DAY_MAX_TOTAL_DEBIT = Decimal("20.00")
+# FAK allows partial fills: any depth >= 1 share is accepted; min_order_size=5
+# constrains order size, not filled quantity.
+MIN_PAPER_FILL_SHARES = Decimal("1")
 
 
 def utc_now_string() -> str:
@@ -125,7 +128,7 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
         if not MIN_PRICE_INCLUSIVE <= best_ask <= MAX_PRICE_INCLUSIVE:
             return _rejected(
                 "paper_fill_rejected_best_ask_outside_gate",
-                "最优 ask 不在包含端点的价格门槛 [0.05, 0.98] 内。",
+                "最优 ask 不在包含端点的价格门槛 [0.40, 0.99] 内。",
                 best_ask=float(best_ask), book_endpoint=book_endpoint, fee_endpoint=fee_endpoint,
             )
         remaining_city_budget = CITY_DAY_MAX_TOTAL_DEBIT - already_spent
@@ -163,10 +166,10 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
             if filled_shares >= target_shares:
                 break
         total_debit = principal + fees
-        if filled_shares < min_order_size:
+        if filled_shares < MIN_PAPER_FILL_SHARES:
             return _rejected(
                 "paper_fill_rejected_below_min_order_size",
-                "订单簿在价格门槛内的累计深度不足 5 股（最小订单规模）。",
+                "订单簿在价格门槛内的累计深度不足 1 股（最小可成交规模）。",
                 best_ask=float(best_ask), min_order_size=float(min_order_size), estimated_shares=float(filled_shares),
                 book_endpoint=book_endpoint, fee_endpoint=fee_endpoint,
             )
