@@ -12,9 +12,10 @@ from typing import Any, Iterable
 
 from clob_market_data import CLOBDataError, CLOBMarketData, BookSnapshot
 from execution_policy import decide_buy_no
+from paper_capital import remaining_capital_usdc, reserve
 
 TARGET_ORDER_SHARES = Decimal("5")
-CITY_DAY_MAX_TOTAL_DEBIT = Decimal("20.00")
+CITY_DAY_MAX_TOTAL_DEBIT_DEFAULT = Decimal("20.00")
 MIN_EXECUTION_PRICE = Decimal("0.05")
 MAX_EXECUTION_PRICE = Decimal("0.98")
 DEFAULT_MAX_SLIPPAGE = Decimal("0.10")
@@ -141,7 +142,8 @@ def simulate(signal: dict[str, Any], state: dict[str, Any], market_data: CLOBMar
     ledger = state.setdefault("paper_city_day_total_debit", {})
     key = f"{signal.get('city_id')}|{signal.get('market_local_date')}"
     already_spent = Decimal(str(ledger.get(key, 0)))
-    remaining = CITY_DAY_MAX_TOTAL_DEBIT - already_spent
+    city_day_max = Decimal(str(state.get("paper_city_day_max_debit_usdc", CITY_DAY_MAX_TOTAL_DEBIT_DEFAULT)))
+    remaining = city_day_max - already_spent
     if remaining <= 0:
         return {**result, "status": "paper_fill_rejected_city_day_cap", "decision_code": "CITY_DAY_CAP"}
 
@@ -151,6 +153,8 @@ def simulate(signal: dict[str, Any], state: dict[str, Any], market_data: CLOBMar
     total = intent.principal_usdc + intent.estimated_fee_usdc
     if total > remaining:
         return {**result, "status": "paper_fill_rejected_city_day_cap", "total_debit_usdc": str(total), "intent": intent.as_dict()}
+    if reserve(state, total) is None:
+        return {**result, "status": "paper_fill_rejected_insufficient_capital", "decision_code": "INSUFFICIENT_CAPITAL", "total_debit_usdc": str(total), "remaining_capital_usdc": str(remaining_capital_usdc(state))}
     ledger[key] = float((already_spent + total).quantize(Decimal("0.00001")))
     return {
         **result, "status": "paper_fill_estimate", "intent": intent.as_dict(),
@@ -158,4 +162,6 @@ def simulate(signal: dict[str, Any], state: dict[str, Any], market_data: CLOBMar
         "principal_usdc": str(intent.principal_usdc), "estimated_fee_usdc": str(intent.estimated_fee_usdc),
         "total_debit_usdc": str(total), "average_price": str(intent.average_price),
         "spent_city_day_total_debit_usdc_after": str(ledger[key]),
+        "paper_initial_capital_usdc": str(state.get("paper_initial_capital_usdc", 1000)),
+        "remaining_capital_usdc": str(remaining_capital_usdc(state)),
     }

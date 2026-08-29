@@ -199,8 +199,11 @@ def load_config(config_path: Path) -> dict[str, Any]:
     if not 0 < market_metadata_timeout <= 10:
         raise ValueError("market_metadata_timeout_seconds 必须介于 0（不含）和 10（含）")
     market_refresh_deadline = float(config.get("market_refresh_deadline_seconds", 30))
-    if not market_metadata_timeout <= market_refresh_deadline <= 90:
-        raise ValueError("market_refresh_deadline_seconds 必须不小于单请求超时且不大于 90")
+    if not market_metadata_timeout <= market_refresh_deadline <= 300:
+        raise ValueError("market_refresh_deadline_seconds 必须不小于单请求超时且不大于 300")
+    market_rule_lookahead_days = int(config.get("market_rule_lookahead_days", 3))
+    if not 1 <= market_rule_lookahead_days <= 7:
+        raise ValueError("market_rule_lookahead_days 必须介于 1 和 7")
     mode = str(config.get("mode", "paper")).lower().strip()
     if mode not in {"observe", "paper", "live"}:
         raise ValueError("mode 只能为 observe、paper 或 live")
@@ -222,6 +225,12 @@ def load_config(config_path: Path) -> dict[str, Any]:
         raise ValueError("max_execution_price 不得大于 0.98（CLOB 可交易价格上限）")
     if max_slippage < 0:
         raise ValueError("max_slippage 不得为负")
+    paper_initial_capital_usdc = float(config.get("paper_initial_capital_usdc", 1000.0))
+    if paper_initial_capital_usdc <= 0:
+        raise ValueError("paper_initial_capital_usdc 必须大于 0")
+    paper_city_day_max_debit_usdc = float(config.get("paper_city_day_max_debit_usdc", 20.0))
+    if paper_city_day_max_debit_usdc < 0:
+        raise ValueError("paper_city_day_max_debit_usdc 不得为负")
     local_book_max_age = float(config.get("local_book_max_age_seconds", 3))
     if local_book_max_age <= 0:
         raise ValueError("local_book_max_age_seconds 必须大于 0")
@@ -263,6 +272,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "market_rules_max_age_seconds": market_rules_max_age,
         "market_metadata_timeout_seconds": market_metadata_timeout,
         "market_refresh_deadline_seconds": market_refresh_deadline,
+        "market_rule_lookahead_days": market_rule_lookahead_days,
         "mode": mode,
         "execution_engine": execution_engine,
         "execution_order_type": order_type,
@@ -270,6 +280,8 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "min_execution_price": min_execution_price,
         "max_execution_price": max_execution_price,
         "max_slippage": max_slippage,
+        "paper_initial_capital_usdc": paper_initial_capital_usdc,
+        "paper_city_day_max_debit_usdc": paper_city_day_max_debit_usdc,
         "local_book_max_age_seconds": local_book_max_age,
         "market_ws_enabled": bool(config.get("market_ws_enabled", False)),
         "tree5_enabled": bool(config.get("tree5_enabled", False)),
@@ -589,6 +601,7 @@ def load_state(state_path: Path) -> dict[str, Any]:
         ("edge_failures", {}), ("daily_extrema", {}), ("daily_warmup", {}), ("handled_candidate_buckets", {}),
         ("market_rules", []), ("market_rules_refreshed_at_utc", None), ("market_failures", {}), ("consecutive_failure_started_utc", None),
         ("paper_city_day_notional", {}), ("paper_city_day_total_debit", {}), ("execution_paused", False),
+        ("paper_initial_capital_usdc", 1000.0), ("paper_total_debit_usdc", 0.0), ("paper_city_day_max_debit_usdc", 20.0),
     ):
         state.setdefault(key, default)
     return state
@@ -816,15 +829,31 @@ def market_rules_cover_local_days(state: dict[str, Any], cities: dict[str, dict[
     return True
 
 
+def _market_rule_local_dates(cities: dict[str, dict[str, Any]], lookahead_days: int) -> dict[str, list[str]]:
+    """Return today plus the next ``lookahead_days - 1`` IANA-local market dates.
+
+    tree12 lays out NO positions more than 24 hours before a local day, so the
+    market-rule snapshot must include future local days, not just today.
+    """
+    lookahead_days = max(1, int(lookahead_days))
+    dates: dict[str, list[str]] = {}
+    for icao, city in cities.items():
+        tz = ZoneInfo(city["timezone"])
+        today = utc_now().astimezone(tz).date()
+        dates[icao] = [(today + timedelta(days=offset)).isoformat() for offset in range(lookahead_days)]
+    return dates
+
+
 def refresh_market_rules_if_due(state: dict[str, Any], config: dict[str, Any], cities: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
     """Refresh Gamma market rules when stale or when any local day rolled over.
 
     tree1 removes all forecast-edge configuration; only market rules (bucket /
-    token structure) are refreshed.
+    token structure) are refreshed. A configurable lookahead window keeps
+    future-day buckets available for the tree12 early-NO layout.
     """
     if cache_is_fresh(state.get("market_rules_refreshed_at_utc"), config["market_rules_max_age_seconds"]) and market_rules_cover_local_days(state, cities):
         return None
-    local_dates = {icao: local_market_date(utc_now(), city) for icao, city in cities.items()}
+    local_dates = _market_rule_local_dates(cities, int(config.get("market_rule_lookahead_days", 3)))
     try:
         rules, failures = refresh_market_rules(
             cities, local_dates, timeout_seconds=float(config.get("market_metadata_timeout_seconds", 3)),
@@ -1021,6 +1050,8 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
     fetched_at = iso_now()
     state = load_state(config["state_path"])
     state["execution_engine"] = config.get("execution_engine", "legacy")
+    state["paper_initial_capital_usdc"] = float(config.get("paper_initial_capital_usdc", 1000.0))
+    state["paper_city_day_max_debit_usdc"] = float(config.get("paper_city_day_max_debit_usdc", 20.0))
     cities = load_contract_cities(config["contract_cities_path"])
     warmup_summary = warm_up_current_local_days(config, state, cities)
     # Process published observations with the last known good market rules first.
@@ -1194,6 +1225,8 @@ def run_loop(config: dict[str, Any]) -> None:
     # Startup: IANA local-day warm-up first, then fresh market rules.
     startup_state = load_state(config["state_path"])
     startup_state["execution_engine"] = config.get("execution_engine", "legacy")
+    startup_state["paper_initial_capital_usdc"] = float(config.get("paper_initial_capital_usdc", 1000.0))
+    startup_state["paper_city_day_max_debit_usdc"] = float(config.get("paper_city_day_max_debit_usdc", 20.0))
     ensure_tree5_state(startup_state)
     startup_cities = load_contract_cities(config["contract_cities_path"])
     startup_warmup = warm_up_current_local_days(config, startup_state, startup_cities)

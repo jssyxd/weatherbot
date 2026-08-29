@@ -1,0 +1,13 @@
+services:
+  weatherbot:
+    build: .
+    container_name: weatherbot-tree12
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./data:/app/data
+    # Legacy paper path talks to public Polymarket CLOB REST + CheckWX +
+    # AviationWeather + Gamma; no real wallet/keys/order submission.

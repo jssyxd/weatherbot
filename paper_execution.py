@@ -14,17 +14,18 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
+from paper_capital import remaining_capital_usdc, reserve
+
 CLOB_BOOK_ENDPOINT = "https://clob.polymarket.com/book"
 CLOB_FEE_RATE_ENDPOINT = "https://clob.polymarket.com/fee-rate"
 MIN_PRICE_INCLUSIVE = Decimal("0.40")
 MAX_PRICE_INCLUSIVE = Decimal("0.98")
 # Per-user spec: every paper order is a FIXED quantity of 5 shares (the
-# exchange minimum order size). No USDC-tier sizing: a $1-$3 intent often
-# cannot reach min_order_size=5 at ask >= 0.20, so those orders were being
-# rejected (paper_fill_rejected_below_min_order_size). The city-day total
-# debit cap (20 USDC) still bounds how many 5-share intents fit per day.
+# exchange minimum order size). The paper account starts with 1000 USDC and
+# every simulated fill reserves cash from that global ledger. The optional
+# per-city-day debit cap remains configurable via state for extra safety.
 TARGET_ORDER_SHARES = Decimal("5")
-CITY_DAY_MAX_TOTAL_DEBIT = Decimal("20.00")
+CITY_DAY_MAX_TOTAL_DEBIT_DEFAULT = Decimal("20.00")
 
 
 def utc_now_string() -> str:
@@ -96,13 +97,15 @@ def _rejected(status: str, message: str, **details: Any) -> dict[str, Any]:
 def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     """Estimate a FAK BUY_NO fill from public book levels.
 
-    Intent size is a FIXED 5 shares (the exchange minimum order size);
-    the city-day cap is 20 USDC total debit.
+    Intent size is a FIXED 5 shares (the exchange minimum order size).
+    Cash is reserved from the global 1000-USDC paper account; an optional
+    per-city-day debit cap remains configurable via state.
     """
     no_token_id = str(signal.get("bucket", {}).get("no_token_id") or "")
     city_day_key = f"{signal.get('city_id')}|{signal.get('market_local_date')}"
     ledger: dict[str, float] = state.setdefault("paper_city_day_total_debit", {})
     already_spent = Decimal(str(ledger.get(city_day_key, 0.0)))
+    city_day_max = Decimal(str(state.get("paper_city_day_max_debit_usdc", CITY_DAY_MAX_TOTAL_DEBIT_DEFAULT)))
     if not no_token_id:
         return _rejected("paper_fill_rejected_missing_no_token", "候选桶没有有效 NO token；未读取订单簿。")
     try:
@@ -128,13 +131,13 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
                 "最优 ask 不在包含端点的价格门槛 [0.40, 0.98] 内。",
                 best_ask=float(best_ask), book_endpoint=book_endpoint, fee_endpoint=fee_endpoint,
             )
-        remaining_city_budget = CITY_DAY_MAX_TOTAL_DEBIT - already_spent
+        remaining_city_budget = city_day_max - already_spent
         if remaining_city_budget <= 0:
             return _rejected(
                 "paper_fill_rejected_city_day_cap",
                 "该城市当地日的含费用总现金余量已用尽。",
                 required_intent_total_debit_usdc=float(TARGET_ORDER_SHARES),
-                total_debit_budget_usdc=float(CITY_DAY_MAX_TOTAL_DEBIT), spent_city_day_total_debit_usdc=float(already_spent),
+                total_debit_budget_usdc=float(city_day_max), spent_city_day_total_debit_usdc=float(already_spent),
             )
         target_shares = TARGET_ORDER_SHARES
         filled_shares = Decimal("0")
@@ -175,10 +178,18 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
                 "paper_fill_rejected_city_day_cap",
                 "5 股订单含费用总成本超过该城市当地日的剩余现金余量。",
                 required_shares=float(target_shares), required_total_debit_usdc=float(total_debit),
-                total_debit_budget_usdc=float(CITY_DAY_MAX_TOTAL_DEBIT), spent_city_day_total_debit_usdc=float(already_spent),
+                total_debit_budget_usdc=float(city_day_max), spent_city_day_total_debit_usdc=float(already_spent),
             )
         if total_debit <= 0:
             return _rejected("paper_fill_rejected_no_affordable_depth", "没有能在价格门槛内成交的有效深度。", book_endpoint=book_endpoint, fee_endpoint=fee_endpoint)
+        if reserve(state, total_debit) is None:
+            return _rejected(
+                "paper_fill_rejected_insufficient_capital",
+                "5 股订单含费用总成本超过纸面账户剩余资金。",
+                required_total_debit_usdc=float(total_debit),
+                remaining_capital_usdc=float(remaining_capital_usdc(state)),
+                paper_initial_capital_usdc=float(state.get("paper_initial_capital_usdc", 1000)),
+            )
         ledger[city_day_key] = float((already_spent + total_debit).quantize(Decimal("0.00001")))
         return {
             "mode": "paper", "status": "paper_fill_estimate", "message": "公开订单簿快照的纸面 FAK 估算；不保证真实可成交，且未提交订单。",
@@ -192,6 +203,8 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
             "unspent_city_day_budget_usdc": float(remaining_city_budget - total_debit),
             "spent_city_day_total_debit_usdc_before": float(already_spent),
             "spent_city_day_total_debit_usdc_after": ledger[city_day_key], "fills": fills,
+            "paper_initial_capital_usdc": float(state.get("paper_initial_capital_usdc", 1000)),
+            "remaining_capital_usdc": float(remaining_capital_usdc(state)),
             "retrieved_at_utc": utc_now_string(),
         }
     except RuntimeError as exc:

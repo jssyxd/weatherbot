@@ -13,6 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from edge_engine import celsius_to_native, local_market_date, parse_utc
+from paper_capital import remaining_capital_usdc, reserve
 
 TREE12_TARGET_SHARES = Decimal("5")
 TREE12_MIN_NO_ASK = Decimal("0.85")
@@ -22,6 +23,7 @@ TREE12_REQUOTE_TICKS = 2
 TREE12_DEFAULT_EXIT_RETRY_SECONDS = (0, 5, 20, 60, 120)
 TREE12_DEFAULT_EXIT_SLIPPAGE = (Decimal("0.10"), Decimal("0.20"), Decimal("0.35"), Decimal("0.60"), Decimal("0.90"))
 TAF_EXTREME_RE = re.compile(r"\b(TX|TN)(M?)(\d{2})/(\d{2})(\d{2})Z\b")
+TREE12_PAPER_FEE_RATE = Decimal("0.05")
 ZERO = Decimal("0")
 
 
@@ -614,6 +616,12 @@ def plan_tree12_entries(
                     if limit <= TREE12_MIN_NO_ASK:
                         actions.append({"action_type": "tree12_entry", "status": "blocked_limit_not_above_085", "key": key, "limit": str(limit)})
                         continue
+                    paper_mode = config.get("mode") in {"paper", "observe"}
+                    estimated_debit = _tree12_estimated_debit(need, limit)
+                    if paper_mode and remaining_capital_usdc(state) < estimated_debit:
+                        actions.append({"action_type": "tree12_entry", "status": "blocked_insufficient_capital", "key": key,
+                                        "required_debit_usdc": str(estimated_debit), "remaining_capital_usdc": str(remaining_capital_usdc(state))})
+                        continue
                     if working and working.get("status") == "working_gtc_buy_no":
                         old_limit = _dec(working.get("limit_price"))
                         if old_limit is not None and abs(old_limit - limit) >= tick * TREE12_REQUOTE_TICKS:
@@ -651,6 +659,8 @@ def plan_tree12_entries(
                     }
                     tree["working_orders"][key] = order
                     actions.append({"action_type": "tree12_submit_entry", "status": "planned_observe_only", **order})
+                    if paper_mode:
+                        actions.append(tree12_paper_fill(state, key, need, ask, now_utc))
     tree["last_scan_utc"] = _iso(now_utc)
     return actions
 
@@ -783,6 +793,53 @@ def plan_tree12_exits_from_taf_revision(
             "shares": str(shares),
         })
     return actions
+
+
+def _tree12_estimated_debit(shares: Decimal, price: Decimal) -> Decimal:
+    fee = shares * TREE12_PAPER_FEE_RATE * price * (Decimal("1") - price)
+    return shares * price + fee
+
+
+def tree12_paper_fill(
+    state: dict[str, Any],
+    key: str,
+    shares: Decimal,
+    fill_price: Decimal,
+    now_utc: datetime,
+) -> dict[str, Any]:
+    """Simulate a tree12 NO fill at the executable best ask (paper mode only).
+
+    Cash is reserved from the shared 1000-USDC paper account. On success the
+    working order becomes a reconciled paper position via
+    ``paper_fill_working_order``.
+    """
+    tree = ensure_tree12_state(state)
+    order = tree["working_orders"].get(key)
+    if not isinstance(order, dict) or order.get("status") != "working_gtc_buy_no":
+        return {"action_type": "tree12_paper_fill", "status": "no_working_order", "key": key}
+    shares = _dec(shares, "0") or ZERO
+    fill_price = _dec(fill_price) or ZERO
+    if shares <= ZERO or fill_price <= ZERO:
+        return {"action_type": "tree12_paper_fill", "status": "invalid_fill", "key": key}
+    principal = shares * fill_price
+    estimated_fee = shares * TREE12_PAPER_FEE_RATE * fill_price * (Decimal("1") - fill_price)
+    total_debit = principal + estimated_fee
+    if reserve(state, total_debit) is None:
+        order["status"] = "blocked_insufficient_capital"
+        order["updated_at_utc"] = _iso(now_utc)
+        tree["working_orders"][key] = order
+        return {
+            "action_type": "tree12_paper_fill", "status": "blocked_insufficient_capital", "key": key,
+            "token_id": order.get("token_id"), "required_debit_usdc": str(total_debit),
+            "remaining_capital_usdc": str(remaining_capital_usdc(state)),
+        }
+    result = paper_fill_working_order(state, key, shares, fill_price, now_utc)
+    result["action_type"] = "tree12_paper_fill"
+    result["principal_usdc"] = str(principal)
+    result["estimated_fee_usdc"] = str(estimated_fee)
+    result["total_debit_usdc"] = str(total_debit)
+    result["remaining_capital_usdc"] = str(remaining_capital_usdc(state))
+    return result
 
 
 def paper_fill_working_order(

@@ -8,7 +8,9 @@ from tree12_allno_strategy import (
     plan_tree12_exits_from_metar, position_key, record_ws_ask_sample,
     start_tree12_exit_chase, plan_tree12_due_exit_faks,
     parse_taf_extremes_for_local_day, record_tree12_taf_reports, ensure_tree12_state,
+    tree12_paper_fill,
 )
+from paper_capital import remaining_capital_usdc, reserve
 
 def city_shanghai():
     return {"city_id": "shanghai", "icao": "ZSPD", "timezone": "Asia/Shanghai", "market_unit": "C"}
@@ -88,6 +90,23 @@ class Tree12AllNoTests(unittest.TestCase):
         self.assertIn("high", parsed)
         self.assertEqual(parsed["high"]["value_native"], 32.0)
         self.assertEqual(parsed["high"]["direction"], "high")
+
+    def test_tree12_paper_fill_reserves_capital_and_blocks_when_exhausted(self):
+        state = {"paper_initial_capital_usdc": 1000.0, "paper_total_debit_usdc": 0.0,
+                 "tree12": {"working_orders": {"k1": {"key": "k1", "status": "working_gtc_buy_no", "remaining_shares": "5",
+                    "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high", "bucket_id": "b32",
+                    "token_id": "no-32", "lo": 32, "hi": 33}}, "positions": {}, "exit_chases": {}, "ws_ask_samples": {}}}
+        now = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        result = tree12_paper_fill(state, "k1", Decimal("5"), Decimal("0.90"), now)
+        self.assertEqual(result["status"], "paper_filled")
+        self.assertGreater(float(state["paper_total_debit_usdc"]), 0)
+        # Exhaust capital: a second 5-share fill at 0.90 should be blocked.
+        state["paper_total_debit_usdc"] = 999.0
+        state["tree12"]["working_orders"]["k2"] = {"key": "k2", "status": "working_gtc_buy_no", "remaining_shares": "5",
+            "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high", "bucket_id": "b33", "token_id": "no-33", "lo": 33, "hi": 34}
+        blocked = tree12_paper_fill(state, "k2", Decimal("5"), Decimal("0.90"), now)
+        self.assertEqual(blocked["status"], "blocked_insufficient_capital")
+        self.assertEqual(state["tree12"]["working_orders"]["k2"]["status"], "blocked_insufficient_capital")
 
 if __name__ == "__main__":
     unittest.main()

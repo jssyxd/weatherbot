@@ -10,6 +10,7 @@ import re
 import urllib.error
 import urllib.request
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import Any
 
@@ -124,35 +125,59 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
     }]
 
 
-def refresh_market_rules(cities: dict[str, dict[str, Any]], local_dates: dict[str, str], timeout_seconds: float = 5.0, total_deadline_seconds: float = 60.0) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Fetch public Gamma metadata under strict per-request and total deadlines.
+def refresh_market_rules(cities: dict[str, dict[str, Any]], local_dates: dict[str, list[str]], timeout_seconds: float = 5.0, total_deadline_seconds: float = 180.0) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Fetch public Gamma metadata with bounded concurrency and total deadline.
 
-    A failed remote market-data endpoint must not prevent weather observation or
-    warm-up progress. Remaining city/direction pairs are explicitly marked as
-    deadline failures so callers remain fail-closed instead of treating partial
-    market rules as complete.
+    ``local_dates`` maps each ICAO to one or more IANA-local market dates. The
+    tree12 strategy lays out NO positions more than 24 hours before a local day,
+    so callers should request today plus the next couple of days. A failed
+    remote market-data endpoint must not prevent weather observation or warm-up
+    progress; missing pairs are recorded as explicit failures so callers remain
+    fail-closed instead of treating partial market rules as complete.
     """
     rules: list[dict[str, Any]] = []
     failures: dict[str, str] = {}
-    started = time.monotonic()
+    tasks: list[tuple[dict[str, Any], str, str]] = []
     for city in cities.values():
-        local_date = local_dates[city["icao"]]
-        for direction in ("high", "low"):
-            key = f"{city['city_id']}|{local_date}|{direction}"
+        dates = local_dates.get(city["icao"]) or []
+        if isinstance(dates, str):
+            dates = [dates]
+        for local_date in dates:
+            for direction in ("high", "low"):
+                tasks.append((city, local_date, direction))
+
+    def fetch_one(task: tuple[dict[str, Any], str, str]) -> tuple[str, str | None, list[dict[str, Any]]]:
+        city, local_date, direction = task
+        key = f"{city['city_id']}|{local_date}|{direction}"
+        slug = event_slug(str(city.get("market_city_slug") or city["city_id"]), local_date, direction)
+        try:
+            event = _fetch_json(GAMMA_EVENT_ENDPOINT + slug, timeout_seconds=timeout_seconds)
+            if not event:
+                return key, "event_not_found", []
+            parsed = parse_event_rules(event, city, local_date, direction)
+            if not parsed:
+                return key, "no_trade_ready_parsed_rules", []
+            return key, None, parsed
+        except (RuntimeError, ValueError, KeyError, json.JSONDecodeError, TimeoutError) as exc:
+            return key, f"market_discovery_failed:{type(exc).__name__}", []
+        except Exception as exc:  # noqa: BLE001 - fail-closed per remote pair
+            return key, f"market_discovery_failed:{type(exc).__name__}", []
+
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_one, task): task for task in tasks}
+        for future in as_completed(futures):
             if time.monotonic() - started >= total_deadline_seconds:
-                failures[key] = "market_discovery_deadline_exceeded"
-                continue
-            slug = event_slug(str(city.get("market_city_slug") or city["city_id"]), local_date, direction)
-            try:
-                event = _fetch_json(GAMMA_EVENT_ENDPOINT + slug, timeout_seconds=timeout_seconds)
-                if not event:
-                    failures[key] = "event_not_found"
-                    continue
-                parsed = parse_event_rules(event, city, local_date, direction)
-                if not parsed:
-                    failures[key] = "no_trade_ready_parsed_rules"
-                    continue
+                for pending in futures:
+                    pending.cancel()
+                for task in tasks:
+                    city, local_date, direction = task
+                    key = f"{city['city_id']}|{local_date}|{direction}"
+                    failures.setdefault(key, "market_discovery_deadline_exceeded")
+                break
+            key, error, parsed = future.result()
+            if error:
+                failures[key] = error
+            else:
                 rules.extend(parsed)
-            except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-                failures[key] = f"market_discovery_failed:{type(exc).__name__}"
     return rules, failures
