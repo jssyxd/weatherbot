@@ -17,13 +17,14 @@ from typing import Any
 CLOB_BOOK_ENDPOINT = "https://clob.polymarket.com/book"
 CLOB_FEE_RATE_ENDPOINT = "https://clob.polymarket.com/fee-rate"
 MIN_PRICE_INCLUSIVE = Decimal("0.40")
-MAX_PRICE_INCLUSIVE = Decimal("0.98")
-# Per-user spec: every paper order is a FIXED quantity of 5 shares (the
+MAX_PRICE_INCLUSIVE = Decimal("0.99")
+# Per-user spec: every paper order is a >=1 share (FAK partial fill) (the
 # exchange minimum order size). No USDC-tier sizing: a $1-$3 intent often
 # cannot reach min_order_size=5 at ask >= 0.20, so those orders were being
 # rejected (paper_fill_rejected_below_min_order_size). The city-day total
 # debit cap (20 USDC) still bounds how many 5-share intents fit per day.
-TARGET_ORDER_SHARES = Decimal("5")
+TARGET_ORDER_SHARES = Decimal("1")
+MIN_PAPER_FILL_SHARES = Decimal("1")
 CITY_DAY_MAX_TOTAL_DEBIT = Decimal("20.00")
 
 
@@ -96,7 +97,7 @@ def _rejected(status: str, message: str, **details: Any) -> dict[str, Any]:
 def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     """Estimate a FAK BUY_NO fill from public book levels.
 
-    Intent size is a FIXED 5 shares (the exchange minimum order size);
+    Intent size is a >=1 share (the exchange minimum order size);
     the city-day cap is 20 USDC total debit.
     """
     no_token_id = str(signal.get("bucket", {}).get("no_token_id") or "")
@@ -149,7 +150,7 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
                 continue
             per_share_fee = fee_rate * price * (Decimal("1") - price)
             per_share_total = price + per_share_fee
-            # Fixed 5-share intent: walk levels until 5 shares are filled.
+            # FAK >=1 share intent: walk levels until 5 shares are filled.
             quantity = min(size, target_shares - filled_shares)
             quantity = _floor_size(quantity)
             if quantity <= 0:
@@ -163,17 +164,17 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
             if filled_shares >= target_shares:
                 break
         total_debit = principal + fees
-        if filled_shares < min_order_size:
+        if filled_shares < MIN_PAPER_FILL_SHARES:
             return _rejected(
                 "paper_fill_rejected_below_min_order_size",
-                "订单簿在价格门槛内的累计深度不足 5 股（最小订单规模）。",
+                "订单簿在价格门槛内的累计深度不足 1 股（最小订单规模）。",
                 best_ask=float(best_ask), min_order_size=float(min_order_size), estimated_shares=float(filled_shares),
                 book_endpoint=book_endpoint, fee_endpoint=fee_endpoint,
             )
         if total_debit > remaining_city_budget:
             return _rejected(
                 "paper_fill_rejected_city_day_cap",
-                "5 股订单含费用总成本超过该城市当地日的剩余现金余量。",
+                "1 股订单含费用总成本超过该城市当地日的剩余现金余量。",
                 required_shares=float(target_shares), required_total_debit_usdc=float(total_debit),
                 total_debit_budget_usdc=float(CITY_DAY_MAX_TOTAL_DEBIT), spent_city_day_total_debit_usdc=float(already_spent),
             )
