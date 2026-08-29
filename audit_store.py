@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at_utc);
 CREATE INDEX IF NOT EXISTS idx_audit_token ON audit_events(token_id);
-CREATE INDEX IF NOT EXISTS idx_audit_order ON audit_events(order_id);
 CREATE TABLE IF NOT EXISTS risk_ledger (
     ledger_key TEXT PRIMARY KEY,
     debit_usdc TEXT NOT NULL,
@@ -50,6 +49,9 @@ class AuditStore:
         self._connection = sqlite3.connect(self.path, timeout=10, isolation_level="DEFERRED")
         self._connection.executescript(SCHEMA)
         self._migrate_order_id_column()
+        # The order_id index is created after the migration so a legacy DB
+        # (without order_id) can be upgraded without the SCHEMA index failing.
+        self._connection.execute("CREATE INDEX IF NOT EXISTS idx_audit_order ON audit_events(order_id)")
         self._connection.commit()
 
     def _migrate_order_id_column(self) -> None:
