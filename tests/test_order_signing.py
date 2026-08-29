@@ -53,7 +53,7 @@ class OrderSigningTests(unittest.TestCase):
     def test_book_metadata_drives_neg_risk_route(self) -> None:
         raw = {
             "asset_id": "123", "market": "market-1", "timestamp": "1", "hash": "h",
-            "min_order_size": "5", "tick_size": "0.01", "neg_risk": True,
+            "min_order_size": "1", "tick_size": "0.01", "neg_risk": True,
             "asks": [{"price": "0.52", "size": "5"}], "bids": [],
         }
         snapshot = CLOBMarketData().snapshot_from_raw("123", raw)
