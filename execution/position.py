@@ -1,107 +1,87 @@
-"""Minimal Position + PnL model driven by fills.
+"""Position and minimal realized-PnL accounting.
 
-Before this module the repo had no PnL anywhere (audit-c M1: "全程无 PnL
-计算"): positions were a bare ``shares``/``avg_price`` dict and exits never
-settled anything.  ``Position`` keeps the weighted-average cost basis and
-tracks realized PnL as fills/exits happen, so a paper run can answer "did this
-bucket win or lose".
-
-This is deliberately small and pure: no I/O, no strategy logic.  Paper and
-future Live share the same math.
+Only a :class:`execution.order_intent.Fill` mutates a Position (audit §15:
+Fill -> Position -> PnL). No PnL is ever derived from a planned or cancelled
+order.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from decimal import Decimal
+from typing import Any
 
-ZERO = Decimal("0")
+from execution.order_intent import Fill, Side, utc_now_iso
 
 
-@dataclass(frozen=True)
+@dataclass
 class Position:
-    """A long position in one outcome token."""
-
-    key: str
     token_id: str
-    side: str  # BUY
-    outcome: str  # YES | NO
-    shares: Decimal = ZERO
-    avg_price: Decimal = ZERO
-    realized_pnl_usdc: Decimal = ZERO
-    # Cost basis in USDC = shares * avg_price (fees are tracked separately by
-    # the paper ledger, not folded into PnL here).
-    cost_basis_usdc: Decimal = ZERO
-    fills: list[dict] = field(default_factory=list)
+    side: Side          # side the position is long (BUY NO / BUY YES)
+    shares: Decimal = Decimal("0")
+    avg_price: Decimal = Decimal("0")
+    realized_pnl_usdc: Decimal = Decimal("0")
+    updated_at: str = utc_now_iso()
 
-    def apply_fill(self, price: Decimal, size: Decimal) -> "Position":
-        """Add a buy fill, updating the weighted-average cost basis."""
-        size = Decimal(str(size))
-        if size <= 0:
-            return self
-        price = Decimal(str(price))
-        prev_shares = self.shares
-        prev_basis = self.cost_basis_usdc
-        total_shares = prev_shares + size
-        new_basis = prev_basis + price * size
-        avg = (new_basis / total_shares).quantize(Decimal("0.0001")) if total_shares > 0 else ZERO
-        return Position(
-            key=self.key,
-            token_id=self.token_id,
-            side=self.side,
-            outcome=self.outcome,
-            shares=total_shares,
-            avg_price=avg,
-            realized_pnl_usdc=self.realized_pnl_usdc,
-            cost_basis_usdc=new_basis,
-            fills=self.fills + [{"price": str(price), "size": str(size)}],
-        )
-
-    def apply_exit(self, price: Decimal, size: Decimal) -> "Position":
-        """Reduce the position at ``price`` and realize PnL on the closed part."""
-        size = Decimal(str(size))
-        if size <= 0:
-            return self
-        price = Decimal(str(price))
-        close = min(size, self.shares)
-        if close <= 0:
-            return self
-        realized = (price - self.avg_price) * close
-        remaining_shares = self.shares - close
-        remaining_basis = self.cost_basis_usdc - self.avg_price * close
-        avg = (remaining_basis / remaining_shares).quantize(Decimal("0.0001")) if remaining_shares > 0 else ZERO
-        return Position(
-            key=self.key,
-            token_id=self.token_id,
-            side=self.side,
-            outcome=self.outcome,
-            shares=remaining_shares,
-            avg_price=avg,
-            realized_pnl_usdc=self.realized_pnl_usdc + realized,
-            cost_basis_usdc=remaining_basis,
-            fills=self.fills + [{"exit_price": str(price), "size": str(close)}],
-        )
-
-    def unrealized_pnl(self, mark_price: Decimal) -> Decimal:
-        """Mark-to-market on the remaining shares (long: (mark - avg) * shares)."""
-        return (Decimal(str(mark_price)) - self.avg_price) * self.shares
-
-    def as_dict(self) -> dict:
+    def as_dict(self) -> dict[str, Any]:
         return {
-            "key": self.key,
             "token_id": self.token_id,
-            "side": self.side,
-            "outcome": self.outcome,
+            "side": self.side.value,
             "shares": str(self.shares),
             "avg_price": str(self.avg_price),
-            "cost_basis_usdc": str(self.cost_basis_usdc),
             "realized_pnl_usdc": str(self.realized_pnl_usdc),
-            "fills": self.fills,
+            "updated_at": self.updated_at,
         }
 
 
-def realized_pnl_for_exit(avg_price: Decimal, exit_price: Decimal, shares: Decimal) -> Decimal:
-    """Pure realized-PnL formula for a SELL of a long position.
+def apply_fill(position: Position, fill: Fill) -> Position:
+    """Apply one Fill to a Position, returning the updated Position.
 
-    (exit_price - avg_price) * shares; positive means the exit made money.
+    BUY increases size with a weighted average cost. SELL reduces size and
+    realizes PnL = (sale price - avg cost) * shares sold.
     """
-    return (Decimal(str(exit_price)) - Decimal(str(avg_price))) * Decimal(str(shares))
+    if fill.token_id != position.token_id:
+        raise ValueError("fill token does not match position token")
+
+    if fill.side is Side.BUY:
+        total = position.shares + fill.shares
+        if total <= 0:
+            return replace(position, updated_at=utc_now_iso())
+        weighted = (position.avg_price * position.shares + fill.price * fill.shares) / total
+        return replace(
+            position,
+            shares=total,
+            avg_price=weighted,
+            updated_at=fill.filled_at or utc_now_iso(),
+        )
+
+    # SELL: reduce size, realize PnL on the sold slice.
+    sold = min(position.shares, fill.shares)
+    if sold <= 0:
+        return replace(position, updated_at=utc_now_iso())
+    realized = (fill.price - position.avg_price) * sold
+    return replace(
+        position,
+        shares=position.shares - sold,
+        realized_pnl_usdc=position.realized_pnl_usdc + realized,
+        updated_at=fill.filled_at or utc_now_iso(),
+    )
+
+
+def unrealized_pnl_usdc(position: Position, mark_price: Decimal | None) -> Decimal | None:
+    """Unrealized PnL at a mark price (None when no mark is available)."""
+    if mark_price is None:
+        return None
+    if position.side is Side.BUY:
+        return (mark_price - position.avg_price) * position.shares
+    return (position.avg_price - mark_price) * position.shares
+
+
+def realized_pnl_for_exit(avg_price: Any, exit_price: Any, shares: Any) -> Decimal:
+    """Estimated realized PnL of selling ``shares`` at ``exit_price``.
+
+    Long-only convention (BUY NO/YES): (exit_price - avg_price) * shares.
+    """
+    avg = Decimal(str(avg_price))
+    exit_px = Decimal(str(exit_price))
+    size = Decimal(str(shares))
+    return (exit_px - avg) * size

@@ -137,8 +137,8 @@ class Tree12AllNoTests(unittest.TestCase):
         result = tree12_paper_fill(state, "k1", Decimal("5"), book, now)
         self.assertEqual(result["status"], "paper_filled")
         # limit=0.90 只吃 0.90 档 3 股（0.91 越限），剩余 2 股留在 GTC 挂单。
-        self.assertEqual(result["filled"], "3")
-        self.assertEqual(state["tree12"]["working_orders"]["k1"]["remaining_shares"], "2")
+        self.assertEqual(Decimal(result["filled"]), Decimal("3"))
+        self.assertEqual(Decimal(state["tree12"]["working_orders"]["k1"]["remaining_shares"]), Decimal("2"))
         self.assertGreater(float(state["paper_total_debit_usdc"]), 0)
         # Exhaust capital: a second fill should be blocked.
         state["paper_total_debit_usdc"] = 999.0

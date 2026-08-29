@@ -11,8 +11,10 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any, Iterable
 
 from clob_market_data import CLOBDataError, CLOBMarketData, BookSnapshot
-from execution.paper_executor import match_l2
+from execution.paper_executor import match_fak
+from execution.order_intent import OrderIntent, OrderType, Side
 from execution_policy import decide_buy_no
+from adapters.polymarket.orderbook import from_any
 from paper_capital import remaining_capital_usdc, reserve
 
 TARGET_ORDER_SHARES = Decimal("5")
@@ -51,10 +53,6 @@ def _fee_rate(payload: dict[str, Any]) -> Decimal:
         raise CLOBDataError("invalid_fee_rate") from exc
 
 
-def _size_quantum(_tick_size: Decimal | None) -> Decimal:
-    return Decimal("0.01")
-
-
 def _price_quantum(tick_size: Decimal | None) -> Decimal:
     if tick_size is None or tick_size <= 0:
         raise CLOBDataError("invalid_tick_size")
@@ -73,41 +71,34 @@ def build_fixed_five_fak(
     The returned ``limit_price`` is a worst acceptable price, not a promise
     that every share fills at that price. Unfilled quantity is cancelled by FAK.
 
-    Matching is delegated to the single shared ``match_l2`` depth walker
+    Matching is delegated to the single shared ``match_fak`` depth walker
     (PRD Step 8: delete the duplicated per-tree matching loops).
     """
     if target_shares <= 0:
         raise CLOBDataError("invalid_target_shares")
     fee_rate = _fee_rate(fee_payload)
     price_quantum = _price_quantum(snapshot.tick_size)
-    size_quantum = _size_quantum(snapshot.tick_size)
-    eligible: list[dict[str, Decimal]] = []
-    for level in sorted(snapshot.asks, key=lambda x: x["price"]):
-        price, size = level["price"], level["size"]
-        if not MIN_EXECUTION_PRICE <= price <= max_price or size <= 0:
-            continue
-        quantity = min(size, target_shares).quantize(size_quantum, rounding=ROUND_DOWN)
-        if quantity <= 0:
-            continue
-        eligible.append({"price": price, "size": quantity})
-    match = match_l2(
-        book={"asks": eligible}, side="BUY", quantity=target_shares,
-        limit_price=max_price, order_type="FAK",
+    book = from_any(snapshot, token_id=snapshot.token_id)
+    intent = OrderIntent.new(
+        token_id=snapshot.token_id, side=Side.BUY, price=max_price,
+        quantity=target_shares, order_type=OrderType.FAK,
+        strategy="tree2", signal_reason="dead_bucket",
     )
+    match = match_fak(intent, book, fee_rate=fee_rate, max_price=max_price)
     fills: list[dict[str, Decimal]] = [
-        {"price": fill.price, "shares": fill.size} for fill in match.fills
+        {"price": fill.price, "shares": fill.shares} for fill in match.fills
     ]
-    principal = sum((fill.price * fill.size for fill in match.fills), Decimal("0"))
-    fees = sum((fill.size * fee_rate * fill.price * (Decimal("1") - fill.price) for fill in match.fills), Decimal("0"))
+    principal = match.principal_usdc
+    fees = match.fee_usdc
     worst = fills[-1]["price"] if fills else None
     if worst is not None:
         worst = (worst / price_quantum).to_integral_value(rounding=ROUND_DOWN) * price_quantum
     return FAKIntent(
         token_id=snapshot.token_id, side="BUY", order_type="FAK",
-        target_shares=target_shares, executable_shares=match.filled_size,
+        target_shares=target_shares, executable_shares=match.filled_shares,
         limit_price=worst, principal_usdc=principal,
         estimated_fee_usdc=fees,
-        average_price=(principal / match.filled_size if match.filled_size > 0 else None),
+        average_price=match.average_price,
         fills=tuple(fills),
     )
 

@@ -15,7 +15,9 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
 from paper_capital import remaining_capital_usdc, reserve
-from execution.paper_executor import match_l2
+from execution.paper_executor import match_fak
+from execution.order_intent import OrderIntent, OrderType, Side
+from execution.market import BookView
 
 CLOB_BOOK_ENDPOINT = "https://clob.polymarket.com/book"
 CLOB_FEE_RATE_ENDPOINT = "https://clob.polymarket.com/fee-rate"
@@ -141,29 +143,35 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
                 total_debit_budget_usdc=float(city_day_max), spent_city_day_total_debit_usdc=float(already_spent),
             )
         target_shares = TARGET_ORDER_SHARES
-        # Depth walk is delegated to the shared match_l2 depth matcher
+        # Depth walk is delegated to the shared match_fak depth matcher
         # (PRD Step 8: single matching implementation, no per-tree loops).
-        eligible = [
-            {"price": level["price"], "size": _floor_size(level["size"])}
-            for level in levels
-            if MIN_PRICE_INCLUSIVE <= level["price"] <= price_cap and level["size"] > 0
-        ]
-        match = match_l2(
-            book={"asks": eligible}, side="BUY", quantity=target_shares,
-            limit_price=price_cap, order_type="FAK",
+        book_view = BookView(
+            token_id=no_token_id,
+            asks=tuple((Decimal(str(level["price"])), _floor_size(level["size"])) for level in levels
+                       if MIN_PRICE_INCLUSIVE <= level["price"] <= price_cap and level["size"] > 0),
+            bids=(),
+            best_ask=best_ask,
+            best_bid=None,
+            age_seconds=0.0,
         )
+        intent = OrderIntent.new(
+            token_id=no_token_id, side=Side.BUY, price=price_cap,
+            quantity=target_shares, order_type=OrderType.FAK,
+            strategy="legacy", signal_reason="dead_bucket",
+        )
+        match = match_fak(intent, book_view, fee_rate=fee_rate, max_price=price_cap)
         fills: list[dict[str, float]] = []
         for fill in match.fills:
             per_share_fee = fee_rate * fill.price * (Decimal("1") - fill.price)
-            level_principal = fill.size * fill.price
-            level_fee = fill.size * per_share_fee
+            level_principal = fill.shares * fill.price
+            level_fee = fill.shares * per_share_fee
             fills.append({
-                "price": float(fill.price), "shares": float(fill.size),
+                "price": float(fill.price), "shares": float(fill.shares),
                 "principal_usdc": float(level_principal), "estimated_fee_usdc": float(level_fee),
             })
-        filled_shares = match.filled_size
-        principal = match.filled_notional
-        fees = sum((fill.size * fee_rate * fill.price * (Decimal("1") - fill.price) for fill in match.fills), Decimal("0"))
+        filled_shares = match.filled_shares
+        principal = match.principal_usdc
+        fees = match.fee_usdc
         total_debit = principal + fees
         if filled_shares < min_order_size:
             return _rejected(

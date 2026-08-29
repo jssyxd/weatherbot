@@ -15,8 +15,10 @@ from zoneinfo import ZoneInfo
 
 from edge_engine import celsius_to_native, local_market_date, parse_utc
 from paper_capital import remaining_capital_usdc, reserve
-from execution.paper_executor import match_l2
-from execution.position import Position, realized_pnl_for_exit
+from execution.paper_executor import match_gtc
+from execution.order_intent import OrderIntent, OrderType, Side
+from execution.position import realized_pnl_for_exit
+from adapters.polymarket.orderbook import from_any
 
 TREE12_TARGET_SHARES = Decimal("5")
 TREE12_MIN_NO_ASK = Decimal("0.85")
@@ -854,15 +856,20 @@ def tree12_paper_fill(
             "token_id": order.get("token_id"), "limit_price": str(limit_price),
             "best_ask": str(best_ask) if best_ask is not None else None,
         }
-    match = match_l2(book=book, side="BUY", quantity=shares, limit_price=limit_price, order_type="GTC")
-    filled = match.filled_size
+    book_view = from_any(book, token_id=order.get("token_id"))
+    intent = OrderIntent.new(
+        token_id=order.get("token_id"), side=Side.BUY, price=limit_price,
+        quantity=shares, order_type=OrderType.GTC, strategy="tree12",
+        signal_reason="allno", order_id=order.get("order_id"),
+    )
+    match = match_gtc(intent, book_view, fee_rate=TREE12_PAPER_FEE_RATE)
+    filled = match.filled_shares
     if filled <= ZERO:
         return {"action_type": "tree12_paper_fill", "status": "resting_no_depth", "key": key,
                 "order_id": order.get("order_id"),
                 "token_id": order.get("token_id"), "limit_price": str(limit_price)}
-    avg = match.avg_price or best_ask
-    estimated_fee = filled * TREE12_PAPER_FEE_RATE * avg * (Decimal("1") - avg)
-    total_debit = match.filled_notional + estimated_fee
+    avg = match.average_price or best_ask
+    total_debit = match.principal_usdc + match.fee_usdc
     if reserve(state, total_debit) is None:
         order["status"] = "blocked_insufficient_capital"
         order["updated_at_utc"] = _iso(now_utc)
@@ -877,8 +884,8 @@ def tree12_paper_fill(
     result["action_type"] = "tree12_paper_fill"
     result["order_id"] = order.get("order_id")
     result["match"] = match.as_dict()
-    result["principal_usdc"] = str(match.filled_notional)
-    result["estimated_fee_usdc"] = str(estimated_fee)
+    result["principal_usdc"] = str(match.principal_usdc)
+    result["estimated_fee_usdc"] = str(match.fee_usdc)
     result["total_debit_usdc"] = str(total_debit)
     result["remaining_capital_usdc"] = str(remaining_capital_usdc(state))
     return result
@@ -928,15 +935,10 @@ def paper_fill_working_order(
     pos["shares"] = str(total_shares)
     pos["avg_price"] = str(weighted_avg)
     pos["updated_at_utc"] = _iso(now_utc)
-    # Minimal PnL snapshot: cost basis + realized (0 on entry fills) so the
-    # audit trail can answer "what did this bucket cost".
-    position = Position(
-        key=key, token_id=str(order.get("token_id") or ""), side="BUY", outcome="NO",
-        shares=total_shares, avg_price=weighted_avg,
-        cost_basis_usdc=weighted_avg * total_shares,
-    )
-    pos["cost_basis_usdc"] = str(position.cost_basis_usdc)
-    pos["realized_pnl_usdc"] = str(position.realized_pnl_usdc)
+    # Minimal PnL snapshot: cost basis + realized (0 on entry fills).
+    cost_basis = weighted_avg * total_shares
+    pos["cost_basis_usdc"] = str(cost_basis)
+    pos["realized_pnl_usdc"] = "0"
     return {
         "status": "paper_filled", "key": key, "filled": str(filled),
         "position_shares": pos["shares"],
