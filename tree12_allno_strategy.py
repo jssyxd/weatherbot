@@ -807,11 +807,12 @@ def tree12_paper_fill(
     fill_price: Decimal,
     now_utc: datetime,
 ) -> dict[str, Any]:
-    """Simulate a tree12 NO fill at the executable best ask (paper mode only).
+    """Simulate a tree12 NO GTC fill against its hybrid limit (paper only).
 
-    Cash is reserved from the shared 1000-USDC paper account. On success the
-    working order becomes a reconciled paper position via
-    ``paper_fill_working_order``.
+    A GTC buy rests when the best ask is above its limit; it only fills when
+    the ask is at or below the limit (which, for the hybrid limit, means the
+    ask has reached the 6h-WS-VWAP anchor). Cash is reserved from the shared
+    1000-USDC paper account.
     """
     tree = ensure_tree12_state(state)
     order = tree["working_orders"].get(key)
@@ -819,8 +820,14 @@ def tree12_paper_fill(
         return {"action_type": "tree12_paper_fill", "status": "no_working_order", "key": key}
     shares = _dec(shares, "0") or ZERO
     fill_price = _dec(fill_price) or ZERO
+    limit_price = _dec(order.get("limit_price"))
     if shares <= ZERO or fill_price <= ZERO:
         return {"action_type": "tree12_paper_fill", "status": "invalid_fill", "key": key}
+    if limit_price is not None and fill_price > limit_price:
+        return {
+            "action_type": "tree12_paper_fill", "status": "resting_above_limit", "key": key,
+            "token_id": order.get("token_id"), "limit_price": str(limit_price), "best_ask": str(fill_price),
+        }
     principal = shares * fill_price
     estimated_fee = shares * TREE12_PAPER_FEE_RATE * fill_price * (Decimal("1") - fill_price)
     total_debit = principal + estimated_fee
@@ -898,6 +905,12 @@ def collect_tree12_book_token_ids(state: dict[str, Any], rules: list[dict[str, A
             if rule.get("city_id") == city["city_id"] and rule.get("market_local_date")
         })
         for local_date in dates:
+            # tree12 only opens new buckets > 24h before the local day. Fetching
+            # books for already-inside-the-window days is wasteful and, with a
+            # 49-city x multi-day universe, makes the CLOB batch request too
+            # large to complete through a proxy.
+            if not allow_new_entries(city, local_date, now_utc):
+                continue
             for direction in ("high", "low"):
                 for bucket in list_no_buckets(rules, city["city_id"], local_date, direction):
                     tokens.add(bucket["_no_token_id"])

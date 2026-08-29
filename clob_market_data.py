@@ -20,6 +20,7 @@ CLOB_BASE = "https://clob.polymarket.com"
 BOOK_ENDPOINT = f"{CLOB_BASE}/book"
 BOOKS_ENDPOINT = f"{CLOB_BASE}/books"
 FEE_ENDPOINT = f"{CLOB_BASE}/fee-rate"
+BOOKS_CHUNK_SIZE = 100
 
 
 @dataclass(frozen=True)
@@ -142,38 +143,41 @@ class CLOBMarketData:
         return snapshot
 
     def fetch_books(self, token_ids: Iterable[str]) -> dict[str, BookSnapshot]:
-        ids = [str(x) for x in token_ids if str(x)]
+        ids = list(dict.fromkeys(str(x) for x in token_ids if str(x)))
         if not ids:
             return {}
-        # The public endpoint accepts a token_id query for one book. Use the
-        # documented /books endpoint when available, with a safe fallback to
-        # bounded single-book requests for deployments behind older gateways.
-        try:
-            raw = self._request_json(
-                BOOKS_ENDPOINT,
-                payload=[{"token_id": token} for token in dict.fromkeys(ids)],
-                timeout=self.timeout_seconds,
-            )
-            items = raw if isinstance(raw, list) else raw.get("books", []) if isinstance(raw, dict) else []
-            parsed: dict[str, BookSnapshot] = {}
-            for item in items:
-                if isinstance(item, dict) and item.get("asset_id") is not None:
-                    token = str(item["asset_id"])
-                    if token in ids:
-                        parsed[token] = self._parse_book(token, item, "rest_batch")
-            if len(parsed) == len(set(ids)):
-                self._books.update(parsed)
-                return parsed
-        except CLOBDataError:
-            pass
-
-        parsed = {}
-        for token in dict.fromkeys(ids):
-            raw = self._request_json(
-                f"{BOOK_ENDPOINT}?{urllib.parse.urlencode({'token_id': token})}",
-                timeout=self.timeout_seconds,
-            )
-            parsed[token] = self._parse_book(token, raw, "rest_single")
+        # The public /books endpoint accepts a batched list, but very large
+        # batches (thousands of tokens) fail or time out behind proxies and
+        # then fall into an unbounded per-token fallback. Fetch in bounded
+        # chunks and only single-fetch the few tokens missing from each chunk,
+        # so a partial snapshot fails closed instead of blocking the observer.
+        parsed: dict[str, BookSnapshot] = {}
+        for chunk_start in range(0, len(ids), BOOKS_CHUNK_SIZE):
+            chunk = ids[chunk_start:chunk_start + BOOKS_CHUNK_SIZE]
+            try:
+                raw = self._request_json(
+                    BOOKS_ENDPOINT,
+                    payload=[{"token_id": token} for token in chunk],
+                    timeout=self.timeout_seconds,
+                )
+                items = raw if isinstance(raw, list) else raw.get("books", []) if isinstance(raw, dict) else []
+                for item in items:
+                    if isinstance(item, dict) and item.get("asset_id") is not None:
+                        token = str(item["asset_id"])
+                        if token in chunk:
+                            parsed[token] = self._parse_book(token, item, "rest_batch")
+            except CLOBDataError:
+                pass
+            missing = [token for token in chunk if token not in parsed]
+            for token in missing:
+                try:
+                    raw = self._request_json(
+                        f"{BOOK_ENDPOINT}?{urllib.parse.urlencode({'token_id': token})}",
+                        timeout=self.timeout_seconds,
+                    )
+                    parsed[token] = self._parse_book(token, raw, "rest_single")
+                except CLOBDataError:
+                    continue
         self._books.update(parsed)
         return parsed
 
