@@ -18,10 +18,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-try:
-    import websocket
-except ImportError as exc:  # pragma: no cover - environment dependent
-    raise SystemExit("websocket-client is required: pip install websocket-client") from exc
+# websocket-client is only required when the recorder opens a live socket.
+# Keep the module importable so pure helpers (parse_tokens, describe_message)
+# and unit tests do not hard-fail in environments without the package.
 
 from data_recorder import AppendOnlyRecorder
 from local_order_book import OrderBookStateError
@@ -29,6 +28,14 @@ from websocket_market_data import MARKET_WS_URL, MarketStream, MarketStreamError
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100"
 USER_AGENT = "weatherbot-tree6-paper-recorder/1.0"
+
+
+def _require_websocket():
+    try:
+        import websocket  # type: ignore
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise SystemExit("websocket-client is required: pip install websocket-client") from exc
+    return websocket
 
 
 def utc_now() -> str:
@@ -114,7 +121,7 @@ def main() -> int:
     try:
         while time.monotonic() < deadline:
             try:
-                current_socket = websocket.create_connection(MARKET_WS_URL, timeout=5, origin="https://polymarket.com")
+                current_socket = _require_websocket().create_connection(MARKET_WS_URL, timeout=5, origin="https://polymarket.com")
                 current_socket.settimeout(2)
                 stream.mark_connected()
                 current_socket.send(json.dumps(stream.subscription_message()))
