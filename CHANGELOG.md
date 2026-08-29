@@ -6,7 +6,8 @@
 
 | 类别 | 改动 | 状态与验证要求 |
 |---|---|---|
-| 策略 | 新增 `tree12_allno_strategy.py`：49 城、high/low 双向、目标 5 股 NO 布局；入场时间窗 `> 当地 00:00 − 24h`、TAF 规避、非共识前 2、`best_ask > 0.85`；hybrid 限价与 SELL NO FAK 出场阶梯。 | 默认 paper / observe-only；真实成交需外部持仓对账。 |
+| 策略 | 新增 `tree12_allno_strategy.py`：49 城、high/low 双向、目标 5 股 NO 布局；入场时间窗 `> 当地 00:00 − 24h`、TAF 规避、非共识前 2、`0.85 ≤ best_ask ≤ 0.95`（含端点）；hybrid 限价与 SELL NO FAK 出场阶梯。 | 默认 paper / observe-only；真实成交需外部持仓对账。 |
+| 入场价格带 | `best_ask` 门槛由 `> 0.85` 改为 `[0.85, 0.95]` 闭区间；`hybrid_limit_price` 保护在同一区间内。 | 新增 `test_ask_range_inclusive_085_to_095`、`test_ask_above_095_blocked`；买入盈亏比不再被 >0.95 的薄利 NO 稀释。 |
 | TAF 独立 | tree12 拥有自己的 `state.tree12.taf_fetches` / `taf_forecasts`，本地实现 `TAF_EXTREME_RE`、`parse_taf_extremes_for_local_day`、`due_tree12_taf_cities`、`record_tree12_taf_reports`；`tree12_allno_strategy.py` 不再 import `tree5_strategy`。 | 新增 `tests/test_tree12_allno_strategy.py` 中 `test_tree12_taf_is_self_contained`、`test_taf_parse_maps_local_day`。 |
 | 调度修复 | `metar_observer.run_loop` 中 `tree12_maintenance_once` 不再嵌套在 `tree5_enabled` 分支内；tree5 与 tree12 各自独立调度维护。 | 配置 `tree12_enabled=true` 且 `tree5_enabled=false` 时，tree12 的 0/5/20/60/120s FAK 阶梯仍可运行。 |
 | 盘口采样语义 | `ws_mid_samples` → `ws_ask_samples`、`ws_vwap_6h` → `ws_ask_vwap_6h`、`record_ws_sample` → `record_ws_ask_sample`；hybrid fair 改为 `mid(6h WS ask VWAP, best_ask)`。 | 消除了“名为 mid 实为 ask”的不一致。 |

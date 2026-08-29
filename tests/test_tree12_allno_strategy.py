@@ -53,6 +53,42 @@ class Tree12AllNoTests(unittest.TestCase):
         self.assertTrue(submits)
         self.assertEqual(submits[0]["token_id"], "no-32")
 
+    def test_ask_range_inclusive_085_to_095(self):
+        city = city_shanghai()
+        now = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        rules = [{"enabled": True, "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high",
+                  "buckets": [
+                      {"bucket_id": "b0", "lo": 0, "hi": 1, "no_token_id": "n0"},
+                      {"bucket_id": "b1", "lo": 1, "hi": 2, "no_token_id": "n1"},
+                      {"bucket_id": "b2", "lo": 2, "hi": 3, "no_token_id": "n2"},
+                      {"bucket_id": "b3", "lo": 3, "hi": 4, "no_token_id": "n3"},
+                  ]}]
+        books = {"n0": {"best_ask": "0.83", "tick_size": "0.01"},
+                 "n1": {"best_ask": "0.84", "tick_size": "0.01"},
+                 "n2": {"best_ask": "0.85", "tick_size": "0.01"},
+                 "n3": {"best_ask": "0.95", "tick_size": "0.01"}}
+        actions = plan_tree12_entries({}, {"shanghai": city}, rules, books, now, {"target_order_shares": "5"})
+        submits = [a for a in actions if a.get("action_type") == "tree12_submit_entry"]
+        self.assertEqual({s["token_id"] for s in submits}, {"n2", "n3"})
+
+    def test_ask_above_095_blocked(self):
+        city = city_shanghai()
+        now = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        rules = [{"enabled": True, "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high",
+                  "buckets": [
+                      {"bucket_id": "b0", "lo": 0, "hi": 1, "no_token_id": "n0"},
+                      {"bucket_id": "b1", "lo": 1, "hi": 2, "no_token_id": "n1"},
+                      {"bucket_id": "b2", "lo": 2, "hi": 3, "no_token_id": "n2"},
+                      {"bucket_id": "b3", "lo": 3, "hi": 4, "no_token_id": "n3"},
+                  ]}]
+        books = {"n0": {"best_ask": "0.83", "tick_size": "0.01"},
+                 "n1": {"best_ask": "0.84", "tick_size": "0.01"},
+                 "n2": {"best_ask": "0.85", "tick_size": "0.01"},
+                 "n3": {"best_ask": "0.96", "tick_size": "0.01"}}
+        actions = plan_tree12_entries({}, {"shanghai": city}, rules, books, now, {"target_order_shares": "5"})
+        submits = [a for a in actions if a.get("action_type") == "tree12_submit_entry"]
+        self.assertEqual({s["token_id"] for s in submits}, {"n2"})
+
     def test_paper_fill(self):
         state = {"tree12": {"working_orders": {"k1": {"key": "k1", "status": "working_gtc_buy_no", "remaining_shares": "5",
                  "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high", "bucket_id": "b32",

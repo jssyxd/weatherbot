@@ -9,12 +9,12 @@
 1. 时间窗：仅 `now < 当地 00:00 − 24h` 可新开新桶；进入最后 24h 后不新开，已有挂单可 hybrid 改价。
 2. TAF 规避：TX/TN 按预报时刻映射当地日；落入桶禁止买 NO；已持则快速 SELL NO。无覆盖不拦截。
 3. 非共识前 2：同方向 NO 按 `best_ask` 升序排除最低与次低。
-4. `best_ask > 0.85`。
+4. `0.85 ≤ best_ask ≤ 0.95`（含端点）。
 5. 目标 5 股，允许部分成交后补足。
 
 ## 限价 hybrid
 
-`fair = mid(6h WS ask VWAP, best_ask)`，`limit = min(fair, best_ask)` 对齐 tick，并保护 `>= 0.85+tick`。
+`fair = mid(6h WS ask VWAP, best_ask)`，`limit = min(fair, best_ask)` 对齐 tick，并保护在 `[0.85, 0.95]` 区间内。
 
 ## 出场
 

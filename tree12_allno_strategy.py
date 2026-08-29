@@ -17,6 +17,7 @@ from paper_capital import remaining_capital_usdc, reserve
 
 TREE12_TARGET_SHARES = Decimal("5")
 TREE12_MIN_NO_ASK = Decimal("0.85")
+TREE12_MAX_NO_ASK = Decimal("0.95")
 TREE12_LEAD_HOURS = 24
 TREE12_WS_VWAP_HOURS = 6
 TREE12_REQUOTE_TICKS = 2
@@ -609,12 +610,12 @@ def plan_tree12_entries(
                     if token in top2:
                         actions.append({"action_type": "tree12_entry", "status": "blocked_consensus_top2", "key": key, "best_ask": str(ask) if ask else None})
                         continue
-                    if ask is None or ask <= TREE12_MIN_NO_ASK:
-                        actions.append({"action_type": "tree12_entry", "status": "blocked_no_ask_or_not_above_085", "key": key, "best_ask": str(ask) if ask else None})
+                    if ask is None or ask < TREE12_MIN_NO_ASK or ask > TREE12_MAX_NO_ASK:
+                        actions.append({"action_type": "tree12_entry", "status": "blocked_no_ask_or_outside_085_095", "key": key, "best_ask": str(ask) if ask else None})
                         continue
                     limit = hybrid_limit_price(state, token, ask, tick, now_utc)
-                    if limit <= TREE12_MIN_NO_ASK:
-                        actions.append({"action_type": "tree12_entry", "status": "blocked_limit_not_above_085", "key": key, "limit": str(limit)})
+                    if limit < TREE12_MIN_NO_ASK or limit > TREE12_MAX_NO_ASK:
+                        actions.append({"action_type": "tree12_entry", "status": "blocked_limit_outside_085_095", "key": key, "limit": str(limit)})
                         continue
                     paper_mode = config.get("mode") in {"paper", "observe"}
                     estimated_debit = _tree12_estimated_debit(need, limit)
@@ -691,7 +692,7 @@ def manage_open_orders_inside_lead_window(
         buckets = list_no_buckets(rules, city["city_id"], local_date, direction)
         top2 = consensus_top2_token_ids(buckets, books_by_token)
         forbidden = taf_forbidden_bucket_ids(state, city, local_date, direction, rules)
-        if bid in forbidden or token in top2 or ask is None or ask <= TREE12_MIN_NO_ASK:
+        if bid in forbidden or token in top2 or ask is None or ask < TREE12_MIN_NO_ASK or ask > TREE12_MAX_NO_ASK:
             order["status"] = "cancelled_filter_break"
             order["updated_at_utc"] = _iso(now_utc)
             actions.append({"action_type": "tree12_cancel", "status": "planned_cancel_filter_break", "key": key})
