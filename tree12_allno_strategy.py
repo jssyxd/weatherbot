@@ -7,6 +7,7 @@ bucket containment and UTC helpers are implemented locally.
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 from edge_engine import celsius_to_native, local_market_date, parse_utc
 from paper_capital import remaining_capital_usdc, reserve
 from execution.paper_executor import match_l2
+from execution.position import Position, realized_pnl_for_exit
 
 TREE12_TARGET_SHARES = Decimal("5")
 TREE12_MIN_NO_ASK = Decimal("0.85")
@@ -31,6 +33,11 @@ ZERO = Decimal("0")
 
 def iso_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def new_order_id() -> str:
+    """Unified order identifier spanning SIGNAL→…→PNL for audit (PRD Step 7)."""
+    return f"t12-{uuid.uuid4().hex[:12]}"
 
 
 def bucket_contains(bucket: dict[str, Any], value: float) -> bool:
@@ -439,6 +446,7 @@ def start_tree12_exit_chase(
         return None
     chase = {
         "key": key,
+        "order_id": str(tree["positions"].get(key, {}).get("order_id") or ""),
         "status": "active",
         "trigger": trigger,
         "token_id": str(token_id),
@@ -519,10 +527,11 @@ def plan_tree12_due_exit_faks(
                 "requested_shares": str(shares),
             }
             chase["attempts"].append(attempt)
-            actions.append({
+            action: dict[str, Any] = {
                 "action_type": "tree12_exit_fak",
                 "status": "planned_observe_only",
                 "key": key,
+                "order_id": chase.get("order_id"),
                 "token_id": token,
                 "side": "SELL",
                 "outcome": "NO",
@@ -531,7 +540,17 @@ def plan_tree12_due_exit_faks(
                 "requested_shares": str(shares),
                 "trigger": chase.get("trigger"),
                 **attempt,
-            })
+            }
+            # Minimal PnL: attach the estimated realized PnL of this planned
+            # exit against the position's weighted-average cost basis.
+            pos = tree["positions"].get(key) or {}
+            avg_price = _dec(pos.get("avg_price"))
+            if avg_price is not None and avg_price > 0:
+                action["position_avg_price"] = str(avg_price)
+                action["estimated_realized_pnl_usdc"] = str(
+                    realized_pnl_for_exit(avg_price, limit, shares).quantize(Decimal("0.0001"))
+                )
+            actions.append(action)
         chase["attempt_index"] = index + 1
         triggered = parse_utc(chase.get("triggered_at_utc")) or now_utc
         if index + 1 < len(seconds):
@@ -640,6 +659,7 @@ def plan_tree12_entries(
                         continue
                     order = {
                         "key": key,
+                        "order_id": new_order_id(),
                         "status": "working_gtc_buy_no",
                         "city_id": city["city_id"],
                         "icao": city.get("icao"),
@@ -819,15 +839,18 @@ def tree12_paper_fill(
     tree = ensure_tree12_state(state)
     order = tree["working_orders"].get(key)
     if not isinstance(order, dict) or order.get("status") != "working_gtc_buy_no":
-        return {"action_type": "tree12_paper_fill", "status": "no_working_order", "key": key}
+        return {"action_type": "tree12_paper_fill", "status": "no_working_order", "key": key,
+                "order_id": order.get("order_id") if isinstance(order, dict) else None}
     shares = _dec(shares, "0") or ZERO
     limit_price = _dec(order.get("limit_price"))
     best_ask = best_ask_of(book)
     if shares <= ZERO or limit_price is None or limit_price <= ZERO:
-        return {"action_type": "tree12_paper_fill", "status": "invalid_fill", "key": key}
+        return {"action_type": "tree12_paper_fill", "status": "invalid_fill", "key": key,
+                "order_id": order.get("order_id")}
     if best_ask is None or best_ask > limit_price:
         return {
             "action_type": "tree12_paper_fill", "status": "resting_above_limit", "key": key,
+            "order_id": order.get("order_id"),
             "token_id": order.get("token_id"), "limit_price": str(limit_price),
             "best_ask": str(best_ask) if best_ask is not None else None,
         }
@@ -835,6 +858,7 @@ def tree12_paper_fill(
     filled = match.filled_size
     if filled <= ZERO:
         return {"action_type": "tree12_paper_fill", "status": "resting_no_depth", "key": key,
+                "order_id": order.get("order_id"),
                 "token_id": order.get("token_id"), "limit_price": str(limit_price)}
     avg = match.avg_price or best_ask
     estimated_fee = filled * TREE12_PAPER_FEE_RATE * avg * (Decimal("1") - avg)
@@ -845,11 +869,13 @@ def tree12_paper_fill(
         tree["working_orders"][key] = order
         return {
             "action_type": "tree12_paper_fill", "status": "blocked_insufficient_capital", "key": key,
+            "order_id": order.get("order_id"),
             "token_id": order.get("token_id"), "required_debit_usdc": str(total_debit),
             "remaining_capital_usdc": str(remaining_capital_usdc(state)),
         }
     result = paper_fill_working_order(state, key, filled, avg, now_utc)
     result["action_type"] = "tree12_paper_fill"
+    result["order_id"] = order.get("order_id")
     result["match"] = match.as_dict()
     result["principal_usdc"] = str(match.filled_notional)
     result["estimated_fee_usdc"] = str(estimated_fee)
@@ -879,6 +905,7 @@ def paper_fill_working_order(
         order["status"] = "filled"
     pos = tree["positions"].setdefault(key, {
         "key": key,
+        "order_id": order.get("order_id"),
         "city_id": order.get("city_id"),
         "market_local_date": order.get("market_local_date"),
         "direction": order.get("direction"),
@@ -901,7 +928,22 @@ def paper_fill_working_order(
     pos["shares"] = str(total_shares)
     pos["avg_price"] = str(weighted_avg)
     pos["updated_at_utc"] = _iso(now_utc)
-    return {"status": "paper_filled", "key": key, "filled": str(filled), "position_shares": pos["shares"]}
+    # Minimal PnL snapshot: cost basis + realized (0 on entry fills) so the
+    # audit trail can answer "what did this bucket cost".
+    position = Position(
+        key=key, token_id=str(order.get("token_id") or ""), side="BUY", outcome="NO",
+        shares=total_shares, avg_price=weighted_avg,
+        cost_basis_usdc=weighted_avg * total_shares,
+    )
+    pos["cost_basis_usdc"] = str(position.cost_basis_usdc)
+    pos["realized_pnl_usdc"] = str(position.realized_pnl_usdc)
+    return {
+        "status": "paper_filled", "key": key, "filled": str(filled),
+        "position_shares": pos["shares"],
+        "position_avg_price": pos["avg_price"],
+        "position_cost_basis_usdc": pos["cost_basis_usdc"],
+        "position_realized_pnl_usdc": pos["realized_pnl_usdc"],
+    }
 
 
 def collect_tree12_book_token_ids(state: dict[str, Any], rules: list[dict[str, Any]], cities: dict[str, dict[str, Any]], now_utc: datetime) -> set[str]:

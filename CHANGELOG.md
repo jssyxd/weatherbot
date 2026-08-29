@@ -17,6 +17,11 @@
 | 价格带 | `config.example.json` `max_execution_price` 0.99 → 0.98，与 `paper_execution.MAX_PRICE_INCLUSIVE` 一致；`load_config` 新增 `max_execution_price > 0.98` 即报错。 | fail-closed，拒绝无法构造的 CLOB 价格。 |
 | 配置 | 新增 `tree12_taf_fetch_local_hour`（固定 1）、`tree12_taf_retry_seconds`、`tree12_exit_retry_seconds`、`tree12_exit_slippage`、`tree12_exit_min_price`、`tree12_action_dir`。 | `config.example.json` 已同步。 |
 | 测试 | 修正 `test_execution_boundary` 过期价格带用例（0.40–0.98）；新增 tree12 独立 TAF 解析/记录用例。 | 本地 `python3 -m unittest discover -s tests` 全绿（112 tests OK）。 |
+| WS 本地盘口接线 | 新增 `execution/book_source.py`：`LocalBookSource` 桥接既有 `MarketStream`/`LocalOrderBook` 状态机——REST 快照作为 prime 源灌入本地盘口，消费端读 freshness 门控的本地盘口，REST 兜底；`market_ws_enabled=true` 时 `metar_observer` 的 tree12 路径走 `fetch_tree5_books_local`（`process_tree12_cycle` 与 `tree12_maintenance_once`），REST 失败即 `disconnect` 使本地盘口失效（fail-closed）。 | 默认 `market_ws_enabled=false` 时行为不变；新增 `tests/test_book_source.py`（8 项：本地优先/过期兜底/断线失效/token 扩展/健康）。 |
+| 最小 PnL | 新增 `execution/position.py`：`Position`（加权成本 + 已实现/未实现 PnL）+ `realized_pnl_for_exit` 纯函数；tree12 `paper_fill_working_order` 仓位附加 `cost_basis_usdc`/`realized_pnl_usdc`，退出 FAK 计划附加 `estimated_realized_pnl_usdc`。 | 新增 `tests/test_position.py`（7 项）。审计结论 M1“全程无 PnL”消除。 |
+| 统一 order_id 审计 | `audit_store` 新增 `order_id` 列（旧库自动迁移）+ `append_order_event`（SIGNAL→INTENT→RISK→SUBMIT→ACK→FILL→CANCEL→POSITION→PNL 九阶段）+ `events_for_order`；tree12 从 `plan_tree12_entries` 起生成 `t12-<uuid12>` 贯穿 submit/fill/position/cancel/exit_chase/exit_fak，`metar_observer.append_tree12_actions` 落库。 | 新增 `tests/test_audit_lifecycle.py`（10 项：生命周期/迁移/贯穿）。 |
+| 删除重复撮合 | `tree2_execution.build_fixed_five_fak` 与 `paper_execution.simulate_paper_fak` 的逐档 walk 统一委托 `match_l2`（单一深度撮合实现）；tree3 经 `build_fixed_five_fak` 间接统一。 | 输出结构/字段语义不变，`test_tree2_execution`/`test_execution_boundary` 原样通过。 |
+| 成交测试矩阵 | 新增 `tests/test_execution_matrix.py`：按 PRD §G 补全 9 行矩阵（完全/部分/零成交、超价、盘口过期、重复订单防重、断线重连、仓位一致、Paper/Live 同模型）。 | 新增 12 项测试。 |
 | 未实施 | 真实 FAK/GTC、撤单、卖出、NO/merge、账户/用户流对账、凭证加载。 | 保持未实现；如未来需要，必须在独立模块、独立审计和明确确认后再处理。 |
 
 ## Unreleased — tree5 净期望值与共识风险研究

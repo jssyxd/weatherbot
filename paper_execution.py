@@ -15,6 +15,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
 from paper_capital import remaining_capital_usdc, reserve
+from execution.paper_executor import match_l2
 
 CLOB_BOOK_ENDPOINT = "https://clob.polymarket.com/book"
 CLOB_FEE_RATE_ENDPOINT = "https://clob.polymarket.com/fee-rate"
@@ -140,31 +141,29 @@ def simulate_paper_fak(signal: dict[str, Any], state: dict[str, Any]) -> dict[st
                 total_debit_budget_usdc=float(city_day_max), spent_city_day_total_debit_usdc=float(already_spent),
             )
         target_shares = TARGET_ORDER_SHARES
-        filled_shares = Decimal("0")
-        principal = Decimal("0")
-        fees = Decimal("0")
+        # Depth walk is delegated to the shared match_l2 depth matcher
+        # (PRD Step 8: single matching implementation, no per-tree loops).
+        eligible = [
+            {"price": level["price"], "size": _floor_size(level["size"])}
+            for level in levels
+            if MIN_PRICE_INCLUSIVE <= level["price"] <= price_cap and level["size"] > 0
+        ]
+        match = match_l2(
+            book={"asks": eligible}, side="BUY", quantity=target_shares,
+            limit_price=price_cap, order_type="FAK",
+        )
         fills: list[dict[str, float]] = []
-        for level in levels:
-            price, size = level["price"], level["size"]
-            if price > price_cap:
-                break
-            if not MIN_PRICE_INCLUSIVE <= price <= MAX_PRICE_INCLUSIVE or size <= 0:
-                continue
-            per_share_fee = fee_rate * price * (Decimal("1") - price)
-            per_share_total = price + per_share_fee
-            # Fixed 5-share intent: walk levels until 5 shares are filled.
-            quantity = min(size, target_shares - filled_shares)
-            quantity = _floor_size(quantity)
-            if quantity <= 0:
-                break
-            level_principal = quantity * price
-            level_fee = quantity * per_share_fee
-            filled_shares += quantity
-            principal += level_principal
-            fees += level_fee
-            fills.append({"price": float(price), "shares": float(quantity), "principal_usdc": float(level_principal), "estimated_fee_usdc": float(level_fee)})
-            if filled_shares >= target_shares:
-                break
+        for fill in match.fills:
+            per_share_fee = fee_rate * fill.price * (Decimal("1") - fill.price)
+            level_principal = fill.size * fill.price
+            level_fee = fill.size * per_share_fee
+            fills.append({
+                "price": float(fill.price), "shares": float(fill.size),
+                "principal_usdc": float(level_principal), "estimated_fee_usdc": float(level_fee),
+            })
+        filled_shares = match.filled_size
+        principal = match.filled_notional
+        fees = sum((fill.size * fee_rate * fill.price * (Decimal("1") - fill.price) for fill in match.fills), Decimal("0"))
         total_debit = principal + fees
         if filled_shares < min_order_size:
             return _rejected(

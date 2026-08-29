@@ -40,6 +40,7 @@ from tree2_execution import simulate as simulate_tree2
 from clob_market_data import CLOBDataError, CLOBMarketData
 from audit_store import AuditStore
 from aviationweather_warmup import AWC_MAX_ICAOS_PER_REQUEST, AviationWeatherError, fetch_aviationweather_history
+from execution.book_source import LocalBookSource
 from tree12_allno_strategy import (
     collect_tree12_book_token_ids,
     due_tree12_taf_cities,
@@ -515,6 +516,48 @@ def fetch_tree5_books(token_ids: set[str]) -> tuple[dict[str, Any], str | None]:
         return {}, f"{type(exc).__name__}: {exc}"
 
 
+_LOCAL_BOOK_SOURCE: LocalBookSource | None = None
+
+
+def ensure_local_book_source(config: dict[str, Any]) -> LocalBookSource | None:
+    """Create (once) the WS local-book bridge when market_ws_enabled=true.
+
+    The bridge makes ``market_ws_enabled`` real: paper books are read from the
+    LocalOrderBook state machine (freshness-gated) instead of straight REST.
+    When disabled (the default), the main loop keeps its exact REST path.
+    """
+    global _LOCAL_BOOK_SOURCE
+    if not config.get("market_ws_enabled", False):
+        return None
+    if _LOCAL_BOOK_SOURCE is None:
+        max_age = float(config.get("local_book_max_age_seconds", 3.0))
+        _LOCAL_BOOK_SOURCE = LocalBookSource([], max_book_age_seconds=max_age)
+        _LOCAL_BOOK_SOURCE.connect()
+    return _LOCAL_BOOK_SOURCE
+
+
+def fetch_tree5_books_local(config: dict[str, Any], token_ids: set[str]) -> tuple[dict[str, Any], str | None]:
+    """tree12 paper book path: WS local book first, REST snapshot as fallback.
+
+    REST is still the priming source (there is no socket transport in this
+    repo), but the consumer reads freshness-gated local books and REST only
+    covers tokens the local book cannot serve.  A REST failure invalidates the
+    local books so stale state can never look live.
+    """
+    rest_books, rest_error = fetch_tree5_books(token_ids)
+    source = ensure_local_book_source(config)
+    if source is None:
+        return rest_books, rest_error
+    source.ensure_tokens(token_ids)
+    if rest_books:
+        source.prime(rest_books)
+    if rest_error:
+        source.disconnect("rest_fetch_failed")
+        return rest_books, rest_error
+    merged = source.books_for(token_ids, rest_books)
+    return merged, None
+
+
 def append_tree5_actions(config: dict[str, Any], actions: list[dict[str, Any]]) -> Path | None:
     """Persist every planned Tree5 action both as JSONL and append-only audit rows."""
     if not actions:
@@ -550,6 +593,7 @@ def append_tree12_actions(config: dict[str, Any], actions: list[dict[str, Any]])
                 correlation_id=str(action.get("key") or action.get("token_id") or ""),
                 mode=str(config.get("mode") or "paper"),
                 token_id=str(action.get("token_id") or "") or None,
+                order_id=str(action.get("order_id") or "") or None,
                 payload=action,
             )
     finally:
@@ -1009,7 +1053,7 @@ def process_tree12_cycle(config: dict[str, Any], state: dict[str, Any], cities: 
     ensure_tree12_state(state)
     # tree12 TAF cache is maintained independently by process_tree12_taf_entries.
     tokens = collect_tree12_book_token_ids(state, market_rules, cities, now)
-    books, book_error = fetch_tree5_books(tokens)
+    books, book_error = fetch_tree5_books_local(config, tokens)
     actions: list[dict[str, Any]] = []
     if book_error:
         actions.append({"action_type": "tree12_book_fetch", "status": "failed_fetch", "token_count": len(tokens), "error": book_error})
@@ -1036,7 +1080,7 @@ def tree12_maintenance_once(config: dict[str, Any]) -> dict[str, Any]:
     state = load_state(config["state_path"])
     ensure_tree12_state(state)
     tokens = due_tree12_exit_token_ids(state, now)
-    books, book_error = fetch_tree5_books(tokens)
+    books, book_error = fetch_tree5_books_local(config, tokens)
     actions: list[dict[str, Any]] = []
     if book_error:
         actions.append({"action_type": "tree12_book_fetch", "status": "failed_fetch", "token_count": len(tokens), "error": book_error})

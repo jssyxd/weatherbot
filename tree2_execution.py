@@ -11,6 +11,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any, Iterable
 
 from clob_market_data import CLOBDataError, CLOBMarketData, BookSnapshot
+from execution.paper_executor import match_l2
 from execution_policy import decide_buy_no
 from paper_capital import remaining_capital_usdc, reserve
 
@@ -71,39 +72,42 @@ def build_fixed_five_fak(
 
     The returned ``limit_price`` is a worst acceptable price, not a promise
     that every share fills at that price. Unfilled quantity is cancelled by FAK.
+
+    Matching is delegated to the single shared ``match_l2`` depth walker
+    (PRD Step 8: delete the duplicated per-tree matching loops).
     """
     if target_shares <= 0:
         raise CLOBDataError("invalid_target_shares")
     fee_rate = _fee_rate(fee_payload)
     price_quantum = _price_quantum(snapshot.tick_size)
     size_quantum = _size_quantum(snapshot.tick_size)
-    filled = Decimal("0")
-    principal = Decimal("0")
-    fees = Decimal("0")
-    fills: list[dict[str, Decimal]] = []
+    eligible: list[dict[str, Decimal]] = []
     for level in sorted(snapshot.asks, key=lambda x: x["price"]):
         price, size = level["price"], level["size"]
         if not MIN_EXECUTION_PRICE <= price <= max_price or size <= 0:
             continue
-        quantity = min(size, target_shares - filled).quantize(size_quantum, rounding=ROUND_DOWN)
+        quantity = min(size, target_shares).quantize(size_quantum, rounding=ROUND_DOWN)
         if quantity <= 0:
             continue
-        level_fee = quantity * fee_rate * price * (Decimal("1") - price)
-        filled += quantity
-        principal += quantity * price
-        fees += level_fee
-        fills.append({"price": price, "shares": quantity})
-        if filled >= target_shares:
-            break
+        eligible.append({"price": price, "size": quantity})
+    match = match_l2(
+        book={"asks": eligible}, side="BUY", quantity=target_shares,
+        limit_price=max_price, order_type="FAK",
+    )
+    fills: list[dict[str, Decimal]] = [
+        {"price": fill.price, "shares": fill.size} for fill in match.fills
+    ]
+    principal = sum((fill.price * fill.size for fill in match.fills), Decimal("0"))
+    fees = sum((fill.size * fee_rate * fill.price * (Decimal("1") - fill.price) for fill in match.fills), Decimal("0"))
     worst = fills[-1]["price"] if fills else None
     if worst is not None:
         worst = (worst / price_quantum).to_integral_value(rounding=ROUND_DOWN) * price_quantum
     return FAKIntent(
         token_id=snapshot.token_id, side="BUY", order_type="FAK",
-        target_shares=target_shares, executable_shares=filled,
+        target_shares=target_shares, executable_shares=match.filled_size,
         limit_price=worst, principal_usdc=principal,
         estimated_fee_usdc=fees,
-        average_price=(principal / filled if filled > 0 else None),
+        average_price=(principal / match.filled_size if match.filled_size > 0 else None),
         fills=tuple(fills),
     )
 
