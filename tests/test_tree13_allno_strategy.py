@@ -18,18 +18,19 @@ class Tree13AllNoStrategyTests(unittest.TestCase):
             {"bucket_id": "a", "lo": 20, "hi": 21, "no_token_id": "na"},
             {"bucket_id": "b", "lo": 21, "hi": 22, "no_token_id": "nb"},
             {"bucket_id": "c", "lo": 22, "hi": 23, "no_token_id": "nc"},
+            {"bucket_id": "d", "lo": 23, "hi": 24, "no_token_id": "nd"},
         ]}
-        self.books = {t: {"best_ask": p, "tick_size": "0.01"} for t, p in (("na", "0.86"), ("nb", "0.90"), ("nc", "0.96"))}
-        self.history = {t: [{"monotonic_ns": 1_000_000_000 * i, "best_ask": p} for i, p in enumerate(("0.90", "0.91", "0.92"), 1)] for t, p in (("na", "0.90"), ("nb", "0.91"), ("nc", "0.92"))}
+        self.books = {t: {"best_ask": p, "tick_size": "0.01"} for t, p in (("na", "0.86"), ("nb", "0.90"), ("nc", "0.92"), ("nd", "0.96"))}
+        self.history = {t: [{"monotonic_ns": 1_000_000_000 * i, "best_ask": p} for i, p in enumerate(("0.90", "0.91", "0.92"), 1)] for t, p in (("na", "0.90"), ("nb", "0.91"), ("nc", "0.92"), ("nd", "0.93"))}
 
     def test_conservative_limit_uses_lower_of_discount_and_midpoint(self):
         self.assertEqual(conservative_limit("0.96", "0.90", "0.01"), Decimal("0.91"))
 
-    def test_entries_exclude_two_cheapest_and_require_history(self):
+    def test_entries_exclude_three_cheapest_and_require_history(self):
         state = {}
         result = plan_entries(state=state, city=self.city, local_date="2026-08-30", direction="high", rules=[self.rule], books=self.books, ask_history=self.history, now_monotonic_ns=3_000_000_000)
         self.assertEqual([x["status"] for x in result if x.get("status") == "PENDING_GTC"], ["PENDING_GTC"])
-        self.assertEqual(result[-1]["token_id"], "nc")
+        self.assertEqual(result[-1]["token_id"], "nd")
         self.assertEqual(result[-1]["outcome"], "NO")
 
     def test_taf_bucket_is_blocked(self):

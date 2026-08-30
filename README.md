@@ -29,11 +29,19 @@
 | 可执行盘口 | 只要存在 best ask 即视为有报价；不要求盘口能完整成交 5 股，但盘口必须新鲜且市场覆盖完整 |
 | 入场价格 | 使用 6 小时可执行 best ask 时间加权均价，不使用稀疏 last-trade VWAP |
 | 入场限价 | `floor_to_tick(min(0.95 × current_best_ask, (ask_TWAP_6h + current_best_ask)/2))`，且有效范围为 0.85–0.98 |
-| 错误 NO 退出 | 卖出 NO，不是卖出 YES；沿用 FAK 追价，时间为 0/3/8/15/30 秒，下浮为 3%/7%/12%/20%/30%，硬底 0.05 |
+| 错误 NO 退出 | 卖出 NO，不是卖出 YES；沿用 FAK 追价，时间为 0/3/8/15/30 秒，下浮为 3%/7%/12%/20%/30%，硬底 0.05；**paper 模式立即 settle**：positions→closed_positions、release 资金、记 realized PnL |
 | 共识变化 | 未成交 GTC 撤销；已成交仓若进入共识前三则退出；退出后不得自动恢复旧仓 |
 | TAF 变化 | 新 TAF 指向持仓桶时撤单并退出；TAF 移开后旧仓不买回，只允许新候选独立评估 |
 | METAR 事实 | 若极值落入持有 NO 桶，说明可能成为结算桶，立即止损；若极值已经跨过桶，则该 NO 已不可能成为结算桶，继续持有到结算 |
 | 测试数据 | 不允许模拟天气、错误天气或虚假 API 数据；完成后只用真实 API 做约 5 分钟纸面观测 |
+
+## 2.1 Paper 结算闭环（已实现）
+
+- `paper_capital.reserve` / `release`：纸面资金占用与回收
+- `paper_fill_entry`：PENDING_GTC → positions（占用资金）
+- `settle_paper_exit` / `process_metar_paper_exits`：METAR 推翻时立即按阶梯限价结算，从 positions 移除、写入 closed_positions、回收资金、记录 realized PnL
+- `process_taf_paper_exits`：TAF 打脸桶同样纸面结算
+- 幂等：重复结算不会双重回款
 
 ## 3. 四项入场筛选
 
