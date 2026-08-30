@@ -47,6 +47,7 @@ from tree12_allno_strategy import (
     ensure_tree12_state,
     record_tree12_taf_reports,
     run_tree12_cycle,
+    settle_tree12_expired_positions,
     tree12_day_key,
 )
 from tree5_strategy import (
@@ -244,6 +245,9 @@ def load_config(config_path: Path) -> dict[str, Any]:
     tree12_taf_retry_seconds = int(config.get("tree12_taf_retry_seconds", 900))
     if tree12_taf_retry_seconds < 60:
         raise ValueError("tree12_taf_retry_seconds 不得小于 60")
+    tree12_expired_settle_grace_hours = float(config.get("tree12_expired_settle_grace_hours", 6))
+    if tree12_expired_settle_grace_hours < 0:
+        raise ValueError("tree12_expired_settle_grace_hours 不得为负")
     tree5_entry_discount = float(config.get("tree5_entry_price_discount", 0.05))
     if not 0 <= tree5_entry_discount < 1:
         raise ValueError("tree5_entry_price_discount 必须介于 0（含）和 1（不含）")
@@ -293,6 +297,8 @@ def load_config(config_path: Path) -> dict[str, Any]:
         "tree12_exit_min_price": float(config.get("tree12_exit_min_price", 0.01)),
         "tree12_taf_fetch_local_hour": tree12_taf_hour,
         "tree12_taf_retry_seconds": tree12_taf_retry_seconds,
+        "tree12_expired_settle_enabled": bool(config.get("tree12_expired_settle_enabled", True)),
+        "tree12_expired_settle_grace_hours": tree12_expired_settle_grace_hours,
         "tree5_taf_fetch_local_hour": tree5_taf_hour,
         "tree5_taf_retry_seconds": int(config.get("tree5_taf_retry_seconds", 900)),
         "tree5_entry_price_discount": tree5_entry_discount,
@@ -1045,16 +1051,16 @@ def process_tree12_taf_entries(config: dict[str, Any], state: dict[str, Any], ci
     due_by_icao = {city["icao"]: city for city in due}
     return record_tree12_taf_reports(state, reports, due_by_icao, now, ";".join(endpoints))
 
-
 def process_tree12_cycle(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], market_rules: list[dict[str, Any]], now: datetime, observations_by_city: dict[str, float] | None = None) -> list[dict[str, Any]]:
     """Plan tree12 NO entries/exits after METAR batch; paper intents only."""
     if not config.get("tree12_enabled", False):
         return []
     ensure_tree12_state(state)
+    # Expired markets settle first so dead positions cannot re-enter or re-exit.
+    actions: list[dict[str, Any]] = settle_tree12_expired_positions(state, cities, market_rules, now, config)
     # tree12 TAF cache is maintained independently by process_tree12_taf_entries.
     tokens = collect_tree12_book_token_ids(state, market_rules, cities, now)
     books, book_error = fetch_tree5_books_local(config, tokens)
-    actions: list[dict[str, Any]] = []
     if book_error:
         actions.append({"action_type": "tree12_book_fetch", "status": "failed_fetch", "token_count": len(tokens), "error": book_error})
     actions.extend(

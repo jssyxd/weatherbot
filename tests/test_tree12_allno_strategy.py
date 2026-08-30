@@ -6,11 +6,11 @@ from tree12_allno_strategy import (
     TREE12_MIN_NO_ASK, allow_new_entries, consensus_top2_token_ids,
     hybrid_limit_price, paper_fill_working_order, plan_tree12_entries,
     plan_tree12_exits_from_metar, position_key, record_ws_ask_sample,
-    start_tree12_exit_chase, plan_tree12_due_exit_faks,
+    plan_tree12_due_exit_faks,
     parse_taf_extremes_for_local_day, record_tree12_taf_reports, ensure_tree12_state,
+    settle_tree12_expired_positions,
     tree12_paper_fill,
 )
-from paper_capital import remaining_capital_usdc, reserve
 
 def city_shanghai():
     return {"city_id": "shanghai", "icao": "ZSPD", "timezone": "Asia/Shanghai", "market_unit": "C"}
@@ -147,6 +147,75 @@ class Tree12AllNoTests(unittest.TestCase):
         blocked = tree12_paper_fill(state, "k2", Decimal("5"), book, now)
         self.assertEqual(blocked["status"], "blocked_insufficient_capital")
         self.assertEqual(state["tree12"]["working_orders"]["k2"]["status"], "blocked_insufficient_capital")
+
+    def _expired_position_state(self, high: float):
+        city = city_shanghai()
+        key = position_key("shanghai", "2026-09-10", "high", "b32")
+        state = {
+            "paper_initial_capital_usdc": 1000.0,
+            "paper_total_debit_usdc": 10.0,
+            "daily_extrema": {"shanghai|2026-09-10": {
+                "city_id": "shanghai", "market_local_date": "2026-09-10",
+                "market_unit": "C", "high": high, "low": 20.0,
+            }},
+            "tree12": {
+                "working_orders": {key: {"key": key, "status": "working_gtc_buy_no",
+                    "city_id": "shanghai", "market_local_date": "2026-09-10",
+                    "direction": "high", "bucket_id": "b32", "token_id": "no-32"}},
+                "positions": {key: {"key": key, "order_id": "t12-abc",
+                    "city_id": "shanghai", "market_local_date": "2026-09-10",
+                    "direction": "high", "bucket_id": "b32", "token_id": "no-32",
+                    "shares": "5", "avg_price": "0.90",
+                    "bucket": {"bucket_id": "b32", "lo": 28.0, "hi": 29.0}}},
+                "exit_chases": {}, "ws_ask_samples": {},
+            },
+        }
+        return city, key, state
+
+    def test_expired_win_settles_and_releases_capital(self):
+        city, key, state = self._expired_position_state(high=30.0)  # 30 outside [28, 29) → NO wins
+        now = datetime(2026, 9, 11, 0, 0, tzinfo=timezone.utc)
+        actions = settle_tree12_expired_positions(state, {"shanghai": city}, [], now, {})
+        self.assertEqual([a["action_type"] for a in actions], ["tree12_settled_win"])
+        a = actions[0]
+        self.assertEqual(a["payout_price"], "1")
+        self.assertEqual(Decimal(a["proceeds_usdc"]), Decimal("5.0"))
+        self.assertEqual(Decimal(a["realized_pnl_usdc"]), Decimal("0.50"))
+        self.assertNotIn(key, state["tree12"]["positions"])
+        self.assertNotIn(key, state["tree12"]["working_orders"])
+        self.assertAlmostEqual(float(state["paper_total_debit_usdc"]), 5.0, places=5)
+        self.assertEqual(state["tree12"]["settled_positions"][key]["outcome"], "win")
+
+    def test_expired_loss_settles_zero_recovery(self):
+        city, key, state = self._expired_position_state(high=28.5)  # 28.5 inside [28, 29) → NO loses
+        now = datetime(2026, 9, 11, 0, 0, tzinfo=timezone.utc)
+        actions = settle_tree12_expired_positions(state, {"shanghai": city}, [], now, {})
+        self.assertEqual([a["action_type"] for a in actions], ["tree12_settled_loss"])
+        a = actions[0]
+        self.assertEqual(a["payout_price"], "0")
+        self.assertEqual(Decimal(a["proceeds_usdc"]), Decimal(0))
+        self.assertEqual(Decimal(a["realized_pnl_usdc"]), Decimal("-4.50"))
+        self.assertNotIn(key, state["tree12"]["positions"])
+        self.assertNotIn(key, state["tree12"]["working_orders"])
+        # release(0): debit unchanged
+        self.assertAlmostEqual(float(state["paper_total_debit_usdc"]), 10.0, places=5)
+        self.assertEqual(state["tree12"]["settled_positions"][key]["outcome"], "loss")
+
+    def test_not_expired_position_not_settled(self):
+        city, key, state = self._expired_position_state(high=30.0)
+        # Within the 6h grace window after local day end (16:00Z) but before 22:00Z expiry.
+        now = datetime(2026, 9, 10, 18, 0, tzinfo=timezone.utc)
+        actions = settle_tree12_expired_positions(state, {"shanghai": city}, [], now, {})
+        self.assertEqual(actions, [])
+        self.assertIn(key, state["tree12"]["positions"])
+
+    def test_expired_settlement_removes_position_and_working_order(self):
+        city, key, state = self._expired_position_state(high=28.5)
+        now = datetime(2026, 9, 11, 0, 0, tzinfo=timezone.utc)
+        settle_tree12_expired_positions(state, {"shanghai": city}, [], now, {})
+        self.assertNotIn(key, state["tree12"]["positions"])
+        self.assertNotIn(key, state["tree12"]["working_orders"])
+        self.assertIn(key, state["tree12"]["settled_positions"])
 
 if __name__ == "__main__":
     unittest.main()
