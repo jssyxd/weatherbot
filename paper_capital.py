@@ -54,3 +54,22 @@ def reserve(state: dict[str, Any], amount_usdc: Any) -> Decimal | None:
     new_total = (total_debit_usdc(state) + amount).quantize(Decimal("0.00001"))
     state["paper_total_debit_usdc"] = float(new_total)
     return new_total
+
+
+def release(state: dict[str, Any], amount_usdc: Any) -> Decimal:
+    """Credit paper cash back after a simulated sell (reduce total debit).
+
+    Used by paper exit settlement so overturned positions free capital and
+    realized PnL is reflected in the ledger. Never goes below zero debit.
+    """
+    amount = Decimal(str(amount_usdc))
+    if amount < 0:
+        raise ValueError("paper credit must be non-negative")
+    initial = initial_capital_usdc(state)
+    new_total = (total_debit_usdc(state) - amount).quantize(Decimal("0.00001"))
+    if new_total < 0:
+        new_total = Decimal("0")
+    state["paper_initial_capital_usdc"] = float(initial)
+    state["paper_total_debit_usdc"] = float(new_total)
+    return new_total
+

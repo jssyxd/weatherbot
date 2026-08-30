@@ -14,7 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from edge_engine import celsius_to_native, local_market_date, parse_utc
-from paper_capital import remaining_capital_usdc, reserve
+from paper_capital import remaining_capital_usdc, reserve, release
 from execution.paper_executor import match_gtc
 from execution.order_intent import OrderIntent, OrderType, Side
 from execution.position import realized_pnl_for_exit
@@ -23,11 +23,15 @@ from adapters.polymarket.orderbook import from_any
 TREE12_TARGET_SHARES = Decimal("5")
 TREE12_MIN_NO_ASK = Decimal("0.85")
 TREE12_MAX_NO_ASK = Decimal("0.95")
-TREE12_LEAD_HOURS = 24
+# Entry window: (18, 30] hours before local day 00:00 (backtest optimal 24-30h + buffer)
+TREE12_LEAD_HOURS_MIN = 18
+TREE12_LEAD_HOURS_MAX = 30
 TREE12_WS_VWAP_HOURS = 6
 TREE12_REQUOTE_TICKS = 2
-TREE12_DEFAULT_EXIT_RETRY_SECONDS = (0, 5, 20, 60, 120)
-TREE12_DEFAULT_EXIT_SLIPPAGE = (Decimal("0.10"), Decimal("0.20"), Decimal("0.35"), Decimal("0.60"), Decimal("0.90"))
+# Fast cut-loss ladder: mild absolute-style discounts, short intervals, hard floor
+TREE12_DEFAULT_EXIT_RETRY_SECONDS = (0, 3, 8, 15, 30)
+TREE12_DEFAULT_EXIT_SLIPPAGE = (Decimal("0.03"), Decimal("0.07"), Decimal("0.12"), Decimal("0.20"), Decimal("0.30"))
+TREE12_EXIT_HARD_FLOOR = Decimal("0.05")
 TAF_EXTREME_RE = re.compile(r"\b(TX|TN)(M?)(\d{2})/(\d{2})(\d{2})Z\b")
 TREE12_PAPER_FEE_RATE = Decimal("0.05")
 ZERO = Decimal("0")
@@ -208,7 +212,9 @@ def hours_before_local_day(city: dict[str, Any], market_local_date: str, now_utc
 
 
 def allow_new_entries(city: dict[str, Any], market_local_date: str, now_utc: datetime) -> bool:
-    return hours_before_local_day(city, market_local_date, now_utc) > TREE12_LEAD_HOURS
+    """Open new buckets only when local-day start is (18, 30] hours ahead."""
+    hours = hours_before_local_day(city, market_local_date, now_utc)
+    return TREE12_LEAD_HOURS_MIN < hours <= TREE12_LEAD_HOURS_MAX
 
 
 def position_key(city_id: str, market_local_date: str, direction: str, bucket_id: Any) -> str:
@@ -362,10 +368,11 @@ def list_no_buckets(
     return out
 
 
-def consensus_top2_token_ids(
+def consensus_top3_token_ids(
     buckets: list[dict[str, Any]],
     books_by_token: dict[str, Any],
 ) -> set[str]:
+    """Exclude the three cheapest distinct ask levels (same price ties excluded together)."""
     ranked: list[tuple[Decimal, str]] = []
     for bucket in buckets:
         token = bucket["_no_token_id"]
@@ -376,14 +383,24 @@ def consensus_top2_token_ids(
     if not ranked:
         return set()
     ranked.sort(key=lambda row: (row[0], row[1]))
-    low1 = ranked[0][0]
-    first = {token for ask, token in ranked if ask == low1}
-    rest = [(ask, token) for ask, token in ranked if ask != low1]
-    if not rest:
-        return first
-    low2 = rest[0][0]
-    second = {token for ask, token in rest if ask == low2}
-    return first | second
+    excluded: set[str] = set()
+    distinct_levels = 0
+    i = 0
+    while i < len(ranked) and distinct_levels < 3:
+        level = ranked[i][0]
+        while i < len(ranked) and ranked[i][0] == level:
+            excluded.add(ranked[i][1])
+            i += 1
+        distinct_levels += 1
+    return excluded
+
+
+# Backward-compatible alias (tests / callers that still import old name)
+def consensus_top2_token_ids(
+    buckets: list[dict[str, Any]],
+    books_by_token: dict[str, Any],
+) -> set[str]:
+    return consensus_top3_token_ids(buckets, books_by_token)
 
 
 def taf_forbidden_bucket_ids(
@@ -465,20 +482,80 @@ def start_tree12_exit_chase(
     return chase
 
 
+
+def settle_tree12_paper_exit(
+    state: dict[str, Any],
+    key: str,
+    sale_price: Decimal,
+    shares: Decimal,
+    now_utc: datetime,
+    *,
+    reason: str = "paper_fak_fill",
+) -> dict[str, Any] | None:
+    """Paper-only: realize exit, credit cash, remove position, mark chase settled.
+
+    Live path must use real FAK fills + reconciliation instead of this helper.
+    """
+    tree = ensure_tree12_state(state)
+    pos = tree["positions"].get(key)
+    if not isinstance(pos, dict):
+        return None
+    shares = shares if shares > ZERO else (_dec(pos.get("shares"), "0") or ZERO)
+    if shares <= ZERO:
+        tree["positions"].pop(key, None)
+        return None
+    avg = _dec(pos.get("avg_price"), "0") or ZERO
+    sale_price = max(sale_price, ZERO)
+    proceeds = (sale_price * shares).quantize(Decimal("0.00001"))
+    pnl = ((sale_price - avg) * shares).quantize(Decimal("0.0001"))
+    release(state, proceeds)
+    prior_realized = _dec(pos.get("realized_pnl_usdc"), "0") or ZERO
+    pos["realized_pnl_usdc"] = str((prior_realized + pnl).quantize(Decimal("0.0001")))
+    pos["shares"] = "0"
+    tree["positions"].pop(key, None)
+    chase = tree["exit_chases"].get(key)
+    if isinstance(chase, dict):
+        chase["status"] = "settled"
+        chase["settled_at_utc"] = _iso(now_utc)
+        chase["sale_price"] = str(sale_price)
+        chase["realized_pnl_usdc"] = str(pnl)
+        chase["proceeds_usdc"] = str(proceeds)
+        chase["remaining_shares"] = "0"
+        chase["settle_reason"] = reason
+    return {
+        "key": key,
+        "sale_price": sale_price,
+        "shares": shares,
+        "proceeds": proceeds,
+        "realized_pnl_usdc": pnl,
+        "avg_price": avg,
+    }
+
+
 def plan_tree12_due_exit_faks(
     state: dict[str, Any],
     books_by_token: dict[str, Any],
     now_utc: datetime,
     config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Tree5-style exit ladder: attempts at 0/5/20/60/120s with protective bid discounts."""
+    """Exit ladder with paper settlement: mild slippage, short retries, hard floor.
+
+    Paper mode immediately settles on first usable bid (conservative limit price),
+    releases capital, realizes PnL, and removes the position so equity is truthful.
+    Live mode still only plans FAK attempts and waits for reconciliation.
+    """
     config = config or {}
     tree = ensure_tree12_state(state)
+    mode = str(config.get("mode", "paper")).lower().strip()
+    paper_mode = mode in {"paper", "observe"}
     seconds = tuple(int(x) for x in config.get("tree12_exit_retry_seconds", TREE12_DEFAULT_EXIT_RETRY_SECONDS))
     slippages = tuple(
         Decimal(str(x)) for x in config.get("tree12_exit_slippage", [str(s) for s in TREE12_DEFAULT_EXIT_SLIPPAGE])
     )
-    min_price = _dec(config.get("tree12_exit_min_price"), "0.01") or Decimal("0.01")
+    min_price = _dec(config.get("tree12_exit_min_price"), str(TREE12_EXIT_HARD_FLOOR)) or TREE12_EXIT_HARD_FLOOR
+    hard_floor = _dec(config.get("tree12_exit_hard_floor"), str(TREE12_EXIT_HARD_FLOOR)) or TREE12_EXIT_HARD_FLOOR
+    if min_price < hard_floor:
+        min_price = hard_floor
     actions: list[dict[str, Any]] = []
     for key, chase in list(tree["exit_chases"].items()):
         if not isinstance(chase, dict) or chase.get("status") != "active":
@@ -488,8 +565,25 @@ def plan_tree12_due_exit_faks(
             continue
         index = int(chase.get("attempt_index") or 0)
         if index >= len(seconds):
-            chase["status"] = "awaiting_reconciliation"
-            chase["next_attempt_utc"] = None
+            # Exhausted ladder: in paper, force-settle at hard floor so books stay honest
+            shares = _dec(chase.get("remaining_shares"), "0") or ZERO
+            if paper_mode and shares > ZERO:
+                settled = settle_tree12_paper_exit(
+                    state, key, hard_floor, shares, now_utc, reason="ladder_exhausted_hard_floor"
+                )
+                actions.append({
+                    "action_type": "tree12_exit_fak",
+                    "status": "paper_settled_hard_floor",
+                    "key": key,
+                    "sale_price": str(hard_floor),
+                    "requested_shares": str(shares),
+                    "realized_pnl_usdc": str(settled["realized_pnl_usdc"]) if settled else None,
+                    "proceeds_usdc": str(settled["proceeds"]) if settled else None,
+                    "trigger": chase.get("trigger"),
+                })
+            else:
+                chase["status"] = "awaiting_reconciliation"
+                chase["next_attempt_utc"] = None
             continue
         token = str(chase.get("token_id"))
         book = books_by_token.get(token)
@@ -498,6 +592,7 @@ def plan_tree12_due_exit_faks(
         shares = _dec(chase.get("remaining_shares"), "0") or ZERO
         if shares <= ZERO:
             chase["status"] = "done"
+            tree["positions"].pop(key, None)
             continue
         if bid is None or bid <= ZERO:
             attempt = {
@@ -515,13 +610,16 @@ def plan_tree12_due_exit_faks(
         else:
             slip = slippages[min(index, len(slippages) - 1)]
             limit = bid * (Decimal("1") - slip)
-            if tick > 0:
+            if tick and tick > 0:
                 limit = (limit / tick).to_integral_value(rounding=ROUND_DOWN) * tick
             if limit < min_price:
                 limit = min_price
+            # If market already dead, do not pretend deeper discounts help
+            if bid <= hard_floor:
+                limit = hard_floor
             attempt = {
                 "attempt_index": index,
-                "status": "planned_observe_only",
+                "status": "planned_observe_only" if not paper_mode else "paper_settled",
                 "at_utc": _iso(now_utc),
                 "best_bid": str(bid),
                 "slippage": str(slip),
@@ -531,7 +629,7 @@ def plan_tree12_due_exit_faks(
             chase["attempts"].append(attempt)
             action: dict[str, Any] = {
                 "action_type": "tree12_exit_fak",
-                "status": "planned_observe_only",
+                "status": attempt["status"],
                 "key": key,
                 "order_id": chase.get("order_id"),
                 "token_id": token,
@@ -543,8 +641,6 @@ def plan_tree12_due_exit_faks(
                 "trigger": chase.get("trigger"),
                 **attempt,
             }
-            # Minimal PnL: attach the estimated realized PnL of this planned
-            # exit against the position's weighted-average cost basis.
             pos = tree["positions"].get(key) or {}
             avg_price = _dec(pos.get("avg_price"))
             if avg_price is not None and avg_price > 0:
@@ -552,14 +648,44 @@ def plan_tree12_due_exit_faks(
                 action["estimated_realized_pnl_usdc"] = str(
                     realized_pnl_for_exit(avg_price, limit, shares).quantize(Decimal("0.0001"))
                 )
+            if paper_mode:
+                settled = settle_tree12_paper_exit(
+                    state, key, limit, shares, now_utc, reason=str(chase.get("trigger") or "paper_fak")
+                )
+                if settled:
+                    action["status"] = "paper_settled"
+                    action["sale_price"] = str(settled["sale_price"])
+                    action["realized_pnl_usdc"] = str(settled["realized_pnl_usdc"])
+                    action["proceeds_usdc"] = str(settled["proceeds"])
+                    chase["remaining_shares"] = "0"
             actions.append(action)
+            if paper_mode:
+                # Settled on this attempt; do not schedule further retries
+                continue
         chase["attempt_index"] = index + 1
         triggered = parse_utc(chase.get("triggered_at_utc")) or now_utc
         if index + 1 < len(seconds):
             chase["next_attempt_utc"] = _iso(triggered + timedelta(seconds=seconds[index + 1]))
         else:
-            chase["status"] = "awaiting_reconciliation"
-            chase["next_attempt_utc"] = None
+            if paper_mode:
+                shares_left = _dec(chase.get("remaining_shares"), "0") or ZERO
+                if shares_left > ZERO:
+                    settled = settle_tree12_paper_exit(
+                        state, key, hard_floor, shares_left, now_utc, reason="ladder_end_hard_floor"
+                    )
+                    actions.append({
+                        "action_type": "tree12_exit_fak",
+                        "status": "paper_settled_hard_floor",
+                        "key": key,
+                        "sale_price": str(hard_floor),
+                        "requested_shares": str(shares_left),
+                        "realized_pnl_usdc": str(settled["realized_pnl_usdc"]) if settled else None,
+                        "proceeds_usdc": str(settled["proceeds"]) if settled else None,
+                        "trigger": chase.get("trigger"),
+                    })
+            else:
+                chase["status"] = "awaiting_reconciliation"
+                chase["next_attempt_utc"] = None
     return actions
 
 
@@ -611,7 +737,7 @@ def plan_tree12_entries(
                 buckets = list_no_buckets(rules, city["city_id"], local_date, direction)
                 if not buckets:
                     continue
-                top2 = consensus_top2_token_ids(buckets, books_by_token)
+                top3 = consensus_top3_token_ids(buckets, books_by_token)
                 forbidden = taf_forbidden_bucket_ids(state, city, local_date, direction, rules)
                 for bucket in buckets:
                     token = bucket["_no_token_id"]
@@ -629,8 +755,8 @@ def plan_tree12_entries(
                     if bid in forbidden:
                         actions.append({"action_type": "tree12_entry", "status": "blocked_taf_predicted_bucket", "key": key})
                         continue
-                    if token in top2:
-                        actions.append({"action_type": "tree12_entry", "status": "blocked_consensus_top2", "key": key, "best_ask": str(ask) if ask else None})
+                    if token in top3:
+                        actions.append({"action_type": "tree12_entry", "status": "blocked_consensus_top3", "key": key, "best_ask": str(ask) if ask else None})
                         continue
                     if ask is None or ask < TREE12_MIN_NO_ASK or ask > TREE12_MAX_NO_ASK:
                         actions.append({"action_type": "tree12_entry", "status": "blocked_no_ask_or_outside_085_095", "key": key, "best_ask": str(ask) if ask else None})
@@ -713,9 +839,9 @@ def manage_open_orders_inside_lead_window(
         direction = str(order.get("direction"))
         bid = str(order.get("bucket_id"))
         buckets = list_no_buckets(rules, city["city_id"], local_date, direction)
-        top2 = consensus_top2_token_ids(buckets, books_by_token)
+        top3 = consensus_top3_token_ids(buckets, books_by_token)
         forbidden = taf_forbidden_bucket_ids(state, city, local_date, direction, rules)
-        if bid in forbidden or token in top2 or ask is None or ask < TREE12_MIN_NO_ASK or ask > TREE12_MAX_NO_ASK:
+        if bid in forbidden or token in top3 or ask is None or ask < TREE12_MIN_NO_ASK or ask > TREE12_MAX_NO_ASK:
             order["status"] = "cancelled_filter_break"
             order["updated_at_utc"] = _iso(now_utc)
             actions.append({"action_type": "tree12_cancel", "status": "planned_cancel_filter_break", "key": key})
