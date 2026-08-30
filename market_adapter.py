@@ -9,7 +9,6 @@ import json
 import re
 import urllib.error
 import urllib.request
-import concurrent.futures
 from datetime import date
 from typing import Any
 
@@ -28,10 +27,10 @@ def event_slug(market_city_slug: str, local_date: str, direction: str) -> str:
     return f"{direction_word}-temperature-in-{market_city_slug}-on-{parsed.strftime('%B').lower()}-{parsed.day}-{parsed.year}"
 
 
-def _fetch_json(url: str, timeout_seconds: float = 5.0) -> dict[str, Any]:
+def _fetch_json(url: str, timeout: float = 15.0) -> dict[str, Any]:
     request = urllib.request.Request(url, headers={"User-Agent": "weatherbot-market-adapter/1.1 (+https://github.com/jssyxd/weatherbot)"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -43,6 +42,15 @@ def _fetch_json(url: str, timeout_seconds: float = 5.0) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise RuntimeError("Gamma 事件返回格式异常")
     return parsed
+
+
+def _is_network_error(exc: Exception) -> bool:
+    """True for transport-level failures (timeouts, unreachable, DNS) that warrant fast abort."""
+    message = str(exc)
+    return any(token in message.lower() for token in (
+        "timed out", "network is unreachable", "connection refused", "connection reset",
+        "name or service not known", "temporary failure", "remote end closed",
+    ))
 
 
 def parse_bucket(outcome_text: str) -> tuple[float | None, float | None, str] | None:
@@ -104,9 +112,9 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
             continue
         if not isinstance(outcomes, list) or not isinstance(token_ids, list) or len(outcomes) != len(token_ids):
             continue
-        no_token = next((str(token_ids[index]) for index, outcome in enumerate(outcomes) if outcome == "No"), None)
         yes_token = next((str(token_ids[index]) for index, outcome in enumerate(outcomes) if outcome == "Yes"), None)
-        if not no_token or not yes_token:
+        no_token = next((str(token_ids[index]) for index, outcome in enumerate(outcomes) if outcome == "No"), None)
+        if not yes_token or not no_token:
             continue
         buckets.append({
             "bucket_id": str(market.get("id")), "label": outcome_text, "lo": lo, "hi": hi,
@@ -124,46 +132,55 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
     }]
 
 
-def refresh_market_rules(cities: dict[str, dict[str, Any]], local_dates: dict[str, str], timeout_seconds: float = 10.0, total_deadline_seconds: float = 120.0) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Fetch public Gamma metadata concurrently (per-request timeout).
+def refresh_market_rules(
+    cities: dict[str, dict[str, Any]], local_dates: dict[str, str],
+    workers: int = 16, retries: int = 2, timeout: float = 15.0,
+    total_deadline_seconds: float | None = None, timeout_seconds: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Refresh Gamma market rules concurrently with per-slug retries.
 
-    A failed remote market-data endpoint must not prevent weather observation or
-    warm-up progress. Failed city/direction pairs are marked so callers remain
-    fail-closed instead of treating partial market rules as complete.
-
-    Concurrent fetch (up to 16 workers) replaces the old serial loop, so the
-    ~98 city/direction requests finish in a few seconds instead of hitting a
-    30s serial deadline with only ~10 fetches done.
+    Polymarket's Cloudflare bot protection tarpits slow serial requests from
+    proxy exit IPs. Concurrency (16 workers) plus short per-request retries
+    turns a ~50/98-in-9-minutes serial refresh into ~97/98-in-~49s, with the
+    remaining failures naturally completing on the next due refresh. A slug
+    failure never aborts the round; the caller's backoff still governs how
+    often a full round is attempted.
     """
-    rules: list[dict[str, Any]] = []
-    failures: dict[str, str] = {}
-    work: list[tuple[str, dict[str, Any], str, str, str]] = []
+    if timeout_seconds is not None:
+        timeout = timeout_seconds
+
+    import concurrent.futures
+
+    tasks: list[tuple[dict[str, Any], str, str, str]] = []
     for city in cities.values():
         local_date = local_dates[city["icao"]]
         for direction in ("high", "low"):
-            key = f"{city['city_id']}|{local_date}|{direction}"
             slug = event_slug(str(city.get("market_city_slug") or city["city_id"]), local_date, direction)
-            work.append((key, city, local_date, direction, slug))
+            tasks.append((city, local_date, direction, slug))
 
-    def fetch_one(item: tuple[str, dict[str, Any], str, str, str]) -> tuple[str, list[dict[str, Any]] | None, str | None]:
-        key, city, local_date, direction, slug = item
-        try:
-            event = _fetch_json(GAMMA_EVENT_ENDPOINT + slug, timeout_seconds=timeout_seconds)
-            if not event:
-                return key, None, "event_not_found"
-            parsed = parse_event_rules(event, city, local_date, direction)
-            if not parsed:
-                return key, None, "no_trade_ready_parsed_rules"
-            return key, parsed, None
-        except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            return key, None, f"market_discovery_failed:{type(exc).__name__}"
+    def fetch_one(task: tuple[dict[str, Any], str, str, str]) -> tuple[str, str, str, str, list[dict[str, Any]] | None]:
+        city, local_date, direction, slug = task
+        url = GAMMA_EVENT_ENDPOINT + slug
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                event = _fetch_json(url, timeout=timeout)
+                if not event:
+                    return city["city_id"], local_date, direction, "event_not_found", None
+                parsed = parse_event_rules(event, city, local_date, direction)
+                if not parsed:
+                    return city["city_id"], local_date, direction, "no_trade_ready_parsed_rules", None
+                return city["city_id"], local_date, direction, "", parsed
+            except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                last_error = exc
+        return city["city_id"], local_date, direction, f"market_discovery_failed:{type(last_error).__name__}", None
 
-    if work:
-        max_workers = min(16, len(work))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for key, parsed, err in pool.map(fetch_one, work):
-                if err is not None:
-                    failures[key] = err
-                else:
-                    rules.extend(parsed or [])
+    rules: list[dict[str, Any]] = []
+    failures: dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for city_id, local_date, direction, failure, parsed in pool.map(fetch_one, tasks):
+            if failure:
+                failures[f"{city_id}|{local_date}|{direction}"] = failure
+            else:
+                rules.extend(parsed or [])
     return rules, failures
