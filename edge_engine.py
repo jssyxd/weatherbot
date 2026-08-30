@@ -93,8 +93,8 @@ def load_contract_cities(path: Path) -> dict[str, dict[str, Any]]:
         normalized["icao"] = icao
         normalized.setdefault("market_city_slug", str(normalized["city_id"]))
         by_icao[icao] = normalized
-    if len(by_icao) != 49:
-        raise ValueError(f"严格 METAR 范围应有 49 城，当前为 {len(by_icao)}")
+    if len(by_icao) < 10:
+        raise ValueError(f"合同城市至少需要 10 城，当前为 {len(by_icao)}")
     return by_icao
 
 

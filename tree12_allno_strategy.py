@@ -54,8 +54,8 @@ TREE12_ALLOWED_CITY_IDS = frozenset({
 
 
 def filter_allowed_cities(cities: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Only keep the 10 high-liquidity ≤30min-METAR stations."""
-    return {cid: c for cid, c in cities.items() if cid in TREE12_ALLOWED_CITY_IDS}
+    """Only keep the 10 high-liquidity ≤30min-METAR stations (match on city_id)."""
+    return {cid: c for cid, c in cities.items() if c.get("city_id") in TREE12_ALLOWED_CITY_IDS}
 
 
 
