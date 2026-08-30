@@ -602,16 +602,18 @@ def acquire_single_instance_lock(state_path: Path):
 def run_loop(config: dict[str, Any]) -> None:
     interval = config["scan_interval_seconds"]
     lock_handle = acquire_single_instance_lock(config["state_path"])
-    print(f"候选边缘扫描器已启动：每 {interval} 秒拉取已发布 METAR/SPECI；默认仅 paper 意图，绝不提交真实订单。")
+    print(f"候选边缘扫描器已启动：每 {interval} 秒拉取已发布 METAR/SPECI；默认仅 paper 意图，绝不提交真实订单。", flush=True)
     # Startup: IANA local-day warm-up first, then fresh market rules.
     startup_state = load_state(config["state_path"])
     startup_state["execution_engine"] = config.get("execution_engine", "legacy")
     startup_cities = load_contract_cities(config["contract_cities_path"])
+    print("[启动阶段] 开始 IANA/AWC warm-up", flush=True)
     startup_warmup = warm_up_current_local_days(config, startup_state, startup_cities)
+    print("[启动阶段] 开始 Gamma market_rules 刷新", flush=True)
     startup_rules = refresh_market_rules_if_due(startup_state, config, startup_cities)
     atomic_json_write(config["state_path"], startup_state)
-    print(f"[启动 IANA warm-up] {startup_warmup}")
-    print(f"[启动市场规则] {startup_rules or {'status': 'cached'}}")
+    print(f"[启动 IANA warm-up] {startup_warmup}", flush=True)
+    print(f"[启动市场规则] {startup_rules or {'status': 'cached'}}", flush=True)
     failure_started: datetime | None = None
     while True:
         try:
