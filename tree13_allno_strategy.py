@@ -20,7 +20,10 @@ ENTRY_SHARES = Decimal("5")
 ENTRY_MIN_ASK = Decimal("0.85")
 ENTRY_MAX_LIMIT = Decimal("0.98")
 ENTRY_ASK_DISCOUNT = Decimal("0.95")
-CONSENSUS_EXCLUDED = 2
+CONSENSUS_EXCLUDED = 3  # exclude cheapest 3 ask levels
+ENTRY_LEAD_HOURS_MIN = 18
+ENTRY_LEAD_HOURS_MAX = 30
+
 
 class AllNoInputError(ValueError):
     pass
@@ -149,7 +152,7 @@ def plan_entries(*, state: dict[str, Any], city: dict[str, Any], local_date: str
         if key in tree["orders"] or key in tree["closed_positions"]:
             continue
         reasons = []
-        if token in excluded: reasons.append("consensus_top2")
+        if token in excluded: reasons.append("consensus_top3")
         if taf and bucket_contains(bucket, float(taf["value_native"])): reasons.append("taf_bucket")
         if ask < ENTRY_MIN_ASK: reasons.append("ask_below_0.85")
         twap = _twap_ask(ask_history.get(token, []), now_monotonic_ns)
@@ -176,9 +179,34 @@ def classify_metar_for_position(position: dict[str, Any], running_extreme: Any) 
         if (lo is None or value >= float(lo)) and (hi is None or value < float(hi)): return "FACT_INVALIDATED_EXIT"
     return "NO_ACTION"
 
+EXIT_RETRY_SECONDS = (0, 3, 8, 15, 30)
+EXIT_SLIPPAGE = (Decimal("0.03"), Decimal("0.07"), Decimal("0.12"), Decimal("0.20"), Decimal("0.30"))
+EXIT_HARD_FLOOR = Decimal("0.05")
+
 def plan_exit(*, position: dict[str, Any], reason: str, best_bid: Any, remaining_shares: Any, attempt: int = 0) -> dict[str, Any]:
+    """Fast mild FAK ladder; hard floor 0.05. Paper callers should settle fills into closed_positions."""
     shares = _decimal(remaining_shares, "remaining_shares")
-    if shares <= 0: return {"action_type": "tree13_exit", "status": "blocked_no_reconciled_shares"}
+    if shares <= 0:
+        return {"action_type": "tree13_exit", "status": "blocked_no_reconciled_shares"}
     bid = _decimal(best_bid, "best_bid")
-    slippage = (Decimal("0.10"), Decimal("0.20"), Decimal("0.35"), Decimal("0.60"), Decimal("0.90"))[min(max(attempt, 0), 4)]
-    return {"action_type": "tree13_paper_sell_no", "status": "PENDING_FAK", "reason": reason, "token_id": position.get("token_id"), "outcome": "NO", "side": "SELL", "order_type": "FAK", "remaining_shares": str(shares), "best_bid": str(bid), "minimum_price": str(max(Decimal("0.01"), bid * (Decimal(1) - slippage))), "attempt": attempt, "requires_reconciled_order_id": True, "safety": {"paper_only": True, "orders_submitted": 0, "credentials_loaded": False}}
+    slip = EXIT_SLIPPAGE[min(max(attempt, 0), len(EXIT_SLIPPAGE) - 1)]
+    minimum = max(EXIT_HARD_FLOOR, bid * (Decimal(1) - slip))
+    if bid <= EXIT_HARD_FLOOR:
+        minimum = EXIT_HARD_FLOOR
+    return {
+        "action_type": "tree13_paper_sell_no",
+        "status": "PENDING_FAK",
+        "reason": reason,
+        "token_id": position.get("token_id"),
+        "outcome": "NO",
+        "side": "SELL",
+        "order_type": "FAK",
+        "remaining_shares": str(shares),
+        "best_bid": str(bid),
+        "minimum_price": str(minimum),
+        "slippage": str(slip),
+        "attempt": attempt,
+        "retry_seconds": EXIT_RETRY_SECONDS[min(max(attempt, 0), len(EXIT_RETRY_SECONDS) - 1)],
+        "requires_reconciled_order_id": True,
+        "safety": {"paper_only": True, "orders_submitted": 0, "credentials_loaded": False},
+    }
