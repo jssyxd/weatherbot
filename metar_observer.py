@@ -566,6 +566,7 @@ def warm_up_current_local_days(config: dict[str, Any], state: dict[str, Any], ci
     if awc_station_ids:
         try:
             for station_chunk in chunks(awc_station_ids, int(config.get("awc_stations_per_request", 1))):
+                print(f"[AWC warm-up] 请求 {len(station_chunk)} 个机场: {','.join(station_chunk)}", flush=True)
                 reports, endpoint = fetch_awc_reports(station_chunk, float(config.get("awc_warmup_history_hours", 30)))
                 all_reports.extend(reports)
                 endpoints.append(endpoint)
@@ -621,6 +622,7 @@ def fetch_current_reports_with_fallback(config: dict[str, Any], station_ids: lis
     awc_returned: set[str] = set()
     if missing_before_fallback:
         for station_chunk in chunks(missing_before_fallback, int(config.get("awc_stations_per_request", 1))):
+            print(f"[AWC fallback] 请求 {len(station_chunk)} 个缺报机场: {','.join(station_chunk)}", flush=True)
             try:
                 current, endpoint = fetch_awc_reports(station_chunk, float(config.get("awc_fallback_history_hours", 2)), latest_only=True)
             except Exception as exc:
@@ -848,16 +850,18 @@ def acquire_single_instance_lock(state_path: Path):
 def run_loop(config: dict[str, Any]) -> None:
     interval = config["scan_interval_seconds"]
     lock_handle = acquire_single_instance_lock(config["state_path"])
-    print(f"候选边缘扫描器已启动：每 {interval} 秒拉取已发布 METAR/SPECI；默认仅 paper 意图，绝不提交真实订单。")
+    print(f"候选边缘扫描器已启动：每 {interval} 秒拉取已发布 METAR/SPECI；默认仅 paper 意图，绝不提交真实订单。", flush=True)
     # Startup: IANA local-day warm-up first, then fresh market rules.
     startup_state = load_state(config["state_path"])
     startup_state["execution_engine"] = config.get("execution_engine", "legacy")
     startup_cities = load_contract_cities(config["contract_cities_path"])
+    print("[启动阶段] 开始 IANA/AWC warm-up", flush=True)
     startup_warmup = warm_up_current_local_days(config, startup_state, startup_cities)
+    print("[启动阶段] 开始 Gamma market_rules 刷新", flush=True)
     startup_rules = refresh_market_rules_if_due(startup_state, config, startup_cities)
     atomic_json_write(config["state_path"], startup_state)
-    print(f"[启动 IANA warm-up] {startup_warmup}")
-    print(f"[启动市场规则] {startup_rules or {'status': 'cached'}}")
+    print(f"[启动 IANA warm-up] {startup_warmup}", flush=True)
+    print(f"[启动市场规则] {startup_rules or {'status': 'cached'}}", flush=True)
     failure_started: datetime | None = None
     while True:
         try:
