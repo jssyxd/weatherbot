@@ -112,12 +112,13 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
             continue
         if not isinstance(outcomes, list) or not isinstance(token_ids, list) or len(outcomes) != len(token_ids):
             continue
+        yes_token = next((str(token_ids[index]) for index, outcome in enumerate(outcomes) if outcome == "Yes"), None)
         no_token = next((str(token_ids[index]) for index, outcome in enumerate(outcomes) if outcome == "No"), None)
-        if not no_token:
+        if not yes_token or not no_token:
             continue
         buckets.append({
             "bucket_id": str(market.get("id")), "label": outcome_text, "lo": lo, "hi": hi,
-            "market_id": str(market.get("id")), "no_token_id": no_token,
+            "market_id": str(market.get("id")), "yes_token_id": yes_token, "no_token_id": no_token,
         })
     if not buckets:
         return []
@@ -134,6 +135,7 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
 def refresh_market_rules(
     cities: dict[str, dict[str, Any]], local_dates: dict[str, str],
     workers: int = 16, retries: int = 2, timeout: float = 15.0,
+    total_deadline_seconds: float | None = None, timeout_seconds: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Refresh Gamma market rules concurrently with per-slug retries.
 
@@ -144,6 +146,9 @@ def refresh_market_rules(
     failure never aborts the round; the caller's backoff still governs how
     often a full round is attempted.
     """
+    if timeout_seconds is not None:
+        timeout = timeout_seconds
+
     import concurrent.futures
 
     tasks: list[tuple[dict[str, Any], str, str, str]] = []
