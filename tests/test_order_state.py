@@ -13,6 +13,15 @@ from execution.order_state import (
 )
 
 
+def _acked(order_id: str = "o1", quantity: Decimal = Decimal("5")) -> OrderStateMachine:
+    """Drive an order through CREATED -> SUBMITTING -> SUBMITTED -> ACKED."""
+    machine = OrderStateMachine(OrderState.created(order_id, quantity))
+    machine.transition(OrderStatus.SUBMITTING)
+    machine.transition(OrderStatus.SUBMITTED)
+    machine.transition(OrderStatus.ACKED)
+    return machine
+
+
 class OrderStateTests(unittest.TestCase):
     def test_created_initializes_zero_fill(self) -> None:
         state = OrderState.created("o1", Decimal("5"))
@@ -22,11 +31,7 @@ class OrderStateTests(unittest.TestCase):
         self.assertFalse(state.terminal)
 
     def test_valid_submit_chain(self) -> None:
-        machine = OrderStateMachine(OrderState.created("o1", Decimal("5")))
-        machine.transition(OrderStatus.SUBMITTING)
-        machine.transition(OrderStatus.SUBMITTED)
-        machine.transition(OrderStatus.ACKED)
-        self.assertEqual(machine.state.status, OrderStatus.ACKED)
+        self.assertEqual(_acked().state.status, OrderStatus.ACKED)
 
     def test_illegal_transition_raises(self) -> None:
         machine = OrderStateMachine(OrderState.created("o1", Decimal("5")))
@@ -39,8 +44,14 @@ class OrderStateTests(unittest.TestCase):
         self.assertTrue(machine.state.terminal)
         self.assertEqual(machine.state.reject_reason, "price too high")
 
-    def test_full_fill_is_filled(self) -> None:
+    def test_apply_match_from_created_raises(self) -> None:
+        # Matching may not bypass the CREATED -> SUBMIT -> ACK lifecycle.
         machine = OrderStateMachine(OrderState.created("o1", Decimal("5")))
+        with self.assertRaises(InvalidTransitionError):
+            machine.apply_match(Decimal("5"), order_type="FAK")
+
+    def test_full_fill_is_filled(self) -> None:
+        machine = _acked()
         machine.apply_match(Decimal("5"), order_type="FAK")
         self.assertEqual(machine.state.status, OrderStatus.FILLED)
         self.assertEqual(machine.state.filled_size, Decimal("5"))
@@ -48,7 +59,7 @@ class OrderStateTests(unittest.TestCase):
 
     def test_fak_partial_cancels_remainder_explicitly(self) -> None:
         # Audit §5 example: BUY 5, only 3 available -> filled 3, cancel 2.
-        machine = OrderStateMachine(OrderState.created("o1", Decimal("5")))
+        machine = _acked()
         machine.apply_match(Decimal("3"), order_type="FAK")
         self.assertEqual(machine.state.status, OrderStatus.CANCELLED)
         self.assertEqual(machine.state.cancel_reason, FAK_REMAINDER_CANCELLED)
@@ -56,21 +67,31 @@ class OrderStateTests(unittest.TestCase):
         self.assertEqual(machine.state.remaining_size, Decimal("0"))
 
     def test_fak_zero_fill_cancels_with_no_fill(self) -> None:
-        machine = OrderStateMachine(OrderState.created("o1", Decimal("5")))
+        machine = _acked()
         machine.apply_match(Decimal("0"), order_type="FAK")
         self.assertEqual(machine.state.status, OrderStatus.CANCELLED)
         self.assertEqual(machine.state.filled_size, Decimal("0"))
 
     def test_gtc_partial_rests(self) -> None:
-        machine = OrderStateMachine(OrderState.created("o1", Decimal("5")))
+        machine = _acked()
         machine.apply_match(Decimal("2"), order_type="GTC")
         self.assertEqual(machine.state.status, OrderStatus.PARTIALLY_FILLED)
         self.assertEqual(machine.state.filled_size, Decimal("2"))
         self.assertEqual(machine.state.remaining_size, Decimal("3"))
         self.assertIsNone(machine.state.cancel_reason)
 
+    def test_fok_partial_raises(self) -> None:
+        machine = _acked()
+        with self.assertRaises(InvalidTransitionError):
+            machine.apply_match(Decimal("2"), order_type="FOK")
+
+    def test_unsupported_order_type_raises(self) -> None:
+        machine = _acked()
+        with self.assertRaises(ValueError):
+            machine.apply_match(Decimal("5"), order_type="NOPE")
+
     def test_cancel_open_order(self) -> None:
-        machine = OrderStateMachine(OrderState.created("o1", Decimal("5")))
+        machine = _acked()
         machine.cancel(reason="manual_cancel")
         self.assertEqual(machine.state.status, OrderStatus.CANCELLED)
         self.assertEqual(machine.state.cancel_reason, "manual_cancel")

@@ -17,6 +17,11 @@ or source control:
 - ``POLY_API_SECRET``    L2 API secret (HMAC request signing)
 - ``POLY_PASSPHRASE``    L2 passphrase
 
+HMAC spec (must be re-verified against the live CLOB OpenAPI before enabling):
+``signature = base64(HMAC-SHA256(secret, timestamp + method + requestPath + body))``,
+``timestamp`` is Unix seconds, and ``body`` is the exact JSON string sent (empty
+string for GET). This is PREPARE ONLY and has never submitted a real order.
+
 Hard safety gate: :class:`LiveExecutor` refuses to sign or submit anything
 unless ``live_enabled`` is explicitly ``true`` in the config it is constructed
 with. There is no code path that flips this on automatically, and the main loop
@@ -41,7 +46,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from execution.order_intent import OrderIntent
+from execution.order_intent import OrderIntent, Side, OrderType
 from order_signing import (
     OrderEncodingError,
     build_unsigned_buy_order,
@@ -106,18 +111,24 @@ def build_order_wire(unsigned: Any, signature: str) -> dict[str, Any]:
 
 def build_send_order(intent: OrderIntent, order_wire: dict[str, Any], owner: str) -> dict[str, Any]:
     """Assemble the ``SendOrder`` body per the official CLOB OpenAPI."""
-    if intent.order_type not in _CLOB_ORDER_TYPES:
+    if intent.order_type.value not in _CLOB_ORDER_TYPES:
         raise LiveOrderNotSupported(f"unsupported order_type: {intent.order_type}")
     return {
         "order": order_wire,
         "owner": owner,
-        "orderType": _CLOB_ORDER_TYPES[intent.order_type],
+        "orderType": _CLOB_ORDER_TYPES[intent.order_type.value],
     }
 
 
 def _hmac_sha256_base64(secret: str, message: str) -> str:
-    digest = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).digest()
-    return base64.b64encode(digest).decode("utf-8")
+    # Polymarket L2 API secret is base64-encoded (possibly URL-safe); it MUST be
+    # decoded before use as the HMAC key, and the digest is returned URL-safe
+    # base64. Reference: py-clob-client signing/hmac.py, clob-client-v2 hmac.ts.
+    raw = secret.replace("-", "+").replace("_", "/")
+    raw += "=" * (-len(raw) % 4)  # restore base64 padding
+    secret_bytes = base64.b64decode(raw)
+    digest = hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode("utf-8")
 
 
 class LiveExecutor:
@@ -190,7 +201,7 @@ class LiveExecutor:
     ) -> LiveSubmitResult:
         """Sign and POST a single order. BUY only for now."""
         self._assert_enabled()
-        if intent.side != "BUY":
+        if intent.side != Side.BUY:
             raise LiveOrderNotSupported(
                 "live submit is BUY-only until the signed-order builder supports SELL"
             )
@@ -224,8 +235,11 @@ class LiveExecutor:
         )
 
     def cancel(self, order_id: str) -> dict[str, Any]:
-        """DELETE a resting order by its order id."""
-        return self._request("DELETE", ORDER_ENDPOINT, {"orderID": order_id})
+        """DELETE a resting order by its order id. Raises on rejection."""
+        response = self._request("DELETE", ORDER_ENDPOINT, {"orderID": order_id})
+        if not response.get("success"):
+            raise LiveExecutorError(f"cancel_rejected: {response.get('errorMsg') or response.get('error')}")
+        return response
 
     def query_orders(self, market: str | None = None) -> dict[str, Any]:
         """Query open orders, optionally scoped to one market/condition id."""

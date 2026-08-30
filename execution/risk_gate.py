@@ -88,10 +88,10 @@ class RiskGate:
             return RiskDecision(False, "STALE_BOOK", f"book age {book.age_seconds:.2f}s > {cfg.max_book_age_seconds}s")
 
         # Slippage: adverse move between intent limit and current best quote.
-        ref = book.best_ask if intent.side is Side.BUY else book.best_bid
+        ref = book.best_ask if intent.side == Side.BUY else book.best_bid
         if ref is None:
             return RiskDecision(False, "NO_QUOTE", "no best quote on the required side")
-        slip = (ref - intent.price) / ref if intent.side is Side.BUY else (intent.price - ref) / ref
+        slip = (ref - intent.price) / ref if intent.side == Side.BUY else (intent.price - ref) / ref
         if slip > cfg.max_slippage:
             return RiskDecision(False, "SLIPPAGE_EXCEEDED", f"adverse move {slip:.4f} > max {cfg.max_slippage}")
 
@@ -110,7 +110,7 @@ class RiskGate:
                 return RiskDecision(False, "DUPLICATE_OPEN_ORDER", "an equivalent open order already exists")
 
         # Max position.
-        if intent.side is Side.BUY:
+        if intent.side == Side.BUY:
             projected = current_position_shares + intent.quantity
         else:
             projected = current_position_shares - intent.quantity
@@ -118,7 +118,7 @@ class RiskGate:
             return RiskDecision(False, "MAX_POSITION_EXCEEDED", f"projected position {projected} out of [0, {cfg.max_position_shares}]")
 
         # Available capital (paper cash; live uses exchange balance, so optional).
-        if available_capital_usdc is not None and intent.side is Side.BUY:
+        if available_capital_usdc is not None and intent.side == Side.BUY:
             cost = intent.quantity * intent.price
             if cost > available_capital_usdc:
                 return RiskDecision(False, "INSUFFICIENT_CAPITAL", f"cost {cost} > available {available_capital_usdc}")

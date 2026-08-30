@@ -8,10 +8,10 @@ Composes with ``execution.paper_executor.match_fak`` / ``match_gtc``: the matche
 much fills against this book", and the state machine answers "what is the
 order's lifecycle status now, and why".
 
-FAK partial fill is recorded as ``PARTIALLY_FILLED`` (filled_size > 0) and then
-settled to terminal ``CANCELLED`` with ``cancel_reason == "FAK_REMAINDER_CANCELLED"``,
-so an audit trail can always distinguish "filled 3 then cancelled 2" from a
-zero-fill cancel (filled_size == 0) and from a full fill.
+FAK partial fill ends terminal ``CANCELLED`` with ``cancel_reason ==
+"FAK_REMAINDER_CANCELLED"`` and ``filled_size > 0`` (the positive filled_size is
+what records the partial), so an audit trail can always distinguish
+"filled 3 then cancelled 2" from a zero-fill cancel (filled_size == 0) and from a full fill.
 """
 from __future__ import annotations
 
@@ -112,15 +112,25 @@ class OrderStateMachine:
     def apply_match(self, filled_size: Any, *, order_type: str = "FAK") -> OrderState:
         """Apply a match of ``filled_size`` and settle the resulting status.
 
-        FAK: unfilled remainder is cancelled immediately (terminal CANCELLED,
-        cancel_reason FAK_REMAINDER_CANCELLED, filled_size preserved).
-        GTC: unfilled remainder rests (terminal-lite PARTIALLY_FILLED).
+        Precondition: the order must be ACKED, or PARTIALLY_FILLED for a
+        continuing GTC — matching may not bypass the CREATED -> SUBMIT -> ACK
+        lifecycle. FAK: unfilled remainder is cancelled immediately (terminal
+        CANCELLED, cancel_reason FAK_REMAINDER_CANCELLED, filled_size preserved).
+        GTC: unfilled remainder rests (PARTIALLY_FILLED). FOK: all-or-nothing.
         """
+        if self.state.status not in (OrderStatus.ACKED, OrderStatus.PARTIALLY_FILLED):
+            raise InvalidTransitionError(
+                f"apply_match requires ACKED or PARTIALLY_FILLED, got {self.state.status.value}"
+            )
+        if order_type not in ("FAK", "GTC", "FOK"):
+            raise ValueError(f"unsupported order_type: {order_type}")
         filled = Decimal(str(filled_size))
         if filled < 0 or filled > self.state.remaining_size:
             raise ValueError("filled_size out of range for remaining_size")
         remaining = self.state.remaining_size - filled
         filled_total = self.state.filled_size + filled
+        if order_type == "FOK" and remaining > 0:
+            raise InvalidTransitionError("FOK cannot partially fill")
 
         if remaining > 0:
             if order_type == "FAK":

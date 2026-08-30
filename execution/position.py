@@ -42,7 +42,7 @@ def apply_fill(position: Position, fill: Fill) -> Position:
     if fill.token_id != position.token_id:
         raise ValueError("fill token does not match position token")
 
-    if fill.side is Side.BUY:
+    if fill.side == Side.BUY:
         total = position.shares + fill.shares
         if total <= 0:
             return replace(position, updated_at=utc_now_iso())
@@ -71,7 +71,7 @@ def unrealized_pnl_usdc(position: Position, mark_price: Decimal | None) -> Decim
     """Unrealized PnL at a mark price (None when no mark is available)."""
     if mark_price is None:
         return None
-    if position.side is Side.BUY:
+    if position.side == Side.BUY:
         return (mark_price - position.avg_price) * position.shares
     return (position.avg_price - mark_price) * position.shares
 

@@ -82,6 +82,19 @@ class OrderIntent:
     market: str | None = None
     outcome: str | None = None   # "YES" | "NO" | None
 
+    def __post_init__(self) -> None:
+        # Coerce plain strings into enums so callers that construct directly
+        # (instead of using ``new``) cannot produce a string side/order_type
+        # that ``is Side.BUY`` identity checks silently misread as SELL.
+        if not isinstance(self.side, Side):
+            self.side = Side(self.side)
+        if not isinstance(self.order_type, OrderType):
+            self.order_type = OrderType(self.order_type)
+        if not isinstance(self.price, Decimal):
+            self.price = Decimal(str(self.price))
+        if not isinstance(self.quantity, Decimal):
+            self.quantity = Decimal(str(self.quantity))
+
     @classmethod
     def new(
         cls,
@@ -135,6 +148,17 @@ class Fill:
     shares: Decimal
     fee_usdc: Decimal = Decimal("0")
     filled_at: str = field(default_factory=utc_now_iso)
+
+    def __post_init__(self) -> None:
+        # Fill is frozen; coerce enums/decimals via object.__setattr__.
+        if not isinstance(self.side, Side):
+            object.__setattr__(self, "side", Side(self.side))
+        if not isinstance(self.price, Decimal):
+            object.__setattr__(self, "price", Decimal(str(self.price)))
+        if not isinstance(self.shares, Decimal):
+            object.__setattr__(self, "shares", Decimal(str(self.shares)))
+        if not isinstance(self.fee_usdc, Decimal):
+            object.__setattr__(self, "fee_usdc", Decimal(str(self.fee_usdc)))
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)

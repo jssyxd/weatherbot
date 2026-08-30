@@ -143,7 +143,7 @@ def match_fak(
     zero fill. Never reports a fill above available depth.
     """
     cap = max_price if max_price is not None else intent.price
-    if intent.side is Side.BUY:
+    if intent.side == Side.BUY:
         levels = book.asks
         side = Side.BUY
     else:
@@ -163,7 +163,7 @@ def match_gtc(
     A GTC only fills levels at or better than its limit; any unfilled size
     rests (``remaining_shares > 0``, ``status == PARTIALLY_FILLED``).
     """
-    if intent.side is Side.BUY:
+    if intent.side == Side.BUY:
         levels = book.asks
         side = Side.BUY
     else:

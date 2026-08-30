@@ -13,6 +13,7 @@ from adapters.polymarket.live_executor import (
     LiveExecutorDisabledError,
     LiveExecutorError,
     LiveOrderNotSupported,
+    _hmac_sha256_base64,
     build_order_wire,
     build_send_order,
 )
@@ -70,8 +71,11 @@ class LiveExecutorWireTests(unittest.TestCase):
         self.assertEqual(build_send_order(_intent(order_type="FOK"), {}, "o")["orderType"], "FOK")
 
     def test_build_send_order_unsupported_type(self) -> None:
-        with self.assertRaises(LiveOrderNotSupported):
-            build_send_order(_intent(order_type="NOPE"), {}, "o")
+        # OrderIntent.__post_init__ coerces order_type to the OrderType enum,
+        # so an invalid value now fails at construction (ValueError), not at
+        # build_send_order. Verify that fail-closed behavior here.
+        with self.assertRaises(ValueError):
+            _intent(order_type="NOPE")
 
     def test_build_order_wire_adds_signature_and_stringifies_token(self) -> None:
         class FakeUnsigned:
@@ -80,6 +84,18 @@ class LiveExecutorWireTests(unittest.TestCase):
         wire = build_order_wire(FakeUnsigned(), "0xsig")
         self.assertEqual(wire["signature"], "0xsig")
         self.assertEqual(wire["tokenId"], "1234567890")
+
+    def test_hmac_decodes_base64_secret(self) -> None:
+        import base64
+        import hashlib
+        import hmac
+
+        secret_raw = b"weatherbot-l2-secret"
+        secret_b64 = base64.b64encode(secret_raw).decode()
+        message = "123456POST/order"
+        expected_digest = hmac.new(secret_raw, message.encode("utf-8"), hashlib.sha256).digest()
+        expected = base64.urlsafe_b64encode(expected_digest).decode()
+        self.assertEqual(_hmac_sha256_base64(secret_b64, message), expected)
 
 
 if __name__ == "__main__":
