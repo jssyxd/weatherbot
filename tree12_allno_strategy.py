@@ -198,6 +198,7 @@ def ensure_tree12_state(state: dict[str, Any]) -> dict[str, Any]:
         ("working_orders", {}),
         ("positions", {}),
         ("exit_chases", {}),
+        ("settled_positions", {}),
         ("ws_ask_samples", {}),
         ("taf_fetches", {}),
         ("taf_forecasts", {}),
@@ -726,6 +727,204 @@ def due_tree12_exit_token_ids(state: dict[str, Any], now_utc: datetime) -> set[s
         if token:
             tokens.add(str(token))
     return tokens
+
+
+def local_day_end_utc(city: dict[str, Any], market_local_date: str) -> datetime:
+    """UTC instant of the local midnight that ends ``market_local_date``."""
+    return local_day_start_utc(city, market_local_date) + timedelta(days=1)
+
+
+def tree12_market_date_expired(
+    city: dict[str, Any],
+    market_local_date: str,
+    now_utc: datetime,
+    grace_hours: float,
+) -> bool:
+    """True once ``now_utc`` is past the local market day end plus grace."""
+    end = local_day_end_utc(city, market_local_date)
+    return now_utc.astimezone(timezone.utc) >= end + timedelta(hours=grace_hours)
+
+
+def _gamma_resolved_win(pos: dict[str, Any], rules: list[dict[str, Any]]) -> bool | None:
+    """Return True (NO wins) / False (NO loses) from Gamma resolution, or None.
+
+    Priority resolution source 1: an explicit ``winning_bucket_id`` (or alias)
+    on the matching market rule, or a resolved ``outcome``/``result``/``winning``
+    flag on the matching bucket.
+    """
+    bucket_id = str(pos.get("bucket_id") or "")
+    direction = str(pos.get("direction"))
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        if not (
+            rule.get("city_id") == pos.get("city_id")
+            and rule.get("market_local_date") == pos.get("market_local_date")
+            and rule.get("direction") == direction
+        ):
+            continue
+        winning = rule.get("winning_bucket_id") or rule.get("winning_bucket") or rule.get("resolved_bucket_id")
+        if winning is not None:
+            # Our NO bucket wins iff it is NOT the resolving (hit) bucket.
+            return str(winning) != bucket_id
+        for bucket in rule.get("buckets") or []:
+            if not isinstance(bucket, dict) or str(bucket.get("bucket_id") or "") != bucket_id:
+                continue
+            if bucket.get("resolved") is True or "outcome" in bucket or "result" in bucket:
+                return _outcome_means_no_win(bucket.get("outcome", bucket.get("result")))
+    return None
+
+
+def _outcome_means_no_win(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return not value
+    text = str(value).strip().lower()
+    if text in {"yes", "won", "win", "true", "1", "hit"}:
+        return False
+    if text in {"no", "lost", "lose", "false", "0", "miss"}:
+        return True
+    return None
+
+
+def _extreme_based_win(
+    state: dict[str, Any],
+    pos: dict[str, Any],
+    city: dict[str, Any],
+    market_local_date: str,
+) -> bool | None:
+    """Fallback resolution: the tracked daily extreme decides the held bucket.
+
+    For a ``high`` contract the resolving value is the day's high; for ``low``
+    it is the day's low. A NO bucket wins iff that extreme falls OUTSIDE the
+    held [lo, hi) bucket.
+    """
+    direction = str(pos.get("direction"))
+    day = (state.get("daily_extrema") or {}).get(f"{city['city_id']}|{market_local_date}")
+    if not isinstance(day, dict):
+        return None
+    try:
+        extreme = float(day.get(direction))
+    except (TypeError, ValueError):
+        return None
+    return not bucket_contains(pos.get("bucket") or {}, extreme)
+
+
+def _resolve_expired_outcome(
+    state: dict[str, Any],
+    pos: dict[str, Any],
+    city: dict[str, Any],
+    market_local_date: str,
+    rules: list[dict[str, Any]],
+) -> bool | None:
+    """Resolve an expired position: True = win (NO pays 1.0), False = loss."""
+    gamma = _gamma_resolved_win(pos, rules)
+    if gamma is not None:
+        return gamma
+    return _extreme_based_win(state, pos, city, market_local_date)
+
+
+def _settle_expired_position(
+    state: dict[str, Any],
+    key: str,
+    pos: dict[str, Any],
+    shares: Decimal,
+    won: bool,
+    now_utc: datetime,
+) -> dict[str, Any]:
+    """Realize an expired paper position, remove it, record the settlement."""
+    tree = ensure_tree12_state(state)
+    avg = _dec(pos.get("avg_price"), "0") or ZERO
+    if won:
+        payout = Decimal(1)
+        proceeds = (payout * shares).quantize(Decimal("0.00001"))
+        pnl = ((payout - avg) * shares).quantize(Decimal("0.0001"))
+        release(state, proceeds)
+        action_type = "tree12_settled_win"
+    else:
+        proceeds = ZERO
+        pnl = (-avg * shares).quantize(Decimal("0.0001"))
+        action_type = "tree12_settled_loss"
+    tree.setdefault("settled_positions", {})[key] = {
+        "key": key,
+        "city_id": pos.get("city_id"),
+        "market_local_date": pos.get("market_local_date"),
+        "direction": pos.get("direction"),
+        "bucket_id": pos.get("bucket_id"),
+        "token_id": pos.get("token_id"),
+        "outcome": "win" if won else "loss",
+        "shares": str(shares),
+        "avg_price": str(avg),
+        "proceeds_usdc": str(proceeds),
+        "realized_pnl_usdc": str(pnl),
+        "settled_at_utc": _iso(now_utc),
+    }
+    tree["positions"].pop(key, None)
+    tree["working_orders"].pop(key, None)
+    chase = tree["exit_chases"].get(key)
+    if isinstance(chase, dict):
+        chase["status"] = "settled_expired"
+        chase["settled_at_utc"] = _iso(now_utc)
+    return {
+        "action_type": action_type,
+        "status": "settled",
+        "key": key,
+        "order_id": pos.get("order_id"),
+        "token_id": pos.get("token_id"),
+        "city_id": pos.get("city_id"),
+        "market_local_date": pos.get("market_local_date"),
+        "direction": pos.get("direction"),
+        "bucket_id": pos.get("bucket_id"),
+        "shares": str(shares),
+        "avg_price": str(avg),
+        "payout_price": "1" if won else "0",
+        "proceeds_usdc": str(proceeds),
+        "realized_pnl_usdc": str(pnl),
+        "at_utc": _iso(now_utc),
+    }
+
+
+def settle_tree12_expired_positions(
+    state: dict[str, Any],
+    cities: dict[str, dict[str, Any]],
+    rules: list[dict[str, Any]],
+    now_utc: datetime,
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Settle paper NO positions whose local market day has expired.
+
+    Win (resolving value outside the held bucket): release ``shares * 1.0``
+    cash and realize ``(1.0 - avg_price) * shares``. Loss (value inside the
+    bucket): release nothing and realize ``-avg_price * shares``. Either way the
+    position and its working order are removed and the outcome is recorded in
+    ``tree12.settled_positions`` plus the returned audit actions.
+    """
+    config = config or {}
+    tree = ensure_tree12_state(state)
+    if str(config.get("mode", "paper")).lower().strip() not in {"paper", "observe"}:
+        return []
+    if not config.get("tree12_expired_settle_enabled", True):
+        return []
+    grace_hours = float(config.get("tree12_expired_settle_grace_hours", 6))
+    actions: list[dict[str, Any]] = []
+    for key, pos in list(tree["positions"].items()):
+        if not isinstance(pos, dict):
+            continue
+        shares = _dec(pos.get("shares"), "0") or ZERO
+        if shares <= ZERO:
+            continue
+        city = next((c for c in cities.values() if c.get("city_id") == pos.get("city_id")), None)
+        if city is None:
+            continue
+        market_local_date = str(pos.get("market_local_date"))
+        if not tree12_market_date_expired(city, market_local_date, now_utc, grace_hours):
+            continue
+        won = _resolve_expired_outcome(state, pos, city, market_local_date, rules)
+        if won is None:
+            continue
+        actions.append(_settle_expired_position(state, key, pos, shares, bool(won), now_utc))
+    return actions
 
 
 def plan_tree12_entries(
