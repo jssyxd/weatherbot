@@ -83,5 +83,7 @@
   ],
   "tree12_exit_min_price": 0.05,
   "tree12_exit_hard_floor": 0.05,
+  "tree12_expired_settle_enabled": true,
+  "tree12_expired_settle_grace_hours": 6,
   "tree12_action_dir": "data/tree12_actions"
 }
