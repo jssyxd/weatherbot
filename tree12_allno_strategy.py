@@ -28,6 +28,14 @@ TREE12_MAX_NO_ASK = Decimal("0.95")
 # Entry window: (18, 30] hours before local day 00:00 (backtest optimal 24-30h + buffer)
 TREE12_LEAD_HOURS_MIN = 18
 TREE12_LEAD_HOURS_MAX = 30
+# 补丁A(割肉精确化): 极值穿越桶上界时 NO 必赢不割; 极值在桶内(不确定态)仅当
+# TAF 锚定(接近预计极值)或已过当日峰值时段才割。
+TREE12_CUT_TAF_ANCHOR_TOLERANCE_C = 1.0   # 运行极值距 TAF 预测极值 ≤1°C 视为"已封顶"
+TREE12_CUT_HIGH_PEAK_END_LOCAL_HOUR = 18  # high: 当地 18 点后高温定型, 极值在桶内视为确定输
+TREE12_CUT_LOW_TROUGH_END_LOCAL_HOUR = 9  # low: 当地 9 点后低温定型
+# 补丁B(开市保护): 当日观测不足或凌晨(市场日刚开始)不割——凌晨温度≠当日极值
+TREE12_CUT_MIN_OBS = 3                    # 当日观测条数 < 3 时运行极值不可靠, 不割
+TREE12_CUT_OPEN_PROTECT_LOCAL_HOUR = 7    # 当地 07:00 前不割(避免"开市即割")
 TREE12_WS_VWAP_HOURS = 6
 TREE12_REQUOTE_TICKS = 2
 # Fast cut-loss ladder: mild absolute-style discounts, short intervals, hard floor
@@ -1106,6 +1114,26 @@ def manage_open_orders_inside_lead_window(
     return actions
 
 
+def _tree12_taf_anchor_value(tree: dict[str, Any], pos: dict[str, Any], direction: str) -> float | None:
+    """TAF 锚定: 取该持仓城市/市场日/方向的 TAF 预测极值(value_native)。
+
+    补丁A 用: 运行极值接近 TAF 预计极值(≤1°C)且落在桶内时, 说明温度已封顶
+    在桶内(而非仍在穿越途中), 才触发割肉。TAF 缺失时返回 None(fail-closed 不锚定)。
+    """
+    city_id = pos.get("city_id")
+    local_date = pos.get("market_local_date")
+    if not city_id or not local_date:
+        return None
+    key = f"{city_id}|{local_date}|{direction}"
+    fc = tree.get("taf_forecasts", {}).get(key)
+    if not isinstance(fc, dict):
+        return None
+    try:
+        return float(fc.get("value_native"))
+    except (TypeError, ValueError):
+        return None
+
+
 def plan_tree12_exits_from_metar(
     state: dict[str, Any],
     city: dict[str, Any],
@@ -1126,6 +1154,7 @@ def plan_tree12_exits_from_metar(
         if shares <= ZERO:
             continue
         bucket = pos.get("bucket") or {}
+        direction = str(pos.get("direction"))
         # 修复(pi-opt-a 3.1): 触发割肉必须用"当日运行极值"而非任意瞬时观测。
         # 瞬时穿桶(中午 27.5°C 进 [27,28) 后升至 32°C)不证明 NO 已输——
         # 结算以当日 high/low 极值判定(_extreme_based_win)。极值缺失时 fail-closed 不触发。
@@ -1133,13 +1162,49 @@ def plan_tree12_exits_from_metar(
         extreme = None
         if isinstance(day, dict):
             try:
-                extreme = float(day.get(str(pos.get("direction"))))
+                extreme = float(day.get(direction))
             except (TypeError, ValueError):
                 extreme = None
         if extreme is None:
             continue
-        if not bucket_contains(bucket, extreme):
+        # 补丁B(开市保护): 当日观测不足或凌晨(市场日刚开始)不割——
+        # 凌晨温度(如 jeddah 00:03 的 34°C)≠当日极值, 开市首条观测即割是误割。
+        obs_count = int(day.get("obs_count") or day.get("warmup_report_count") or 0)
+        if obs_count < TREE12_CUT_MIN_OBS:
             continue
+        local_now = now_utc.astimezone(ZoneInfo(city["timezone"]))
+        if local_now.hour < TREE12_CUT_OPEN_PROTECT_LOCAL_HOUR:
+            continue
+        # 补丁A(割肉精确化): 极值穿越桶上界 → NO 必赢, 不割; 极值未到桶 → 不割;
+        # 极值在桶内(不确定态) → 仅当 TAF 锚定(接近预计极值)或已过当日峰值时段才割。
+        lo_raw, hi_raw = bucket.get("lo"), bucket.get("hi")
+        lo = float(lo_raw) if lo_raw is not None else None
+        hi = float(hi_raw) if hi_raw is not None else None
+        if direction == "high":
+            if hi is not None and extreme >= hi:
+                continue  # 极值已越过桶上界, 最终最高温必不在桶内 → NO 必赢
+            if lo is not None and extreme < lo:
+                continue  # 极值未到桶
+            # 不确定态(极值在桶内): TAF 锚定或已过峰值时段才割
+            anchor = _tree12_taf_anchor_value(tree, pos, "high")
+            if anchor is not None and extreme >= anchor - TREE12_CUT_TAF_ANCHOR_TOLERANCE_C:
+                pass  # 温度已接近/达到 TAF 预计最高且落在桶内 → 封顶风险高, 割
+            elif local_now.hour >= TREE12_CUT_HIGH_PEAK_END_LOCAL_HOUR:
+                pass  # 已过高温时段, 运行极值即最终极值且仍在桶内 → 确定输, 割
+            else:
+                continue  # 极值仍在上升途中(拂过), 不割
+        else:  # low
+            if lo is not None and extreme < lo:
+                continue  # 极值已低于桶下界 → NO 必赢
+            if hi is not None and extreme >= hi:
+                continue  # 极值未到桶
+            anchor = _tree12_taf_anchor_value(tree, pos, "low")
+            if anchor is not None and extreme <= anchor + TREE12_CUT_TAF_ANCHOR_TOLERANCE_C:
+                pass  # 温度已降至 TAF 预计最低附近且落在桶内 → 割
+            elif local_now.hour >= TREE12_CUT_LOW_TROUGH_END_LOCAL_HOUR:
+                pass  # 已过低温时段, 极值定型在桶内 → 确定输, 割
+            else:
+                continue
         token = str(pos.get("token_id"))
         chase = start_tree12_exit_chase(state, key, token, shares, "metar_hit_no_bucket", now_utc)
         if chase is None:
