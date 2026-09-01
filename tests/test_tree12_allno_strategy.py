@@ -110,8 +110,9 @@ class Tree12AllNoTests(unittest.TestCase):
         state = {"tree12": {"working_orders": {}, "positions": {key: {"key": key, "city_id": "shanghai",
                  "market_local_date": "2026-09-10", "direction": "high", "bucket_id": "b32", "token_id": "no-32",
                  "shares": "5", "bucket": {"bucket_id": "b32", "lo": 32, "hi": 33}}}, "exit_chases": {}, "ws_ask_samples": {}},
-                 "daily_extrema": {"shanghai|2026-09-10": {"high": 32.5, "low": 20.0}}}
-        now = datetime(2026, 9, 10, 6, 0, tzinfo=timezone.utc)
+                 "daily_extrema": {"shanghai|2026-09-10": {"high": 32.5, "low": 20.0, "obs_count": 5}}}
+        # 当地 19:00(≥ 峰值时段 18)→ 极值 32.5 落桶 [32,33) 视为确定输, 触发割肉
+        now = datetime(2026, 9, 10, 11, 0, tzinfo=timezone.utc)  # 上海 19:00
         actions = plan_tree12_exits_from_metar(state, city, "2026-09-10", 32.5, now)
         self.assertTrue(any(a.get("action_type") == "tree12_exit" for a in actions))
         faks = plan_tree12_due_exit_faks(state, {"no-32": {"best_bid": "0.20", "tick_size": "0.01"}}, now, {})

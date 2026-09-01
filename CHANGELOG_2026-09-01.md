@@ -33,3 +33,20 @@
 ### 部署
 - 双容器(weatherbot-tree12-allno / allnopart)重建为修复版,全新 1000 USDC 纸面账本观测中
 - 15 分钟报告 + 30 分钟 watchdog 持续监控
+
+### 🔧 补丁 A + B(极值穿越不割 / TAF 锚定 / 开市保护)——2026-09-01 追加
+
+承接"割肉用当日运行极值"修复,进一步消除两类残留误割:
+
+- **补丁 A(极值精确化)**:割肉不再用 `bucket_contains(极值)`(极值在桶内即割)。
+  - high:运行极值 **≥ 桶上界 hi** → 极值已越过桶,最终最高温必不在桶内 → **NO 必赢,不割**;
+    极值 **< 桶下界 lo** → 未到桶,不割;
+    极值在桶内(不确定态)→ 仅当 **TAF 锚定**(运行极值距 TAF 预测极值 ≤1°C,温度已封顶)或
+    **已过当日峰值时段**(当地 ≥18 点,极值定型)才割,否则视为"拂过"继续持有。
+  - low 对称(锚定容差 1°C / 低谷时段当地 ≥9 点)。
+  - 新增 `_tree12_taf_anchor_value`(从 `taf_forecasts` 取 TAF 预测极值,缺失 fail-closed)。
+- **补丁 B(开市保护)**:当日观测条数 `obs_count < 3` 或当地时间 < 07:00 不割——
+  修复"开市即割"(jeddah 9/2 00:03 首条观测 34°C 即割,当日极值实际 38-40°C)。
+  `update_daily_extrema_from_observation` 新增 `obs_count` 滚动计数。
+- 测试:适配 `test_extreme_hit_triggers_exit` / `test_metar_exit_chase_and_fak`(fixture 补
+  obs_count + 固定峰值时段 now);177/179 OK(2 error = 环境缺 eth_account,既有)。

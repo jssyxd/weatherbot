@@ -38,13 +38,15 @@ class ExtremeTriggerExitTests(unittest.TestCase):
         self.assertEqual(actions, [])
 
     def test_extreme_hit_triggers_exit(self):
-        """当日极值 27.5 落入 [27,28) -> 触发割肉。"""
-        state = {"daily_extrema": {"testcity|2026-09-02": {"high": 27.5, "low": 20.0}}}
+        """当日运行极值 27.5 落桶 [27,28) + 观测充足 + 已过峰值时段(当地 20:00) -> 触发割肉。"""
+        state = {"daily_extrema": {"testcity|2026-09-02": {"high": 27.5, "low": 20.0, "obs_count": 5}}}
         tree = ensure_tree12_state(state)
         bucket = make_bucket(27, 28)
         key = "testcity|2026-09-02|high|b1"
         tree["positions"][key] = make_pos(key, "testcity", "2026-09-02", "high", bucket)
-        actions = plan_tree12_exits_from_metar(state, CITY, "2026-09-02", 27.5, datetime.now(timezone.utc))
+        # Asia/Shanghai 当地 20:00 = UTC 12:00
+        now = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+        actions = plan_tree12_exits_from_metar(state, CITY, "2026-09-02", 27.5, now)
         self.assertTrue(actions, "极值落桶应触发割肉")
         self.assertEqual(actions[0]["status"], "chase_started")
         self.assertEqual(actions[0]["trigger"], "metar_hit_no_bucket")

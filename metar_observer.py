@@ -1025,19 +1025,21 @@ def update_daily_extrema_from_observation(
 
     此前 daily_extrema 只在 warmup 时重建一次, 中午创新高不会更新,
     导致"极值落桶"割肉判定用过时极值而漏割。
+    补丁B: 同时累计当日观测条数 obs_count, 供"开市保护"(观测不足不割)使用。
     """
     extrema: dict[str, Any] = state.setdefault("daily_extrema", {})
     ekey = f"{city['city_id']}|{local_date}"
     current = extrema.get(ekey)
     if current is None or not isinstance(current, dict):
         current = {"city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
-                   "market_unit": city["market_unit"], "high": None, "low": None}
+                   "market_unit": city["market_unit"], "high": None, "low": None, "obs_count": 0}
     try:
         hi = float(current.get("high")) if current.get("high") is not None else None
         lo = float(current.get("low")) if current.get("low") is not None else None
         val = float(observed_native)
         current["high"] = val if hi is None else max(hi, val)
         current["low"] = val if lo is None else min(lo, val)
+        current["obs_count"] = int(current.get("obs_count") or 0) + 1
         current["updated_at_utc"] = iso_now()
         extrema[ekey] = current
     except (TypeError, ValueError):
