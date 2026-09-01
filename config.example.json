@@ -66,6 +66,7 @@
   "audit_db_path": "data/audit.sqlite3",
   "tree12_enabled": true,
   "tree12_taf_fetch_local_hour": 1,
+  "tree12_taf_prefetch_local_hour": 18,
   "tree12_taf_retry_seconds": 900,
   "tree12_exit_retry_seconds": [
     0,
