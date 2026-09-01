@@ -106,16 +106,18 @@ class DuplicateOrderMatrixTests(unittest.TestCase):
     def test_row_existing_working_order_not_resubmitted(self) -> None:
         city = {"city_id": "shanghai", "icao": "ZSPD", "timezone": "Asia/Shanghai", "market_unit": "C"}
         local_date = "2026-09-10"
-        now = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)  # lead=28h ∈ (18,30]
         rules = [{"enabled": True, "city_id": "shanghai", "market_local_date": local_date, "direction": "high",
                   "buckets": [
                       {"bucket_id": "b29", "lo": 29, "hi": 30, "no_token_id": "no-29"},
                       {"bucket_id": "b30", "lo": 30, "hi": 31, "no_token_id": "no-30"},
                       {"bucket_id": "b31", "lo": 31, "hi": 32, "no_token_id": "no-31"},
+                      {"bucket_id": "b32", "lo": 32, "hi": 33, "no_token_id": "no-32"},
                   ]}]
         books = {"no-29": {"best_ask": "0.85", "tick_size": "0.01", "asks": [{"price": "0.85", "size": "10"}], "bids": []},
                  "no-30": {"best_ask": "0.87", "tick_size": "0.01", "asks": [{"price": "0.87", "size": "10"}], "bids": []},
-                 "no-31": {"best_ask": "0.91", "tick_size": "0.01", "asks": [{"price": "0.91", "size": "10"}], "bids": []}}
+                 "no-31": {"best_ask": "0.91", "tick_size": "0.01", "asks": [{"price": "0.91", "size": "10"}], "bids": []},
+                 "no-32": {"best_ask": "0.95", "tick_size": "0.01", "asks": [{"price": "0.95", "size": "10"}], "bids": []}}
         config = {"target_order_shares": "5", "mode": "paper"}
         first = plan_tree12_entries({}, {"shanghai": city}, rules, books, now, config)
         submits1 = [a for a in first if a.get("action_type") == "tree12_submit_entry"]
@@ -160,7 +162,7 @@ class PositionConsistencyMatrixTests(unittest.TestCase):
                     "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high",
                     "bucket_id": "b32", "token_id": "no-32", "lo": 32, "hi": 33, "limit_price": "0.92"}},
                     "positions": {}, "exit_chases": {}, "ws_ask_samples": {}}}
-        now = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)  # lead=28h ∈ (18,30]
         book = {"best_ask": "0.90", "asks": [{"price": "0.90", "size": "3"}], "bids": []}
         result = tree12_paper_fill(state, "k1", Decimal("5"), book, now)
         self.assertEqual(result["status"], "paper_filled")

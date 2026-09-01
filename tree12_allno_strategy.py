@@ -109,60 +109,84 @@ def tree12_day_key(city: dict[str, Any], market_local_date: str) -> str:
 
 
 def due_tree12_taf_cities(state: dict[str, Any], cities: dict[str, dict[str, Any]], now_utc: datetime, config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return cities whose first post-01:00 TAF fetch (or bounded retry) is due."""
+    """Return cities whose first post-01:00 TAF fetch (or bounded retry) is due.
+
+    修复(pi-opt-b 1.1): 入场窗口是目标日 D 前 18-30h(当地 D-1),但 D 的 TAF 此前
+    只在 D 当日 01:00 后拉取 -> 入场时 taf_forbidden_bucket_ids(D) 恒为空。
+    现在当当地时间 >= tree12_taf_prefetch_local_hour(默认 18)时,同时预拉"明日" D+1
+    的 TAF,使入场过滤器在窗口期内真正生效。
+    """
     tree = ensure_tree12_state(state)
     fetch_hour = int(config.get("tree12_taf_fetch_local_hour", 1))
+    prefetch_hour = int(config.get("tree12_taf_prefetch_local_hour", 18))
     retry_seconds = int(config.get("tree12_taf_retry_seconds", 900))
     due: list[dict[str, Any]] = []
+
+    def _is_due(market_date: str) -> bool:
+        key = tree12_day_key(city, market_date)
+        prior = tree["taf_fetches"].get(key, {})
+        if prior.get("status") == "complete" and prior.get("market_local_date") == market_date:
+            return False
+        last_attempt = parse_utc(prior.get("last_attempt_utc"))
+        if last_attempt is not None and (now_utc - last_attempt).total_seconds() < retry_seconds:
+            return False
+        return True
+
     for city in cities.values():
         local_now = now_utc.astimezone(ZoneInfo(city["timezone"]))
         if local_now.hour < fetch_hour:
             continue
         market_date = local_now.date().isoformat()
-        key = tree12_day_key(city, market_date)
-        prior = tree["taf_fetches"].get(key, {})
-        if prior.get("status") == "complete" and prior.get("market_local_date") == market_date:
+        if _is_due(market_date):
+            due.append(city)
             continue
-        last_attempt = parse_utc(prior.get("last_attempt_utc"))
-        if last_attempt is not None and (now_utc - last_attempt).total_seconds() < retry_seconds:
-            continue
-        due.append(city)
+        # 预拉明日: 当地 >= prefetch_hour 且明日 TAF 未获取
+        if local_now.hour >= prefetch_hour:
+            from datetime import timedelta as _td
+            tomorrow = (local_now.date() + _td(days=1)).isoformat()
+            if _is_due(tomorrow):
+                due.append(city)
     return due
 
 
-def record_tree12_taf_reports(state: dict[str, Any], reports: list[dict[str, Any]], cities: dict[str, dict[str, Any]], now_utc: datetime, source_endpoint: str) -> list[dict[str, Any]]:
-    """Persist tree12-owned daily TAF extrema. Missing TX/TN is explicit and does not trade."""
+def record_tree12_taf_reports(state: dict[str, Any], reports: list[dict[str, Any]], cities: dict[str, dict[str, Any]], now_utc: datetime, source_endpoint: str, extra_dates: dict[str, list[str]] | None = None) -> list[dict[str, Any]]:
+    """Persist tree12-owned daily TAF extrema. Missing TX/TN is explicit and does not trade.
+
+    extra_dates: icao -> 额外目标日期列表(预拉"明日"TAF 用,使入场窗口期 TAF 过滤生效)。
+    """
     tree = ensure_tree12_state(state)
     by_icao = {str(report.get("icao", "")).upper(): report for report in reports if isinstance(report, dict)}
     actions: list[dict[str, Any]] = []
     for city in cities.values():
         local_date = now_utc.astimezone(ZoneInfo(city["timezone"])).date().isoformat()
-        day_key = tree12_day_key(city, local_date)
-        report = by_icao.get(city["icao"])
-        fetch_record = {
-            "city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
-            "last_attempt_utc": iso_utc(now_utc), "source_endpoint": source_endpoint,
-        }
-        if report is None:
-            tree["taf_fetches"][day_key] = {**fetch_record, "status": "failed_missing_station_taf"}
-            actions.append({"action_type": "tree12_taf_fetch", "status": "failed_missing_station_taf", **fetch_record})
-            continue
-        parsed = parse_taf_extremes_for_local_day(report.get("raw_text"), report.get("issued"), city, local_date)
-        missing = sorted({"high", "low"} - set(parsed))
-        if missing:
-            tree["taf_fetches"][day_key] = {**fetch_record, "status": "failed_missing_local_day_extreme", "missing_directions": missing, "taf_issued_utc": report.get("issued")}
-            actions.append({"action_type": "tree12_taf_fetch", "status": "failed_missing_local_day_extreme", "missing_directions": missing, **fetch_record})
-            continue
-        tree["taf_fetches"][day_key] = {**fetch_record, "status": "complete", "taf_issued_utc": report.get("issued")}
-        for direction, detail in parsed.items():
-            key = f"{day_key}|{direction}"
-            tree["taf_forecasts"][key] = {
-                **detail, "city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
-                "raw_taf": str(report.get("raw_text") or ""), "source_endpoint": source_endpoint,
-                "fetched_at_utc": iso_utc(now_utc),
+        target_dates = [local_date] + list((extra_dates or {}).get(city["icao"], []))
+        for target_date in target_dates:
+            day_key = tree12_day_key(city, target_date)
+            report = by_icao.get(city["icao"])
+            fetch_record = {
+                "city_id": city["city_id"], "icao": city["icao"], "market_local_date": target_date,
+                "last_attempt_utc": iso_utc(now_utc), "source_endpoint": source_endpoint,
             }
-            actions.append({"action_type": "tree12_taf_forecast_recorded", "status": "recorded", "forecast_key": key,
-                            "city_id": city["city_id"], "market_local_date": local_date, **detail})
+            if report is None:
+                tree["taf_fetches"][day_key] = {**fetch_record, "status": "failed_missing_station_taf"}
+                actions.append({"action_type": "tree12_taf_fetch", "status": "failed_missing_station_taf", **fetch_record})
+                continue
+            parsed = parse_taf_extremes_for_local_day(report.get("raw_text"), report.get("issued"), city, target_date)
+            missing = sorted({"high", "low"} - set(parsed))
+            if missing:
+                tree["taf_fetches"][day_key] = {**fetch_record, "status": "failed_missing_local_day_extreme", "missing_directions": missing, "taf_issued_utc": report.get("issued")}
+                actions.append({"action_type": "tree12_taf_fetch", "status": "failed_missing_local_day_extreme", "missing_directions": missing, **fetch_record})
+                continue
+            tree["taf_fetches"][day_key] = {**fetch_record, "status": "complete", "taf_issued_utc": report.get("issued")}
+            for direction, detail in parsed.items():
+                key = f"{day_key}|{direction}"
+                tree["taf_forecasts"][key] = {
+                    **detail, "city_id": city["city_id"], "icao": city["icao"], "market_local_date": target_date,
+                    "raw_taf": str(report.get("raw_text") or ""), "source_endpoint": source_endpoint,
+                    "fetched_at_utc": iso_utc(now_utc),
+                }
+                actions.append({"action_type": "tree12_taf_forecast_recorded", "status": "recorded", "forecast_key": key,
+                                "city_id": city["city_id"], "market_local_date": target_date, **detail})
     return actions
 
 
@@ -1080,7 +1104,19 @@ def plan_tree12_exits_from_metar(
         if shares <= ZERO:
             continue
         bucket = pos.get("bucket") or {}
-        if not bucket_hit_by_observation(bucket, observed_temp_native):
+        # 修复(pi-opt-a 3.1): 触发割肉必须用"当日运行极值"而非任意瞬时观测。
+        # 瞬时穿桶(中午 27.5°C 进 [27,28) 后升至 32°C)不证明 NO 已输——
+        # 结算以当日 high/low 极值判定(_extreme_based_win)。极值缺失时 fail-closed 不触发。
+        day = (state.get("daily_extrema") or {}).get(f"{city['city_id']}|{market_local_date}")
+        extreme = None
+        if isinstance(day, dict):
+            try:
+                extreme = float(day.get(str(pos.get("direction"))))
+            except (TypeError, ValueError):
+                extreme = None
+        if extreme is None:
+            continue
+        if not bucket_contains(bucket, extreme):
             continue
         token = str(pos.get("token_id"))
         chase = start_tree12_exit_chase(state, key, token, shares, "metar_hit_no_bucket", now_utc)

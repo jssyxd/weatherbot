@@ -1018,6 +1018,50 @@ def tree5_maintenance_once(config: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def update_daily_extrema_from_observation(
+    state: dict[str, Any], city: dict[str, Any], local_date: str, observed_native: float
+) -> None:
+    """修复1补全: 实时新观测滚动更新当日运行极值(high=max / low=min)。
+
+    此前 daily_extrema 只在 warmup 时重建一次, 中午创新高不会更新,
+    导致"极值落桶"割肉判定用过时极值而漏割。
+    """
+    extrema: dict[str, Any] = state.setdefault("daily_extrema", {})
+    ekey = f"{city['city_id']}|{local_date}"
+    current = extrema.get(ekey)
+    if current is None or not isinstance(current, dict):
+        current = {"city_id": city["city_id"], "icao": city["icao"], "market_local_date": local_date,
+                   "market_unit": city["market_unit"], "high": None, "low": None}
+    try:
+        hi = float(current.get("high")) if current.get("high") is not None else None
+        lo = float(current.get("low")) if current.get("low") is not None else None
+        val = float(observed_native)
+        current["high"] = val if hi is None else max(hi, val)
+        current["low"] = val if lo is None else min(lo, val)
+        current["updated_at_utc"] = iso_now()
+        extrema[ekey] = current
+    except (TypeError, ValueError):
+        pass
+
+
+def process_realtime_observations_for_extrema(
+    state: dict[str, Any], new_events: list[dict[str, Any]], cities: dict[str, dict[str, Any]]
+) -> None:
+    """为每个新观测事件按当地日更新运行极值(供 tree12 极值割肉判定)。"""
+    for event in new_events:
+        city = cities.get(event.get("airport_icao") or "")
+        if not city:
+            continue
+        native_temperature = observed_temperature_native(event, city)
+        if native_temperature is None:
+            continue
+        observed_native, _precision = native_temperature
+        report_time = parse_time(event.get("report_time_utc"))
+        local_date = local_market_date(report_time, city) if report_time else None
+        if local_date is not None:
+            update_daily_extrema_from_observation(state, city, local_date, float(observed_native))
+
+
 def process_tree12_taf_entries(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
     """Fetch one TAF per city-local-day for tree12 independently of tree5.
 
@@ -1049,7 +1093,16 @@ def process_tree12_taf_entries(config: dict[str, Any], state: dict[str, Any], ci
             }
         return [{"action_type": "tree12_taf_fetch", "status": "failed_fetch", "due_city_count": len(due), "error": f"{type(exc).__name__}: {exc}"}]
     due_by_icao = {city["icao"]: city for city in due}
-    return record_tree12_taf_reports(state, reports, due_by_icao, now, ";".join(endpoints))
+    # 预拉"明日"TAF: 当地 >= prefetch_hour 的城市, 把明日 D+1 加入解析目标
+    from datetime import timedelta as _td
+    prefetch_hour = int(config.get("tree12_taf_prefetch_local_hour", 18))
+    extra_dates: dict[str, list[str]] = {}
+    for city in due:
+        local_now = now.astimezone(ZoneInfo(city["timezone"]))
+        if local_now.hour >= prefetch_hour:
+            tomorrow = (local_now.date() + _td(days=1)).isoformat()
+            extra_dates[city["icao"]] = [tomorrow]
+    return record_tree12_taf_reports(state, reports, due_by_icao, now, ";".join(endpoints), extra_dates=extra_dates)
 
 def process_tree12_cycle(config: dict[str, Any], state: dict[str, Any], cities: dict[str, dict[str, Any]], market_rules: list[dict[str, Any]], now: datetime, observations_by_city: dict[str, float] | None = None) -> list[dict[str, Any]]:
     """Plan tree12 NO entries/exits after METAR batch; paper intents only."""
@@ -1189,6 +1242,11 @@ def scan_once(config: dict[str, Any]) -> dict[str, Any]:
             continue
         observed_native, _precision = native_temperature
         observations_by_city[city["city_id"]] = float(observed_native)
+        # 修复1补全: 实时观测滚动更新当日运行极值(high=max/low=min), 供极值割肉判定
+        report_time = parse_time(event.get("report_time_utc"))
+        local_date = local_market_date(report_time, city) if report_time else None
+        if local_date is not None:
+            update_daily_extrema_from_observation(state, city, local_date, float(observed_native))
     tree12_actions = process_tree12_taf_entries(config, state, cities, scan_time)
     tree12_actions.extend(process_tree12_cycle(config, state, cities, market_rules, scan_time, observations_by_city))
     # Refresh market rules only after this round's time-sensitive observations.

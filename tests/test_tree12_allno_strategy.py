@@ -21,10 +21,11 @@ class Tree12AllNoTests(unittest.TestCase):
         self.assertTrue(allow_new_entries(city, "2026-09-01", datetime(2026, 8, 30, 15, 0, tzinfo=timezone.utc)))
         self.assertFalse(allow_new_entries(city, "2026-09-01", datetime(2026, 8, 31, 17, 0, tzinfo=timezone.utc)))
 
-    def test_top2(self):
-        buckets = [{"_no_token_id": "a"}, {"_no_token_id": "b"}, {"_no_token_id": "c"}]
-        books = {"a": {"best_ask": "0.90"}, "b": {"best_ask": "0.86"}, "c": {"best_ask": "0.95"}}
-        self.assertEqual(consensus_top2_token_ids(buckets, books), {"a", "b"})
+    def test_top3(self):
+        buckets = [{"_no_token_id": "a"}, {"_no_token_id": "b"}, {"_no_token_id": "c"}, {"_no_token_id": "d"}]
+        books = {"a": {"best_ask": "0.90"}, "b": {"best_ask": "0.86"}, "c": {"best_ask": "0.95"}, "d": {"best_ask": "0.99"}}
+        # 53d7a92: consensus 从 top2 升级为 top3(排除 ask 最低的 3 个)
+        self.assertEqual(consensus_top2_token_ids(buckets, books), {"a", "b", "c"})
 
     def test_hybrid(self):
         state = {}
@@ -38,16 +39,18 @@ class Tree12AllNoTests(unittest.TestCase):
     def test_entry_plans(self):
         city = city_shanghai()
         local_date = "2026-09-10"
-        now = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)  # lead=28h ∈ (18,30]
         rules = [{"enabled": True, "city_id": "shanghai", "market_local_date": local_date, "direction": "high",
                   "buckets": [
                       {"bucket_id": "b30", "lo": 30, "hi": 31, "no_token_id": "no-30"},
                       {"bucket_id": "b31", "lo": 31, "hi": 32, "no_token_id": "no-31"},
                       {"bucket_id": "b32", "lo": 32, "hi": 33, "no_token_id": "no-32"},
+                      {"bucket_id": "b33", "lo": 33, "hi": 34, "no_token_id": "no-33"},
                   ]}]
         books = {"no-30": {"best_ask": "0.86", "tick_size": "0.01"},
                  "no-31": {"best_ask": "0.87", "tick_size": "0.01"},
-                 "no-32": {"best_ask": "0.91", "tick_size": "0.01"}}
+                 "no-32": {"best_ask": "0.95", "tick_size": "0.01"},
+                 "no-33": {"best_ask": "0.90", "tick_size": "0.01"}}
         actions = plan_tree12_entries({}, {"shanghai": city}, rules, books, now, {"target_order_shares": "5"})
         submits = [a for a in actions if a.get("action_type") == "tree12_submit_entry"]
         self.assertTrue(submits)
@@ -55,7 +58,7 @@ class Tree12AllNoTests(unittest.TestCase):
 
     def test_ask_range_inclusive_085_to_095(self):
         city = city_shanghai()
-        now = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)  # lead=28h ∈ (18,30]
         rules = [{"enabled": True, "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high",
                   "buckets": [
                       {"bucket_id": "b0", "lo": 0, "hi": 1, "no_token_id": "n0"},
@@ -69,24 +72,28 @@ class Tree12AllNoTests(unittest.TestCase):
                  "n3": {"best_ask": "0.95", "tick_size": "0.01"}}
         actions = plan_tree12_entries({}, {"shanghai": city}, rules, books, now, {"target_order_shares": "5"})
         submits = [a for a in actions if a.get("action_type") == "tree12_submit_entry"]
-        self.assertEqual({s["token_id"] for s in submits}, {"n2", "n3"})
+        # top3 排除 n0/n1/n2(最低 3 个 ask), 剩 n3(0.95 边界内)提交
+        self.assertEqual({s["token_id"] for s in submits}, {"n3"})
 
     def test_ask_above_095_blocked(self):
         city = city_shanghai()
-        now = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)  # lead=28h ∈ (18,30]
         rules = [{"enabled": True, "city_id": "shanghai", "market_local_date": "2026-09-10", "direction": "high",
                   "buckets": [
                       {"bucket_id": "b0", "lo": 0, "hi": 1, "no_token_id": "n0"},
                       {"bucket_id": "b1", "lo": 1, "hi": 2, "no_token_id": "n1"},
                       {"bucket_id": "b2", "lo": 2, "hi": 3, "no_token_id": "n2"},
                       {"bucket_id": "b3", "lo": 3, "hi": 4, "no_token_id": "n3"},
+                      {"bucket_id": "b4", "lo": 4, "hi": 5, "no_token_id": "n4"},
                   ]}]
         books = {"n0": {"best_ask": "0.83", "tick_size": "0.01"},
                  "n1": {"best_ask": "0.84", "tick_size": "0.01"},
                  "n2": {"best_ask": "0.85", "tick_size": "0.01"},
-                 "n3": {"best_ask": "0.96", "tick_size": "0.01"}}
+                 "n3": {"best_ask": "0.96", "tick_size": "0.01"},
+                 "n4": {"best_ask": "0.80", "tick_size": "0.01"}}
         actions = plan_tree12_entries({}, {"shanghai": city}, rules, books, now, {"target_order_shares": "5"})
         submits = [a for a in actions if a.get("action_type") == "tree12_submit_entry"]
+        # top3 排除 n4/n0/n1, n2(0.85)提交, n3(0.96>0.95)被区间上限阻断
         self.assertEqual({s["token_id"] for s in submits}, {"n2"})
 
     def test_paper_fill(self):
@@ -102,7 +109,8 @@ class Tree12AllNoTests(unittest.TestCase):
         key = position_key("shanghai", "2026-09-10", "high", "b32")
         state = {"tree12": {"working_orders": {}, "positions": {key: {"key": key, "city_id": "shanghai",
                  "market_local_date": "2026-09-10", "direction": "high", "bucket_id": "b32", "token_id": "no-32",
-                 "shares": "5", "bucket": {"bucket_id": "b32", "lo": 32, "hi": 33}}}, "exit_chases": {}, "ws_ask_samples": {}}}
+                 "shares": "5", "bucket": {"bucket_id": "b32", "lo": 32, "hi": 33}}}, "exit_chases": {}, "ws_ask_samples": {}},
+                 "daily_extrema": {"shanghai|2026-09-10": {"high": 32.5, "low": 20.0}}}
         now = datetime(2026, 9, 10, 6, 0, tzinfo=timezone.utc)
         actions = plan_tree12_exits_from_metar(state, city, "2026-09-10", 32.5, now)
         self.assertTrue(any(a.get("action_type") == "tree12_exit" for a in actions))
